@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dream Memory"
+  short_description: "Consolidate and review persistent memory"
+  default_prompt: "Use $dream to ingest recent sessions and consolidate memory suggestions."

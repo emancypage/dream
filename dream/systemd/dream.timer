@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly dream memory consolidation
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+# Catch up after boot if the laptop was asleep/off at 04:00 (it usually is).
+Persistent=true
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target

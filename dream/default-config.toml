@@ -1,0 +1,38 @@
+[storage]
+db_path = "~/.claude/dream.db"
+memory_root = "~/.claude/projects/-home-szymon/memory"
+
+[stages.distill]
+provider = "codex"
+model = "gpt-5.6-luna"
+reasoning_effort = "low"
+timeout_seconds = 600
+
+[stages.consolidate]
+provider = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+timeout_seconds = 1800
+
+[providers.codex]
+type = "codex-cli"
+auth = "chatgpt-subscription"
+
+[providers.claude]
+type = "claude-cli"
+
+[[sources]]
+name = "codex"
+type = "codex-jsonl"
+root = "~/.codex/sessions"
+enabled = true
+
+[[sources]]
+name = "claude-history"
+type = "claude-jsonl"
+root = "~/.claude/projects"
+enabled = false
+
+[review]
+mode = "suggest-only"
+backup_keep = 14

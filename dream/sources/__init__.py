@@ -1,0 +1,1 @@
+"""Transcript-source adapters."""

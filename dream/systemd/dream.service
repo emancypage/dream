@@ -1,0 +1,14 @@
+[Unit]
+Description=dream nightly — ingest + distill + consolidate + apply memory
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Provider routing, transcript sources, storage and review mode come from
+# ~/.config/dream/config.toml. Include common CLI install locations only for lookup.
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/dream ingest
+ExecStart=%h/.local/bin/dream distill --yes --limit 50
+ExecStart=%h/.local/bin/dream consolidate
+ExecStart=%h/.local/bin/dream suggestions apply-configured
