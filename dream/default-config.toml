@@ -34,3 +34,25 @@ enabled = false
 [review]
 mode = "suggest-only"
 backup_keep = 14
+
+[recall]
+enabled = true
+install_hooks = false
+allow_raw_transcript_prompt = false
+first_prompt_only = true
+session_start_budget_codepoints = 6000
+prompt_budget_codepoints = 4000
+session_start_additional_context_limit = 1800
+prompt_additional_context_limit = 1200
+diagnostic_path = "~/.cache/dream/recall-diagnostics.jsonl"
+calibration_path = "~/.config/dream/recall-calibration.json"
+
+[recall.embedder]
+enabled = false
+type = "none"
+remote_data_egress = false
+
+[recall.reranker]
+enabled = false
+type = "none"
+remote_data_egress = false

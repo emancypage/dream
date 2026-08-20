@@ -141,3 +141,86 @@ CREATE TABLE IF NOT EXISTS archived_memories (
 );
 
 CREATE INDEX IF NOT EXISTS idx_archived_kind ON archived_memories(kind);
+
+-- Automatic memory recall (post-v0.0.1). Canonical document store beside the
+-- transcript-only messages_fts: approved memories, distilled summaries and
+-- (when opted in) raw transcripts live here, never in messages/messages_fts.
+CREATE TABLE IF NOT EXISTS recall_documents (
+    id                TEXT PRIMARY KEY,  -- stable UUID source identity
+    content_sha256    TEXT NOT NULL,     -- SHA-256 of canonical source content
+    source_kind       TEXT NOT NULL CHECK (source_kind IN ('approved_memory', 'distilled_summary', 'raw_transcript')),
+    trust_level       TEXT NOT NULL CHECK (trust_level IN ('user_approved', 'model_distilled', 'untrusted_transcript')),
+    project_slug      TEXT,              -- nullable normalized project identity
+    source_path       TEXT NOT NULL,     -- relative or synthetic stable locator
+    source_updated_at TEXT NOT NULL,     -- UTC source timestamp
+    indexed_at        TEXT NOT NULL,     -- UTC index timestamp
+    source_version    TEXT NOT NULL,     -- ingest / distillation / file-revision identifier
+    text              TEXT NOT NULL      -- canonical searchable content (pre-render redaction)
+);
+
+CREATE TABLE IF NOT EXISTS recall_events (
+    session_id        TEXT NOT NULL,
+    event             TEXT NOT NULL,     -- e.g. 'session-start:startup', 'prompt'
+    policy_version    TEXT NOT NULL,     -- e.g. 'recall-v1'
+    status            TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+    attempt_count     INTEGER NOT NULL DEFAULT 1,
+    started_at        TEXT,
+    finished_at       TEXT,
+    selected_ids_json TEXT,
+    error_code        TEXT,
+    PRIMARY KEY (session_id, event, policy_version)
+);
+
+CREATE TABLE IF NOT EXISTS recall_calibrations (
+    mode                TEXT PRIMARY KEY,  -- 'lexical' | 'lexical_plus_embedder' | 'lexical_plus_reranker' | 'combined'
+    calibration_version TEXT NOT NULL,
+    threshold           REAL NOT NULL,
+    fixture_sha256      TEXT NOT NULL,
+    created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS recall_embeddings (
+    document_id         TEXT NOT NULL,
+    content_sha256      TEXT NOT NULL,
+    adapter_fingerprint TEXT NOT NULL,
+    vector_json         TEXT NOT NULL,
+    created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, content_sha256, adapter_fingerprint)
+);
+
+-- External-content FTS5 index over recall_documents (rebuildable from the
+-- table via rebuild_recall_fts(); never recreates messages_fts).
+CREATE VIRTUAL TABLE IF NOT EXISTS recall_documents_fts USING fts5(
+    text,
+    id UNINDEXED,
+    content_sha256 UNINDEXED,
+    source_kind UNINDEXED,
+    trust_level UNINDEXED,
+    project_slug UNINDEXED,
+    source_path UNINDEXED,
+    source_updated_at UNINDEXED,
+    indexed_at UNINDEXED,
+    source_version UNINDEXED,
+    content='recall_documents',
+    content_rowid='rowid',
+    tokenize='unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER IF NOT EXISTS recall_documents_ai AFTER INSERT ON recall_documents BEGIN
+    INSERT INTO recall_documents_fts(rowid, text, id, content_sha256, source_kind,
+                                     trust_level, project_slug, source_path,
+                                     source_updated_at, indexed_at, source_version)
+    VALUES (new.rowid, new.text, new.id, new.content_sha256, new.source_kind,
+            new.trust_level, new.project_slug, new.source_path,
+            new.source_updated_at, new.indexed_at, new.source_version);
+END;
+
+CREATE TRIGGER IF NOT EXISTS recall_documents_ad AFTER DELETE ON recall_documents BEGIN
+    INSERT INTO recall_documents_fts(recall_documents_fts, rowid, text, id,
+                                     content_sha256, source_kind, trust_level,
+                                     project_slug, source_path, source_updated_at,
+                                     indexed_at, source_version)
+    VALUES ('delete', old.rowid, old.text, old.id, old.content_sha256,
+            old.source_kind, old.trust_level, old.project_slug, old.source_path,
+            old.source_updated_at, old.indexed_at, old.source_version);
+END;

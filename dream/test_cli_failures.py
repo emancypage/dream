@@ -26,3 +26,28 @@ def test_distill_returns_nonzero_when_provider_call_fails(monkeypatch, tmp_path)
         refresh=False,
     )
     assert dream.cmd_distill(args) == 1
+
+
+def test_read_only_commands_work_without_database_directory_write_access(tmp_path, capsys):
+    from types import SimpleNamespace
+
+    db_dir = tmp_path / "store"
+    db_dir.mkdir()
+    db_path = db_dir / "dream.db"
+    conn = dream.open_db(db_path)
+    conn.close()
+    db_dir.chmod(0o555)
+    try:
+        config = load_config(tmp_path / "absent.toml")
+        assert dream.cmd_estimate(SimpleNamespace(
+            db=db_path, min_chars=500, project=None, config=config, refresh=False, verbose=False,
+        )) == 0
+        assert dream.cmd_search(SimpleNamespace(
+            db=db_path, query="missing", limit=20, role=None, project=None,
+        )) == 0
+        assert dream.cmd_suggestions(SimpleNamespace(
+            db=db_path, memory=str(tmp_path / "memory"), suggestions_cmd="list", config=config,
+        )) == 0
+        assert '"suggestions": []' in capsys.readouterr().out
+    finally:
+        db_dir.chmod(0o755)

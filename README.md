@@ -83,7 +83,7 @@ Legacy compatibility variables remain accepted: `DREAM_BACKEND`, `CLAUDE_DREAM_D
 - **Model calls send content.** The `distill` and `consolidate` stages send selected session content to the model provider configured for that stage — by default the Codex CLI against your ChatGPT subscription. Distillation sends the filtered transcript of a session; consolidation sends the distilled notes plus the current memory store.
 - **Everything else stays local.** The SQLite database (`~/.claude/dream.db` by default), suggestion previews (`.suggestions/`), and the memory store remain on your machine.
 - **Check your configuration first.** Before the first run, review the `[[sources]]` roots and the `[stages.*]`/`[providers.*]` entries in `~/.config/dream/config.toml` so you know which transcripts are read and where their content is sent.
-- **Local and external effects.** `estimate`, `search`, `status`, `preflight`, and `suggestions list` only read local data. `ingest` reads transcripts and updates the local SQLite index without calling a model. `distill` and `consolidate` make model calls and write local results. Suggestion review commands update local review state; `accept`, `merge`, and configured apply operations can also update memory files, with backups before live-memory writes.
+- **Local and external effects.** `estimate`, `search`, `status`, `preflight`, `context`, and `suggestions list` only read the persistent local data. Automatic recall opens SQLite through an immutable read-only connection; its small deduplication markers live under `/tmp`. `ingest` reads transcripts and updates the local SQLite index without calling a model. `distill` and `consolidate` make model calls and write local results. Suggestion review commands update local review state; `accept`, `merge`, and configured apply operations can also update memory files, with backups before live-memory writes.
 - **Cost / subscription usage.** Each model call can incur cost or consume part of your subscription limit. `dream estimate -v` shows how many sessions a distillation run would cover before you run it.
 - **Consent.** Do not run `dream` on confidential transcripts unless you have consciously agreed to send their selected content to the configured provider.
 
@@ -136,7 +136,28 @@ dream distill --yes
 dream consolidate
 dream status
 dream preflight
+dream context session-start < hook-payload.json
+dream context prompt < hook-payload.json
+dream hooks install
+dream hooks uninstall
+dream recall-eval --fixtures dream/fixtures/recall/public.json
 ```
+
+Automatic recall is disabled at the Codex hook boundary until `dream hooks install`
+has been reviewed and trusted through Codex `/hooks`. The hook is read-only with
+respect to `~/.claude/dream.db`, so it works in Codex's workspace sandbox without
+extra launch flags or writable-home configuration. The host-side systemd timer
+remains the write path for ingest, distillation, consolidation, and memory review.
+The lexical store is local, raw transcripts are disabled by default, and rendered
+results are marked as untrusted reference data with source provenance. `recall.diagnostic_path` receives
+bounded JSONL diagnostics; diagnostics never contain raw document bodies.
+
+Optional `recall.embedder` and `recall.reranker` adapters are disabled by default,
+cache by content hash and adapter fingerprint, accept at most 100 candidates, and
+fall back to lexical results on unavailable adapters, invalid output, missing
+calibration, or adapter errors. Set `remote_data_egress = true` only after
+reviewing the adapter's data-flow implications; Dream does not add a model package
+or network dependency.
 
 Search indexed conversations:
 
@@ -208,3 +229,6 @@ Paths are relative to `dream/`.
 | `dream.py` | CLI, migrations, search, backups and review |
 | `schema.sql` | current SQLite schema |
 | `prompts/` | provider-neutral prompts |
+| `recall_documents.py`, `recall_query.py` | canonical synchronization and lexical retrieval |
+| `recall_context.py`, `recall_hooks.py` | fail-open context execution and Codex hook management |
+| `recall_eval.py`, `recall_adapters.py` | fixture evaluation, calibration, and optional adapter contracts |

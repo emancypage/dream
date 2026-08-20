@@ -96,6 +96,7 @@ def distill_session(
     session_id: str,
     model: str | None = DEFAULT_MODEL,
     config: DreamConfig | None = None,
+    memory_root: Path | None = None,
 ) -> DistillResult | None:
     session_row = conn.execute(
         "SELECT started_at, cwd, project_slug, source_revision, parser_version "
@@ -186,6 +187,19 @@ def distill_session(
         ),
     )
     conn.commit()
+    if memory_root is not None:
+        from recall_documents import synchronize_recall_documents
+
+        try:
+            synchronize_recall_documents(
+                conn,
+                memory_root,
+                include_raw_transcripts=False,
+            )
+        except Exception:
+            # Synchronization is maintenance, never fatal to a successful
+            # distillation: the distilled row above is already committed.
+            pass
     return result
 
 

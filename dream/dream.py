@@ -42,16 +42,35 @@ from consolidate import consolidate as run_consolidate  # noqa: E402
 from search import search as fts_search, session_summary  # noqa: E402
 from backend import active_backend, preflight  # noqa: E402
 from config import load_config  # noqa: E402
+from recall_documents import synchronize_recall_documents  # noqa: E402
+from recall_context import append_diagnostic, parse_hook_payload, recall_preflight, run_context, hook_success_json  # noqa: E402
+from recall_hook_state import claim_hook_event, finish_hook_event, successful_session_start_ids  # noqa: E402
+from recall_hooks import install_hooks, uninstall_hooks  # noqa: E402
+from storage import open_db_readonly  # noqa: E402
+
+
+def _sync_recall_documents(conn: sqlite3.Connection, memory_root,
+                           *, include_raw_transcripts: bool = False) -> None:
+    """Keep the recall store current after a successful mutation.
+
+    Synchronization is quiet on success and non-fatal: any error (missing
+    recall objects, FTS problems, ...) is reported to stderr and swallowed so
+    the caller's already-committed mutation is never undone and the command
+    keeps its documented behavior. Raw transcripts are opt-in.
+    """
+    try:
+        synchronize_recall_documents(
+            conn,
+            memory_root,
+            include_raw_transcripts=include_raw_transcripts,
+        )
+    except Exception as e:
+        print(f"recall sync skipped: {type(e).__name__}: {e}", file=sys.stderr)
 
 
 def _sub_label() -> str:
     """Human name of the subscription the active backend draws on."""
     return f"{active_backend()} provider"
-
-
-_CONFIG = load_config()
-DEFAULT_DB = _CONFIG.db_path
-DEFAULT_MEMORY_ROOT = _CONFIG.memory_root
 
 
 def open_db(path: Path) -> sqlite3.Connection:
@@ -181,6 +200,23 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 (run_id, cursor[0]),
             )
         conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (1)")
+        # Version 2: automatic memory recall objects (recall_documents and the
+        # other recall tables plus their FTS5 index and triggers are created by
+        # schema.sql above; messages_fts is never dropped or recreated).
+        conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (2)")
+
+
+def rebuild_recall_fts(conn: sqlite3.Connection) -> None:
+    """Rebuild recall_documents_fts from recall_documents.
+
+    Idempotent and safe to run inside a write transaction: the FTS5 'rebuild'
+    command reindexes every row of the external-content table, recovering a
+    missing or corrupt index. Callers must keep it transactional so a failure
+    rolls back and retains the previous complete index.
+    """
+    conn.execute(
+        "INSERT INTO recall_documents_fts(recall_documents_fts) VALUES ('rebuild')"
+    )
 
 
 def _color(s: str, c: str) -> str:
@@ -267,11 +303,12 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     for name, seen, ingested, messages in results:
         print(f"{name}: scanned {seen}, ingested {ingested}, {messages} messages stored.")
     print(f"DB: {args.db}")
+    _sync_recall_documents(conn, args.config.memory_root)
     return 0
 
 
 def cmd_estimate(args: argparse.Namespace) -> int:
-    conn = open_db(args.db)
+    conn = open_db_readonly(args.db)
     candidates = sessions_needing_distill(
         conn, min_chars=args.min_chars, project_slug=args.project, config=args.config,
         refresh_config=getattr(args, "refresh", False),
@@ -324,7 +361,7 @@ def cmd_distill(args: argparse.Namespace) -> int:
     t_start = __import__("time").monotonic()
     for i, (sid, chars) in enumerate(candidates, 1):
         try:
-            res = distill_session(conn, sid, model=args.model, config=args.config)
+            res = distill_session(conn, sid, model=args.model, config=args.config, memory_root=args.config.memory_root)
         except Exception as e:
             print(f"  {_color('!', 'red')} {sid[:8]}…: {type(e).__name__}: {e}")
             failures += 1
@@ -374,7 +411,7 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
 
 
 def cmd_search(args: argparse.Namespace) -> int:
-    conn = open_db(args.db)
+    conn = open_db_readonly(args.db)
     hits = fts_search(conn, args.query, limit=args.limit, role=args.role, project_slug=args.project)
     if not hits:
         print("No matches.")
@@ -415,7 +452,8 @@ def _file_sha256(path: Path) -> str | None:
 
 
 def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
-                      sug_id, kind, target_path, new_content, sug_file) -> bool:
+                      sug_id, kind, target_path, new_content, sug_file,
+                      sync_recall: bool = True) -> bool:
     """Accept one suggestion: write/merge/delete the target, mark accepted, drop the preview.
 
     Refuses (marks 'rejected' instead of touching the filesystem) if target_path would
@@ -455,6 +493,8 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
         f = sug_dir / sug_file
         if f.exists():
             f.unlink()
+    if sync_recall and status == "accepted":
+        _sync_recall_documents(conn, memory_root)
     return status == "accepted"
 
 
@@ -467,7 +507,7 @@ def _pending_suggestions(conn: sqlite3.Connection) -> list[sqlite3.Row | tuple]:
 
 
 def cmd_suggestions(args: argparse.Namespace) -> int:
-    conn = open_db(args.db)
+    conn = open_db_readonly(args.db) if args.suggestions_cmd == "list" else open_db(args.db)
     memory_root = Path(args.memory)
     sug_dir = memory_root / ".suggestions"
     rows = _pending_suggestions(conn)
@@ -656,7 +696,7 @@ def cmd_review(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    conn = open_db(args.db)
+    conn = open_db_readonly(args.db)
     def scalar(sql: str, *p: Any) -> int:
         return conn.execute(sql, p).fetchone()[0]
     print(f"DB:                 {args.db}")
@@ -682,7 +722,114 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     for name, ok, detail in preflight(args.config):
         print(f"{'ok' if ok else 'FAIL'}  {name}: {detail}")
         failed = failed or not ok
+    for name, ok, detail in recall_preflight(args.config, args.db):
+        print(f"{'ok' if ok else 'FAIL'}  {name}: {detail}")
+        failed = failed or not ok
     return 1 if failed else 0
+
+
+def cmd_recall_eval(args: argparse.Namespace) -> int:
+    from recall_eval import evaluate_fixture_file
+    conn = sqlite3.connect(":memory:")
+    conn.executescript((ROOT / "schema.sql").read_text(encoding="utf-8"))
+    _migrate(conn)
+    report = evaluate_fixture_file(args.fixtures, conn, args.config.recall_settings())
+    conn.close()
+    print(json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_recall_calibrate(args: argparse.Namespace) -> int:
+    from recall_eval import calibrate_fixture_file
+    record = calibrate_fixture_file(args.fixtures, open_db(args.db), args.mode)
+    result = {
+        "mode": record.mode,
+        "calibration_version": record.calibration_version,
+        "threshold": record.threshold,
+        "fixture_sha256": record.fixture_sha256,
+        "created_at": record.created_at,
+    }
+    if args.output:
+        output = Path(args.output).expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_hooks(args: argparse.Namespace) -> int:
+    path = Path(args.path).expanduser()
+    if args.hooks_cmd == "install":
+        report = install_hooks(path)
+        print(f"Installed {report.installed} Dream automatic recall hooks in {path}.")
+        print("Review and trust the exact commands through Codex /hooks before enabling automatic injection.")
+        return 0
+    report = uninstall_hooks(path)
+    print(f"Removed {report.removed} Dream automatic recall hooks from {path}.")
+    return 0
+
+
+def _context_failure(args, exc: Exception, *, explain: bool) -> int:
+    diagnostic = {"error": type(exc).__name__, "message": str(exc)[:400]}
+    try:
+        settings = args.config.recall_settings()
+        append_diagnostic(settings, diagnostic)
+    except Exception:
+        pass
+    if explain:
+        print(json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def cmd_context(args: argparse.Namespace) -> int:
+    explain = bool(getattr(args, "explain", False))
+    conn = None
+    attempt_token = None
+    payload = {}
+    try:
+        payload = json.load(sys.stdin)
+        event_name = "UserPromptSubmit" if args.context_cmd == "prompt" else "SessionStart"
+        query = parse_hook_payload(event_name, payload)
+        settings = args.config.recall_settings()
+        conn = open_db_readonly(args.db)
+        excluded = successful_session_start_ids(query.session_id) if args.context_cmd == "prompt" else frozenset()
+        query = query.__class__(
+            query.query_text, query.session_id, query.hook_event, query.cwd,
+            query.repository_roots,
+            settings.session_start_budget_codepoints if args.context_cmd == "session-start" else settings.prompt_budget_codepoints,
+            excluded,
+            settings.allow_raw_transcript_prompt if args.context_cmd == "prompt" else False,
+        )
+        if not settings.enabled:
+            if not explain:
+                print(hook_success_json(""))
+            return 0
+        use_hook_state = query.hook_event != "prompt" or settings.first_prompt_only
+        if use_hook_state and not (attempt_token := claim_hook_event(query.session_id, query.hook_event)):
+            if explain:
+                print(json.dumps({"candidate_count": 0, "selected_count": 0, "fallback_reason": "duplicate-or-running"}, separators=(",", ":")))
+            return 0
+        result = run_context(conn, query, settings, explain=explain, allow_cache_writes=False)
+        if attempt_token is not None:
+            finish_hook_event(query.session_id, query.hook_event, succeeded=True, selected_ids=[candidate.document.id for candidate in result.selected], attempt_token=attempt_token)
+        if explain:
+            print(json.dumps({
+                "candidate_ids": [candidate.document.id for candidate in result.selected],
+                "selected_codepoints": len(result.rendered_context),
+                "elapsed_ms": result.diagnostics.elapsed_ms,
+                "calibration_version": result.calibration_version,
+                "fallback_reason": result.diagnostics.fallback_reason,
+            }, ensure_ascii=False, separators=(",", ":")))
+        else:
+            print(hook_success_json(result.rendered_context))
+        return 0
+    except Exception as exc:
+        if attempt_token is not None:
+            try:
+                finish_hook_event(str(payload.get("session_id", "unknown")), getattr(locals().get("query", None), "hook_event", "prompt"), succeeded=False, error_code=type(exc).__name__, attempt_token=attempt_token)
+            except Exception:
+                pass
+        return _context_failure(args, exc, explain=explain)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -761,8 +908,38 @@ def main(argv: list[str] | None = None) -> int:
     ppre = sub.add_parser("preflight", help="Check configured provider executables and auth")
     ppre.set_defaults(func=cmd_preflight)
 
+    pctx = sub.add_parser("context", help="Run fail-open automatic recall context")
+    csub = pctx.add_subparsers(dest="context_cmd", required=True)
+    for context_cmd in ("session-start", "prompt"):
+        cp = csub.add_parser(context_cmd)
+        cp.add_argument("--explain", action="store_true")
+        cp.set_defaults(func=cmd_context)
+
+    peval = sub.add_parser("recall-eval", help="Evaluate a recall fixture")
+    peval.add_argument("--fixtures", required=True)
+    peval.set_defaults(func=cmd_recall_eval)
+    pcal = sub.add_parser("recall-calibrate", help="Calibrate recall thresholds")
+    pcal.add_argument("--fixtures", required=True)
+    pcal.add_argument("--mode", required=True)
+    pcal.add_argument("--output")
+    pcal.set_defaults(func=cmd_recall_calibrate)
+
+    phooks = sub.add_parser("hooks", help="Install or remove Codex recall hooks")
+    hsub = phooks.add_subparsers(dest="hooks_cmd", required=True)
+    for hooks_cmd in ("install", "uninstall"):
+        hp = hsub.add_parser(hooks_cmd)
+        hp.add_argument("--path", default=os.environ.get("DREAM_CODEX_HOOKS_PATH", str(Path.home() / ".codex" / "hooks.json")))
+        hp.set_defaults(func=cmd_hooks)
+
     args = p.parse_args(argv)
-    args.config = load_config(Path(args.config).expanduser() if args.config else None)
+    try:
+        args.config = load_config(Path(args.config).expanduser() if args.config else None)
+    except Exception as exc:
+        if args.cmd == "context":
+            if getattr(args, "explain", False):
+                print(json.dumps({"error": type(exc).__name__, "message": str(exc)[:400]}, separators=(",", ":")))
+            return 0
+        raise
     args.db = Path(args.db).expanduser() if args.db else args.config.db_path
     if hasattr(args, "memory"):
         args.memory = str(Path(args.memory).expanduser()) if args.memory else str(args.config.memory_root)
