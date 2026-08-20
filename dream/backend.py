@@ -39,7 +39,7 @@ def generate(
         system_prompt=SYSTEM_PROMPT,
         prompt=prompt,
         schema=schema,
-        model=model or stage_cfg["model"],
+        model=model or stage_cfg.get("model"),
         timeout_seconds=timeout or int(stage_cfg.get("timeout_seconds", 600)),
         options={key: value for key, value in options.items() if value is not None},
     )

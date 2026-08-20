@@ -36,7 +36,7 @@ class GenerationRequest:
     system_prompt: str
     prompt: str
     schema: dict[str, Any]
-    model: str
+    model: str | None
     timeout_seconds: int
     options: dict[str, Any] = field(default_factory=dict)
 
@@ -46,7 +46,7 @@ class GenerationResult:
     output: dict[str, Any]
     raw_result: str
     provider: str
-    model: str
+    model: str | None
     usage: Usage | None
     duration_ms: int
     total_cost_usd: float | None = None

@@ -250,7 +250,7 @@ def _persist(
     suggestions: list[Suggestion],
     batch: list[tuple[str, str, dict, str]],
     provider: str,
-    model: str,
+    model: str | None,
 ) -> None:
     sug_dir = memory_root / ".suggestions"
     sug_dir.mkdir(parents=True, exist_ok=True)

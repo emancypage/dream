@@ -67,7 +67,7 @@ def _ensure_workdir() -> Path:
 def call_claude(
     prompt: str,
     schema: dict,
-    model: str = "haiku",
+    model: str | None = "haiku",
     timeout: int = DEFAULT_TIMEOUT_SECS,
     system_prompt: str = SYSTEM_PROMPT,
     extra_args: list[str] | None = None,
@@ -77,6 +77,7 @@ def call_claude(
     Run a single `claude --print` invocation against the user's OAuth subscription.
 
     `model` accepts an alias ("haiku", "sonnet", "opus") or a full model id.
+    `model=None` omits `--model` and lets Claude use its configured default.
     The schema is enforced by Claude Code (`--json-schema`); we then parse the
     `structured_output` from the wrapper JSON.
     """
@@ -86,7 +87,10 @@ def call_claude(
     cmd = [
         executable,
         "--print",
-        "--model", model,
+    ]
+    if model is not None:
+        cmd.extend(["--model", model])
+    cmd += [
         "--output-format", "json",
         "--json-schema", schema_json,
         "--no-session-persistence",

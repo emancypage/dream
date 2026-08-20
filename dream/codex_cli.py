@@ -79,7 +79,7 @@ def _parse_json(raw: str) -> dict:
 def call_codex(
     prompt: str,
     schema: dict,
-    model: str = "haiku",
+    model: str | None = "haiku",
     timeout: int = DEFAULT_TIMEOUT_SECS,
     system_prompt: str = SYSTEM_PROMPT,
     extra_args: list[str] | None = None,
@@ -89,10 +89,15 @@ def call_codex(
     """Single `codex exec` invocation against the user's ChatGPT subscription.
 
     Token usage is unavailable from --output-last-message and is returned as null.
+    `model=None` lets Codex use its own default model.
     """
     workdir = ensure_workdir()
-    codex_model, effort = _resolve_model(model)
-    effort = reasoning_effort or effort
+    if model is None:
+        codex_model: str | None = None
+        effort: str | None = reasoning_effort
+    else:
+        codex_model, effort = _resolve_model(model)
+        effort = reasoning_effort or effort
     full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
 
     with tempfile.TemporaryDirectory() as td:
@@ -100,10 +105,12 @@ def call_codex(
         out_path = Path(td) / "last.json"
         schema_path.write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
 
-        cmd = [
-            executable, "exec",
-            "-m", codex_model,
-            "-c", f"model_reasoning_effort={effort}",
+        cmd = [executable, "exec"]
+        if codex_model:
+            cmd.extend(["-m", codex_model])
+        if effort:
+            cmd.extend(["-c", f"model_reasoning_effort={effort}"])
+        cmd += [
             "-s", "read-only",
             "--ephemeral",
             "--ignore-user-config",

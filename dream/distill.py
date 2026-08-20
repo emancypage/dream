@@ -49,7 +49,7 @@ class DistillResult:
     cache_read_tokens: int | None
     cost_usd: float | None
     provider: str
-    model: str
+    model: str | None
     duration_ms: int
 
 
@@ -144,7 +144,7 @@ def distill_session(
         parser_version or "",
         prompt_version(),
         res.provider,
-        res.model,
+        res.model or "",
         json.dumps(cfg.stage("distill"), sort_keys=True),
     ])
     distillation_key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
@@ -199,7 +199,7 @@ def sessions_needing_distill(
     cfg = config or load_config()
     stage = cfg.stage("distill")
     provider_name = stage["provider"]
-    model_name = stage["model"]
+    model_name = stage.get("model")
     sql = """
         SELECT s.session_id, s.total_chars
         FROM sessions s
@@ -211,7 +211,7 @@ def sessions_needing_distill(
            OR (? AND (
                   COALESCE(d.prompt_version, '') <> ?
                OR COALESCE(d.provider, '') <> ?
-               OR COALESCE(d.model, '') <> ?
+               OR COALESCE(d.model, '') <> COALESCE(?, '')
            ))
         )
           AND s.total_chars >= ?

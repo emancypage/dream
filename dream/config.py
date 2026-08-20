@@ -38,7 +38,7 @@ class DreamConfig:
     def memory_root(self) -> Path:
         raw = self.data["storage"]["memory_root"]
         # Keep the packaged default portable across home-directory names.
-        raw = raw.replace("-home-szymon", str(Path.home()).replace("/", "-"))
+        raw = raw.replace("__HOME_SLUG__", str(Path.home()).replace("/", "-"))
         return Path(raw).expanduser()
 
     def stage(self, name: str) -> dict[str, Any]:
@@ -84,8 +84,8 @@ def _validate(data: dict[str, Any]) -> None:
     _unknown_keys("storage", data.get("storage", {}), _STORAGE_KEYS)
     for name, stage in data.get("stages", {}).items():
         _unknown_keys(f"stage {name}", stage, _STAGE_KEYS)
-        if "provider" not in stage or "model" not in stage:
-            raise ConfigError(f"stage {name} requires provider and model")
+        if "provider" not in stage:
+            raise ConfigError(f"stage {name} requires provider")
     for name, provider in data.get("providers", {}).items():
         _unknown_keys(f"provider {name}", provider, _PROVIDER_KEYS)
         if provider.get("type") not in {"codex-cli", "claude-cli"}:

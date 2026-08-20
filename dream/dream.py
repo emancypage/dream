@@ -670,8 +670,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"Suggestions accepted:{accepted}")
     last = conn.execute("SELECT MAX(created_at) FROM consolidation_runs").fetchone()
     print(f"Last consolidate:   {last[0] if last and last[0] else 'never'}")
-    print(f"Distill route:      {args.config.stage('distill')['provider']} / {args.config.stage('distill')['model']}")
-    print(f"Consolidate route:  {args.config.stage('consolidate')['provider']} / {args.config.stage('consolidate')['model']}")
+    distill_route = args.config.stage("distill")
+    consolidate_route = args.config.stage("consolidate")
+    print(f"Distill route:      {distill_route['provider']} / {distill_route.get('model') or '(provider default)'}")
+    print(f"Consolidate route:  {consolidate_route['provider']} / {consolidate_route.get('model') or '(provider default)'}")
     return 0
 
 
