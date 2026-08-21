@@ -11,7 +11,9 @@ Mechanism (verified against codex-cli 0.135.0):
   * `--ephemeral`            no session persistence (≈ claude's --no-session-persistence).
   * `--ignore-user-config`   skip ~/.codex/config.toml (MCP plugins, hooks, xhigh default);
                              auth still resolves from CODEX_HOME. We supply model+effort ourselves.
-  * `-s read-only`           locked-down sandbox; distillation needs no tools (transcript is in-prompt).
+  * `-s workspace-write`     lets the app-server initialize while restricting model-generated writes
+                             to the dedicated Dream workdir from `-C`; memory and database paths
+                             are not added as writable directories.
 
 Codex has no --system-prompt; we fold the worker instructions into the prompt body.
 """
@@ -111,7 +113,7 @@ def call_codex(
         if effort:
             cmd.extend(["-c", f"model_reasoning_effort={effort}"])
         cmd += [
-            "-s", "read-only",
+            "-s", "workspace-write",
             "--ephemeral",
             "--ignore-user-config",
             "--skip-git-repo-check",
