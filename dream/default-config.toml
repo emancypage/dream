@@ -12,6 +12,12 @@ provider = "codex"
 reasoning_effort = "high"
 timeout_seconds = 1800
 
+[stages.review]
+provider = "codex"
+model = "gpt-5.6-luna"
+reasoning_effort = "high"
+timeout_seconds = 1800
+
 [providers.codex]
 type = "codex-cli"
 auth = "chatgpt-subscription"

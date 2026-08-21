@@ -16,6 +16,12 @@ def test_default_profile_routes_both_stages_to_codex():
     config = load_config(Path("/nonexistent/dream-config.toml"))
     assert config.stage("distill")["provider"] == "codex"
     assert config.stage("consolidate")["provider"] == "codex"
+    assert config.stage("review") == {
+        "provider": "codex",
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "high",
+        "timeout_seconds": 1800,
+    }
     assert config.provider("codex")["type"] == "codex-cli"
 
 
