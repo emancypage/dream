@@ -1,4 +1,9 @@
-"""Pure prompt and decision contract for LLM-assisted suggestion curation."""
+"""Pure prompt and decision contract for LLM-assisted suggestion curation.
+
+Prompt construction fails before provider invocation when any model-facing field
+exceeds ``MAX_CURATION_FIELD_CHARS`` or the complete prompt exceeds
+``MAX_CURATION_PROMPT_CHARS``. Values are never truncated.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +14,11 @@ from pathlib import Path
 from typing import Any
 
 from model_types import validate_output
+
+
+# These limits are character counts and deliberately fail closed before provider use.
+MAX_CURATION_FIELD_CHARS = 60_000
+MAX_CURATION_PROMPT_CHARS = 240_000
 
 
 CURATION_SCHEMA: dict[str, Any] = {
@@ -107,11 +117,36 @@ def _prompt_row(row: Any) -> dict[str, Any]:
     }
 
 
+def _validate_prompt_fields(prompt_row: dict[str, Any]) -> None:
+    for field in (
+        "target_kind",
+        "target_path",
+        "proposal_body",
+        "rationale",
+        "source_sessions",
+        "current_target_body",
+        "current_sha256",
+        "stored_base_sha256",
+    ):
+        value = prompt_row[field]
+        values = value if isinstance(value, list) else (value,)
+        for item in values:
+            if isinstance(item, str) and len(item) > MAX_CURATION_FIELD_CHARS:
+                raise ValueError(
+                    f"suggestion ID {prompt_row['id']} field {field} exceeds "
+                    f"{MAX_CURATION_FIELD_CHARS} characters"
+                )
+
+
 def build_curation_prompt(rows: Any, memory_root: str | Path) -> str:
     """Build a bounded, provider-neutral prompt from host-supplied snapshots."""
-    rendered_rows = [_prompt_row(row) for row in rows]
+    rendered_rows = []
+    for row in rows:
+        prompt_row = _prompt_row(row)
+        _validate_prompt_fields(prompt_row)
+        rendered_rows.append(prompt_row)
     payload = json.dumps(rendered_rows, ensure_ascii=False, indent=2, default=str)
-    return f"""Review the pending Dream suggestions below.
+    prompt = f"""Review the pending Dream suggestions below.
 
 Memory root (host-controlled context only): {memory_root}
 
@@ -128,6 +163,12 @@ Use a body only when returning merge; accept, reject, and defer must not include
 Pending suggestion snapshots:
 {payload}
 """
+    if len(prompt) > MAX_CURATION_PROMPT_CHARS:
+        raise ValueError(
+            f"curation prompt limit exceeded: {len(prompt)} > "
+            f"{MAX_CURATION_PROMPT_CHARS} characters"
+        )
+    return prompt
 
 
 def parse_curation_output(

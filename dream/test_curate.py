@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from curate import (  # noqa: E402
     CURATION_SCHEMA,
     CurationDecision,
+    MAX_CURATION_FIELD_CHARS,
     build_curation_prompt,
     parse_curation_output,
 )
@@ -123,3 +124,21 @@ def test_build_curation_prompt_contains_bounded_review_context_and_safety_rules(
     assert "complete replacement body" in prompt
     assert "accept, reject, merge, defer" in prompt
     assert "concise" in prompt
+
+
+def test_build_curation_prompt_rejects_field_overrun_before_serializing():
+    with pytest.raises(ValueError, match="suggestion ID 7.*proposal_body"):
+        build_curation_prompt(
+            [{"id": 7, "body": "x" * (MAX_CURATION_FIELD_CHARS + 1)}],
+            Path("/memory/root"),
+        )
+
+
+def test_build_curation_prompt_rejects_complete_prompt_overrun():
+    rows = [
+        {"id": suggestion_id, "body": "x" * (MAX_CURATION_FIELD_CHARS - 1)}
+        for suggestion_id in range(1, 6)
+    ]
+
+    with pytest.raises(ValueError, match="prompt limit"):
+        build_curation_prompt(rows, Path("/memory/root"))
