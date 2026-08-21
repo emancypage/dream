@@ -106,3 +106,37 @@ def test_structurally_invalid_codex_memories_config_returns_read_error(tmp_path)
 
     assert not ok
     assert detail.startswith("Codex Memories configuration could not be read: ")
+
+
+def test_invalid_utf8_codex_memories_config_returns_read_error(tmp_path):
+    from recall_context import codex_memories_check
+
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_bytes(b"[features]\nmemories = true\n\xff\n")
+
+    ok, detail = codex_memories_check(codex_home)
+
+    assert not ok
+    assert detail.startswith("Codex Memories configuration could not be read: ")
+
+
+def test_codex_memories_config_existence_oserror_returns_read_error(tmp_path, monkeypatch):
+    from recall_context import codex_memories_check
+
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    original_exists = Path.exists
+
+    def raising_exists(path):
+        if path == config_path:
+            raise OSError("config stat failed")
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", raising_exists)
+
+    ok, detail = codex_memories_check(codex_home)
+
+    assert not ok
+    assert detail.startswith("Codex Memories configuration could not be read: ")

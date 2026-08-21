@@ -76,12 +76,12 @@ def codex_memories_check(codex_home: Path | None = None) -> tuple[bool, str]:
     home = Path.home() / ".codex" if codex_home is None else Path(codex_home)
     config_path = home / "config.toml"
     config = {}
-    if config_path.exists():
-        try:
+    try:
+        if config_path.exists():
             with config_path.open("rb") as handle:
                 config = tomllib.load(handle)
-        except (OSError, tomllib.TOMLDecodeError) as exc:
-            return False, f"Codex Memories configuration could not be read: {exc}"
+    except (UnicodeError, OSError, tomllib.TOMLDecodeError) as exc:
+        return False, f"Codex Memories configuration could not be read: {exc}"
 
     features = config.get("features", {})
     memories = config.get("memories", {})
