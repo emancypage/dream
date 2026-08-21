@@ -20,8 +20,10 @@ generate_memories = false
 ```
 
 Treat `~/.codex/memories` as generated Codex state outside Dream’s ownership:
-do not index, edit, merge, or delete it. `dream preflight` fails for active
-native settings, not merely for an empty scaffold directory. Put required
+do not index, edit, merge, or delete it. `dream preflight` fails only when
+`[features].memories = true` and either `memories.use_memories` or
+`memories.generate_memories` is not explicitly `false`; an empty scaffold
+directory alone does not fail preflight. Put required
 behavior in `AGENTS.md` or checked-in documentation, not generated memory
 files.
 

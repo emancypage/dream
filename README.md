@@ -158,8 +158,9 @@ generate_memories = false
 `~/.codex/memories` is generated Codex state. Dream does not index, edit, merge,
 or delete that directory or its contents. An empty scaffold directory is not
 active native memory state, so it does not make `dream preflight` fail;
-preflight fails when the Codex configuration enables native reading or
-generation. Required behavior belongs in `AGENTS.md` or checked-in
+Preflight fails only when `[features].memories = true` and either
+`memories.use_memories` or `memories.generate_memories` is not explicitly
+`false`. Required behavior belongs in `AGENTS.md` or checked-in
 documentation, never in generated memory state.
 
 ### Deliberately restoring native Memories
