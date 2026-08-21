@@ -27,3 +27,52 @@ def test_recall_preflight_reads_schema_without_parent_write_access(tmp_path):
         assert ("recall.index", True, "recall schema present") in checks
     finally:
         db_dir.chmod(0o755)
+
+
+def test_empty_codex_memories_scaffold_is_not_duplicate_injection(tmp_path):
+    from recall_context import codex_memories_check
+
+    codex_home = tmp_path / "codex"
+    (codex_home / "memories" / ".agents").mkdir(parents=True)
+    (codex_home / "memories" / ".codex").mkdir()
+
+    ok, detail = codex_memories_check(codex_home)
+
+    assert ok
+    assert "disabled" in detail or "empty" in detail
+
+
+def test_enabled_codex_memories_is_reported_as_duplicate_injection(tmp_path):
+    from recall_context import codex_memories_check
+
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        "[features]\nmemories = true\n[memories]\nuse_memories = true\n",
+        encoding="utf-8",
+    )
+    (codex_home / "memories").mkdir()
+
+    ok, detail = codex_memories_check(codex_home)
+
+    assert not ok
+    assert "enabled" in detail
+
+
+def test_explicitly_disabled_codex_memories_passes_even_with_old_files(tmp_path):
+    from recall_context import codex_memories_check
+
+    codex_home = tmp_path / "codex"
+    memories = codex_home / "memories"
+    memories.mkdir(parents=True)
+    (memories / "old.md").write_text("preserved generated state", encoding="utf-8")
+    (codex_home / "config.toml").write_text(
+        "[features]\nmemories = false\n[memories]\n"
+        "use_memories = false\ngenerate_memories = false\n",
+        encoding="utf-8",
+    )
+
+    ok, detail = codex_memories_check(codex_home)
+
+    assert ok
+    assert "disabled" in detail

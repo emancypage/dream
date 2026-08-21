@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 
@@ -71,6 +72,45 @@ def append_diagnostic(settings, diagnostic: dict) -> None:
         handle.write(payload + "\n")
 
 
+def codex_memories_check(codex_home: Path | None = None) -> tuple[bool, str]:
+    home = Path.home() / ".codex" if codex_home is None else Path(codex_home)
+    config_path = home / "config.toml"
+    config = {}
+    if config_path.exists():
+        try:
+            with config_path.open("rb") as handle:
+                config = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            return False, f"Codex Memories configuration could not be read: {exc}"
+
+    features = config.get("features", {})
+    memories = config.get("memories", {})
+    feature_enabled = features.get("memories") is True
+    use_memories = memories.get("use_memories")
+    generate_memories = memories.get("generate_memories")
+    explicitly_disabled = use_memories is False or generate_memories is False
+    if feature_enabled and not explicitly_disabled:
+        controls = ["features.memories"]
+        if use_memories is True:
+            controls.append("memories.use_memories")
+        if generate_memories is True:
+            controls.append("memories.generate_memories")
+        return False, (
+            "Codex Memories enabled by " + ", ".join(controls) +
+            "; disable native Codex Memories before relying on Dream"
+        )
+
+    memories_path = home / "memories"
+    if memories_path.is_dir():
+        payload_files = [
+            path for path in memories_path.rglob("*")
+            if path.is_file() and not ({*path.relative_to(memories_path).parts} & {".agents", ".codex"})
+        ]
+        if not payload_files:
+            return True, "Codex Memories is disabled or has an empty/stale scaffold"
+    return True, "native Codex Memories disabled"
+
+
 def recall_preflight(config, db_path) -> list[tuple[str, bool, str]]:
     checks: list[tuple[str, bool, str]] = []
     path = Path(db_path).expanduser()
@@ -99,6 +139,6 @@ def recall_preflight(config, db_path) -> list[tuple[str, bool, str]]:
         except (OSError, subprocess.SubprocessError) as exc:
             detail = str(exc)
     checks.append(("codex.version", version_ok, detail))
-    memories = Path.home() / ".codex" / "memories"
-    checks.append(("codex.memories-double-injection", not memories.exists(), "not indexed by Dream" if not memories.exists() else "Codex Memories path exists; review duplicate injection"))
+    memories_ok, memories_detail = codex_memories_check()
+    checks.append(("codex.memories-double-injection", memories_ok, memories_detail))
     return checks
