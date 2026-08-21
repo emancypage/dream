@@ -76,3 +76,33 @@ def test_explicitly_disabled_codex_memories_passes_even_with_old_files(tmp_path)
 
     assert ok
     assert "disabled" in detail
+
+
+def test_mixed_codex_memories_controls_are_reported_as_enabled(tmp_path):
+    from recall_context import codex_memories_check
+
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        "[features]\nmemories = true\n[memories]\n"
+        "use_memories = false\ngenerate_memories = true\n",
+        encoding="utf-8",
+    )
+
+    ok, detail = codex_memories_check(codex_home)
+
+    assert not ok
+    assert "enabled" in detail
+
+
+def test_structurally_invalid_codex_memories_config_returns_read_error(tmp_path):
+    from recall_context import codex_memories_check
+
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text("features = true\n", encoding="utf-8")
+
+    ok, detail = codex_memories_check(codex_home)
+
+    assert not ok
+    assert detail.startswith("Codex Memories configuration could not be read: ")

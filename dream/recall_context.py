@@ -85,11 +85,15 @@ def codex_memories_check(codex_home: Path | None = None) -> tuple[bool, str]:
 
     features = config.get("features", {})
     memories = config.get("memories", {})
+    if not isinstance(features, dict):
+        return False, "Codex Memories configuration could not be read: [features] must be a table"
+    if not isinstance(memories, dict):
+        return False, "Codex Memories configuration could not be read: [memories] must be a table"
     feature_enabled = features.get("memories") is True
     use_memories = memories.get("use_memories")
     generate_memories = memories.get("generate_memories")
-    explicitly_disabled = use_memories is False or generate_memories is False
-    if feature_enabled and not explicitly_disabled:
+    all_controls_disabled = use_memories is False and generate_memories is False
+    if feature_enabled and not all_controls_disabled:
         controls = ["features.memories"]
         if use_memories is True:
             controls.append("memories.use_memories")
