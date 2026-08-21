@@ -7,6 +7,38 @@ description: Use when asked to run or inspect Dream, search indexed agent conver
 
 Drive the installed `dream` CLI. Let its configuration choose transcript sources, model providers, models, storage paths, and nightly review mode. Do not encode or override a provider unless the user explicitly requests an override.
 
+## Single memory source
+
+Dream is the canonical single automatic memory-recall layer. It owns persistent
+approved memories, distilled summaries, lexical indexing, and automatic hook
+recall. Native Codex Memories must remain disabled locally with:
+
+```toml
+[memories]
+use_memories = false
+generate_memories = false
+```
+
+Treat `~/.codex/memories` as generated Codex state outside Dream’s ownership:
+do not index, edit, merge, or delete it. `dream preflight` fails for active
+native settings, not merely for an empty scaffold directory. Put required
+behavior in `AGENTS.md` or checked-in documentation, not generated memory
+files.
+
+To deliberately restore native Memories, restore the timestamped configuration
+backup without destructive commands:
+
+```bash
+codex_home="$HOME/.codex"
+configured_codex_home="$(printenv CODEX_HOME 2>/dev/null || true)"
+if test -n "$configured_codex_home"; then codex_home="$configured_codex_home"; fi
+cp -p "$codex_home/backups/codex-memories-disable-<timestamp>/config.toml" "$codex_home/config.toml"
+```
+
+In a new session, run `/memories` and verify the desired `use_memories` and
+`generate_memories` behavior. Do not combine native Memories with Dream’s
+automatic recall unless duplicate injection is intentional.
+
 ## Route the request
 
 - For status, run `dream status`.

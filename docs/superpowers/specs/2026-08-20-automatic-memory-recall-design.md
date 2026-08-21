@@ -10,6 +10,11 @@
 
 Dream shall retrieve useful local memories globally, while softly preferring the current project. It shall never require a model, hosted account, or machine-specific service. Recall data is untrusted reference data, not instructions: every rendered result begins with a fixed marker saying that its contents cannot override conversation instructions.
 
+Dream is the canonical single automatic memory-recall layer. It owns
+persistent approved memories, distilled summaries, lexical indexing, and
+automatic hook recall. Required behavior belongs in `AGENTS.md` or checked-in
+documentation, not in generated memory state.
+
 ## Release boundary and delivery order
 
 Creating an annotated `v0.0.1` tag from the current release commit is a precondition for this work. Automatic recall is not included retrospectively in that tag.
@@ -98,7 +103,7 @@ On a warmed SQLite database with 10,000 documents and 100,000 FTS tokens, lexica
 
 ## Configuration, adapters, and installation
 
-`[recall]` is recognized and optional. Defaults enable the lexical document store but disable hook installation, raw-transcript recall, embedder, and reranker. Existing commands retain their loading behavior; invalid optional adapters cannot prevent `context` from loading core configuration. `dream preflight` independently reports core/schema readiness, lexical-index freshness, optional-adapter availability, and possible double injection when Codex Memories is enabled. Dream never indexes `~/.codex/memories` by default and remains independent from Codex Memories [Memories documentation](https://learn.chatgpt.com/docs/customization/memories).
+`[recall]` is recognized and optional. Defaults enable the lexical document store but disable hook installation, raw-transcript recall, embedder, and reranker. Existing commands retain their loading behavior; invalid optional adapters cannot prevent `context` from loading core configuration. `dream preflight` independently reports core/schema readiness, lexical-index freshness, optional-adapter availability, and possible double injection when Codex Memories is enabled. Native Codex Memories are disabled locally with `memories.use_memories = false` and `memories.generate_memories = false`. An active native setting is a preflight failure; an empty `~/.codex/memories` scaffold alone is not. Dream never indexes, edits, merges, or deletes `~/.codex/memories`, which remains generated Codex state and is independent from Dream [Memories documentation](https://learn.chatgpt.com/docs/customization/memories).
 
 Embedder and reranker adapters are disabled by default, cache by document hash and adapter fingerprint, declare remote data egress, and fail back deterministically. The embedder returns vectors and a fingerprint; the reranker returns relevance scores for bounded candidates.
 
@@ -113,6 +118,24 @@ Held-out calibration fixtures are separate. Evaluation reports Recall@k, mean re
 ## Compatibility, non-goals, and acceptance criteria
 
 Dream does not become a background network service, require a vector database, automatically edit approved memories, or send local content remotely by default.
+
+### Rollback and deliberate native-memory restoration
+
+Task 2 creates a timestamped configuration backup before disabling native
+Memories. Restore it with this exact, non-destructive sequence:
+
+```bash
+codex_home="$HOME/.codex"
+configured_codex_home="$(printenv CODEX_HOME 2>/dev/null || true)"
+if test -n "$configured_codex_home"; then codex_home="$configured_codex_home"; fi
+cp -p "$codex_home/backups/codex-memories-disable-<timestamp>/config.toml" "$codex_home/config.toml"
+```
+
+Restoring native Memories is deliberate: run `/memories` in a new session and
+verify the desired `use_memories` and `generate_memories` behavior. Do not use
+Dream automatic recall simultaneously unless duplicate injection is
+intentionally accepted. Generated files under `~/.codex/memories` are not part
+of rollback and must remain untouched.
 
 - `v0.0.1` exists before implementation begins.
 - Approved files and summaries index separately from `messages_fts`, synchronize after declared mutations, and recover from a missing index.

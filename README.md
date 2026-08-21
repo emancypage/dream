@@ -143,6 +143,42 @@ dream hooks uninstall
 dream recall-eval --fixtures dream/fixtures/recall/public.json
 ```
 
+## Memory ownership and Codex Memories
+
+Dream is the canonical single automatic memory-recall layer. It owns persistent
+approved memories, distilled summaries, their lexical index, and automatic
+hook recall. Native Codex Memories are disabled locally with these controls:
+
+```toml
+[memories]
+use_memories = false
+generate_memories = false
+```
+
+`~/.codex/memories` is generated Codex state. Dream does not index, edit, merge,
+or delete that directory or its contents. An empty scaffold directory is not
+active native memory state, so it does not make `dream preflight` fail;
+preflight fails when the Codex configuration enables native reading or
+generation. Required behavior belongs in `AGENTS.md` or checked-in
+documentation, never in generated memory state.
+
+### Deliberately restoring native Memories
+
+If native Memories must be restored, use the timestamped backup made before
+the configuration change. This sequence copies the backup back without
+deleting anything:
+
+```bash
+codex_home="$HOME/.codex"
+configured_codex_home="$(printenv CODEX_HOME 2>/dev/null || true)"
+if test -n "$configured_codex_home"; then codex_home="$configured_codex_home"; fi
+cp -p "$codex_home/backups/codex-memories-disable-<timestamp>/config.toml" "$codex_home/config.toml"
+```
+
+Then run `/memories` in a new session and verify the desired
+`use_memories` and `generate_memories` behavior. Do not use Dream automatic
+recall simultaneously unless duplicate injection is intentionally accepted.
+
 Automatic recall is disabled at the Codex hook boundary until `dream hooks install`
 has been reviewed and trusted through Codex `/hooks`. The hook is read-only with
 respect to `~/.claude/dream.db`, so it works in Codex's workspace sandbox without
