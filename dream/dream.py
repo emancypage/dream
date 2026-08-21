@@ -608,6 +608,19 @@ def _curation_recheck(memory_root: Path, snapshot: dict[str, Any]) -> tuple[Path
 
 def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions) -> int:
     by_id = {snapshot["id"]: snapshot for snapshot in snapshots}
+    expected_by_target: dict[str, dict[str, Any]] = {}
+    for snapshot in snapshots:
+        target = _safe_suggestion_target(memory_root, snapshot["target_path"])
+        if target is not None:
+            expected_by_target.setdefault(
+                str(target),
+                {
+                    "body": snapshot["current_body"],
+                    "sha256": snapshot["current_sha256"],
+                    "existed": snapshot["target_existed"],
+                    "host_applied": False,
+                },
+            )
     applied: list[int] = []
     rejected: list[int] = []
     deferred: list[int] = []
@@ -646,33 +659,38 @@ def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions) -> int:
             unsafe.append(sug_id)
             print(f"unsafe #{sug_id} ({target_path}): protected target; rejected by host safety check")
             continue
-        if snapshot["conflict"] and decision.decision == "accept":
-            deferred.append(sug_id)
-            conflicts.append(sug_id)
-            print(f"conflict #{sug_id} ({target_path}): initial conflict; accept deferred")
-            continue
 
         rechecked_target, old, current_sha, target_existed = _curation_recheck(memory_root, snapshot)
+        expected = expected_by_target[str(target)]
         if (
             rechecked_target is None
-            or current_sha != snapshot["current_sha256"]
-            or target_existed != snapshot["target_existed"]
+            or old != expected["body"]
+            or current_sha != expected["sha256"]
+            or target_existed != expected["existed"]
         ):
             deferred.append(sug_id)
             conflicts.append(sug_id)
             print(f"conflict #{sug_id} ({target_path}): target changed during curation")
             continue
 
-        if decision.decision == "merge" and snapshot["conflict"]:
-            with conn:
-                conn.execute(
-                    "UPDATE suggestions SET base_sha256=?, target_existed=? WHERE id=?",
-                    (current_sha, int(target_existed), sug_id),
-                )
+        if (
+            not expected["host_applied"]
+            and snapshot["conflict"]
+            and decision.decision == "accept"
+        ):
+            deferred.append(sug_id)
+            conflicts.append(sug_id)
+            print(f"conflict #{sug_id} ({target_path}): initial conflict; accept deferred")
+            continue
         proposed_body = snapshot["body"] if decision.decision == "accept" else decision.body
         new_content = _resolved_body(kind, old, proposed_body)
         if backup is None:
             backup = _backup_memory(memory_root)
+        with conn:
+            conn.execute(
+                "UPDATE suggestions SET base_sha256=?, target_existed=? WHERE id=?",
+                (expected["sha256"], int(expected["existed"]), sug_id),
+            )
         try:
             applied_ok = _apply_suggestion(
                 conn,
@@ -694,6 +712,10 @@ def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions) -> int:
             continue
         if applied_ok:
             applied.append(sug_id)
+            _, expected["body"], expected["sha256"], expected["existed"] = (
+                _curation_recheck(memory_root, snapshot)
+            )
+            expected["host_applied"] = True
         elif sug_id not in conflicts:
             deferred.append(sug_id)
             conflicts.append(sug_id)

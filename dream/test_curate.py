@@ -630,6 +630,89 @@ def test_curate_index_merge_keeps_existing_lines_and_appends_model_lines(tmp_pat
     assert result == "- [Existing](existing.md) — keep\n- [New](new.md) — added\n"
 
 
+def test_curate_tracks_expected_state_across_normalized_shared_index_target(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "memory"
+    root.mkdir()
+    (root / "MEMORY.md").write_text(
+        "- [Existing](existing.md) — keep\n", encoding="utf-8"
+    )
+    for name in ("existing.md", "first.md", "second.md", "third.md"):
+        (root / name).write_text(name, encoding="utf-8")
+    db_path = tmp_path / "dream.db"
+    config = load_config(
+        tmp_path / "missing-config.toml",
+        overrides={
+            "storage": {"db_path": str(db_path), "memory_root": str(root)},
+            "review": {"mode": "auto-apply"},
+        },
+    )
+    conn = open_db(db_path)
+    _insert_pending(
+        conn, root, "MEMORY.md", "index", "- [First](first.md) — one\n", preview=False
+    )
+    _insert_pending(
+        conn,
+        root,
+        "./MEMORY.md",
+        "index",
+        "- [Second](second.md) — two\n",
+        preview=False,
+    )
+    _insert_pending(
+        conn,
+        root,
+        "subdir/../MEMORY.md",
+        "index",
+        "- [Rejected](rejected.md) — no\n",
+        preview=False,
+    )
+    _insert_pending(
+        conn,
+        root,
+        "MEMORY.md",
+        "index",
+        "- [Third](third.md) — three\n",
+        preview=False,
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(
+        dream,
+        "generate",
+        lambda *args, **kwargs: SimpleNamespace(
+            output={
+                "decisions": [
+                    _decision(1, "merge", "add first", body="- [First](first.md) — one\n"),
+                    _decision(2, "merge", "add second", body="- [Second](second.md) — two\n"),
+                    _decision(3, "reject", "not useful"),
+                    _decision(4, "merge", "add third", body="- [Third](third.md) — three\n"),
+                ]
+            },
+            provider="codex",
+            model="gpt-5.6-luna",
+        ),
+        raising=False,
+    )
+
+    assert run_curate(root, db_path, config) == 0
+    assert (root / "MEMORY.md").read_text(encoding="utf-8") == (
+        "- [Existing](existing.md) — keep\n"
+        "- [First](first.md) — one\n"
+        "- [Second](second.md) — two\n"
+        "- [Third](third.md) — three\n"
+    )
+    assert statuses(db_path) == {
+        1: "accepted",
+        2: "accepted",
+        3: "rejected",
+        4: "accepted",
+    }
+    assert len(list(tmp_path.glob("memory-backups/*"))) == 1
+
+
 def test_curate_prompt_has_complete_body_and_never_reads_unsafe_target(tmp_path, monkeypatch):
     root, db_path, config = make_curation_fixture(tmp_path, auto_apply=True, target="safe.md")
     outside = tmp_path / "outside.md"
