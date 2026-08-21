@@ -9,6 +9,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -321,7 +323,8 @@ def test_apply_suggestion_remove_refuses_path_escape():
         assert row[0] == "rejected"
 
 
-def test_apply_suggestion_remove_refuses_memory_md():
+@pytest.mark.parametrize("target_path", ["MEMORY.md", "./MEMORY.md", "sub/../MEMORY.md"])
+def test_apply_suggestion_remove_refuses_memory_md_aliases(target_path):
     from dream import _apply_suggestion
 
     with tempfile.TemporaryDirectory() as d:
@@ -332,12 +335,13 @@ def test_apply_suggestion_remove_refuses_memory_md():
         conn = open_db(db_path)
         cur = conn.execute(
             "INSERT INTO suggestions(kind, target_path, body, rationale, source_sessions, status) "
-            "VALUES ('remove', 'MEMORY.md', '', 'malicious', '', 'pending')"
+            "VALUES ('remove', ?, '', 'malicious', '', 'pending')",
+            (target_path,),
         )
         sug_id = cur.lastrowid
         conn.commit()
 
-        _apply_suggestion(conn, root, root / ".suggestions", sug_id, "remove", "MEMORY.md", "", None)
+        _apply_suggestion(conn, root, root / ".suggestions", sug_id, "remove", target_path, "", None)
 
         assert (root / "MEMORY.md").exists()
         row = conn.execute("SELECT status FROM suggestions WHERE id=?", (sug_id,)).fetchone()

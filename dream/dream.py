@@ -29,6 +29,7 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
+from urllib.parse import quote
 from typing import Any
 
 # resolve() so the installed launcher (~/.local/bin/dream is a symlink into the repo)
@@ -82,6 +83,15 @@ def open_db(path: Path) -> sqlite3.Connection:
     schema = (ROOT / "schema.sql").read_text(encoding="utf-8")
     conn.executescript(schema)
     _migrate(conn)
+    return conn
+
+
+def _open_curation_readonly(path: Path) -> sqlite3.Connection:
+    """Open an existing curation DB read-only, including databases with an active WAL."""
+    resolved = path.expanduser().resolve()
+    uri = f"file:{quote(str(resolved), safe='/')}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.execute("PRAGMA query_only = ON")
     return conn
 
 
@@ -463,8 +473,10 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
     and is otherwise unvalidated before hitting unlink()/write_text().
     """
     tgt = memory_root / target_path
-    contained = tgt.resolve().is_relative_to(memory_root.resolve())
-    protected = kind == "remove" and target_path == "MEMORY.md"
+    resolved_root = memory_root.resolve()
+    resolved_target = tgt.resolve()
+    contained = resolved_target.is_relative_to(resolved_root)
+    protected = kind == "remove" and resolved_target == resolved_root / "MEMORY.md"
     state = conn.execute(
         "SELECT base_sha256, target_existed FROM suggestions WHERE id=?", (sug_id,)
     ).fetchone()
@@ -500,9 +512,18 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
 
 
 def _pending_suggestions(conn: sqlite3.Connection) -> list[sqlite3.Row | tuple]:
+    columns = _table_columns(conn, "suggestions")
+    required = {"id", "kind", "target_path", "body", "status"}
+    if not required.issubset(columns):
+        return []
+    selected = []
+    for name in (
+        "id", "kind", "target_path", "body", "rationale", "source_sessions",
+        "sug_file", "base_sha256", "target_existed",
+    ):
+        selected.append(name if name in columns else f"NULL AS {name}")
     return conn.execute(
-        "SELECT id, kind, target_path, body, rationale, source_sessions, sug_file, "
-        "base_sha256, target_existed FROM suggestions "
+        f"SELECT {', '.join(selected)} FROM suggestions "
         "WHERE status='pending' ORDER BY id"
     ).fetchall()
 
@@ -583,47 +604,7 @@ def _curation_recheck(memory_root: Path, snapshot: dict[str, Any]) -> tuple[Path
     return target, body, sha, exists
 
 
-def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, rows) -> int:
-    """Curate one complete pending batch through the configured review provider."""
-    if args.config.data["review"]["mode"] != "auto-apply":
-        print("review.mode is suggest-only; curation disabled, leaving suggestions pending")
-        return 0
-    if not rows:
-        print("No pending suggestions.")
-        return 0
-
-    try:
-        snapshots = [_curation_target_snapshot(memory_root, row) for row in rows]
-        prompt = build_curation_prompt(snapshots, memory_root)
-        result = generate("review", prompt, CURATION_SCHEMA, config=args.config)
-        decisions = parse_curation_output(result.output, {row[0] for row in rows})
-        missing_merge_bodies = [
-            sug_id for sug_id, decision in decisions.items()
-            if decision.decision == "merge" and not isinstance(decision.body, str)
-        ]
-        if missing_merge_bodies:
-            raise ValueError(
-                "merge decisions require string bodies: "
-                + ", ".join(str(sug_id) for sug_id in sorted(missing_merge_bodies))
-            )
-    except Exception as exc:
-        print(f"curation error: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
-
-    provider = getattr(result, "provider", None) or "unknown"
-    model = getattr(result, "model", None) or "(provider default)"
-    print(f"provider: {provider} / {model}")
-    dry_run = bool(getattr(args, "dry_run", False))
-    for snapshot in snapshots:
-        decision = decisions[snapshot["id"]]
-        suffix = f" body_chars={len(decision.body)}" if decision.body is not None else ""
-        print(
-            f"decision #{snapshot['id']}: {decision.decision} — {decision.reason}{suffix}"
-        )
-    if dry_run:
-        print("dry-run: no files, previews, statuses, or backups changed")
-        return 0
-
+def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions) -> int:
     by_id = {snapshot["id"]: snapshot for snapshot in snapshots}
     applied: list[int] = []
     rejected: list[int] = []
@@ -657,7 +638,7 @@ def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, ro
             unsafe.append(sug_id)
             print(f"conflict #{sug_id}: unsafe target path; rejected by host safety check")
             continue
-        if kind == "remove" and target_path == "MEMORY.md":
+        if kind == "remove" and target == memory_root.resolve() / "MEMORY.md":
             _reject_suggestion(conn, memory_root / ".suggestions", sug_id, sug_file)
             rejected.append(sug_id)
             unsafe.append(sug_id)
@@ -688,11 +669,7 @@ def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, ro
                 )
         proposed_body = snapshot["body"] if decision.decision == "accept" else decision.body
         new_content = _resolved_body(kind, old, proposed_body)
-        mutates_file = (
-            (kind == "remove" and target_existed)
-            or (kind in ("new", "update", "index") and (not target_existed or new_content != old))
-        )
-        if mutates_file and backup is None:
+        if backup is None:
             backup = _backup_memory(memory_root)
         try:
             applied_ok = _apply_suggestion(
@@ -719,8 +696,12 @@ def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, ro
             deferred.append(sug_id)
             conflicts.append(sug_id)
 
-    if applied and _prune_orphaned_index_lines(memory_root):
-        print("pruned orphaned MEMORY.md links")
+    if applied:
+        if backup is None:
+            backup = _backup_memory(memory_root)
+        if _prune_orphaned_index_lines(memory_root):
+            _sync_recall_documents(conn, memory_root)
+            print("pruned orphaned MEMORY.md links")
     print(f"applied IDs: {applied}")
     print(f"rejected IDs: {rejected}")
     print(f"deferred IDs: {deferred}")
@@ -731,14 +712,78 @@ def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, ro
     return 1 if unsafe else 0
 
 
+def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, rows) -> int:
+    """Curate one complete pending batch through the configured review provider."""
+    if args.config.data["review"]["mode"] != "auto-apply":
+        conn.close()
+        print("review.mode is suggest-only; curation disabled, leaving suggestions pending")
+        return 0
+    if not rows:
+        conn.close()
+        print("No pending suggestions.")
+        return 0
+
+    try:
+        snapshots = [_curation_target_snapshot(memory_root, row) for row in rows]
+        prompt = build_curation_prompt(snapshots, memory_root)
+        result = generate("review", prompt, CURATION_SCHEMA, config=args.config)
+        decisions = parse_curation_output(result.output, {row[0] for row in rows})
+        missing_merge_bodies = [
+            sug_id for sug_id, decision in decisions.items()
+            if decision.decision == "merge" and not isinstance(decision.body, str)
+        ]
+        if missing_merge_bodies:
+            raise ValueError(
+                "merge decisions require string bodies: "
+                + ", ".join(str(sug_id) for sug_id in sorted(missing_merge_bodies))
+            )
+    except Exception as exc:
+        conn.close()
+        print(f"curation error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+    provider = getattr(result, "provider", None) or "unknown"
+    model = getattr(result, "model", None) or "(provider default)"
+    print(f"provider: {provider} / {model}")
+    dry_run = bool(getattr(args, "dry_run", False))
+    for snapshot in snapshots:
+        decision = decisions[snapshot["id"]]
+        suffix = f" body_chars={len(decision.body)}" if decision.body is not None else ""
+        print(
+            f"decision #{snapshot['id']}: {decision.decision} — {decision.reason}{suffix}"
+        )
+    conn.close()
+    if dry_run:
+        print("dry-run: no files, previews, statuses, or backups changed")
+        return 0
+    write_conn = open_db(args.db)
+    try:
+        return _apply_curated_batch(write_conn, memory_root, snapshots, decisions)
+    finally:
+        write_conn.close()
+
+
 def cmd_suggestions(args: argparse.Namespace) -> int:
-    conn = open_db_readonly(args.db) if args.suggestions_cmd == "list" else open_db(args.db)
     memory_root = Path(args.memory)
     sug_dir = memory_root / ".suggestions"
-    rows = _pending_suggestions(conn)
 
     if args.suggestions_cmd == "curate-configured":
+        if not Path(args.db).exists():
+            print("No pending suggestions.")
+            return 0
+        conn = None
+        try:
+            conn = _open_curation_readonly(args.db)
+            rows = _pending_suggestions(conn)
+        except Exception as exc:
+            if conn is not None:
+                conn.close()
+            print(f"curation error: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
         return _cmd_curate_configured(args, conn, memory_root, rows)
+
+    conn = open_db_readonly(args.db) if args.suggestions_cmd == "list" else open_db(args.db)
+    rows = _pending_suggestions(conn)
 
     if args.suggestions_cmd == "list":
         items = []

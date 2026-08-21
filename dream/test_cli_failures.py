@@ -51,3 +51,29 @@ def test_read_only_commands_work_without_database_directory_write_access(tmp_pat
         assert '"suggestions": []' in capsys.readouterr().out
     finally:
         db_dir.chmod(0o755)
+
+
+def test_curate_missing_database_does_not_create_it(tmp_path, capsys):
+    from types import SimpleNamespace
+
+    from config import load_config
+
+    db_path = tmp_path / "missing" / "dream.db"
+    config = load_config(
+        tmp_path / "config.toml",
+        overrides={
+            "storage": {"db_path": str(db_path), "memory_root": str(tmp_path / "memory")},
+            "review": {"mode": "auto-apply"},
+        },
+    )
+    args = SimpleNamespace(
+        db=db_path,
+        memory=str(tmp_path / "memory"),
+        suggestions_cmd="curate-configured",
+        config=config,
+        dry_run=False,
+    )
+
+    assert dream.cmd_suggestions(args) == 0
+    assert "No pending suggestions." in capsys.readouterr().out
+    assert not db_path.exists()

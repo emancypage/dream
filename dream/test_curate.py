@@ -301,6 +301,180 @@ def test_curate_provider_failure_writes_nothing(tmp_path, monkeypatch):
     assert not list(tmp_path.glob("memory-backups/*"))
 
 
+def test_curate_rejects_memory_alias_remove_before_unlinking(tmp_path, monkeypatch):
+    root = tmp_path / "memory"
+    root.mkdir()
+    index = root / "MEMORY.md"
+    index.write_text("- [A](a.md) — keep\n", encoding="utf-8")
+    db_path = tmp_path / "dream.db"
+    config = load_config(
+        tmp_path / "missing-config.toml",
+        overrides={
+            "storage": {"db_path": str(db_path), "memory_root": str(root)},
+            "review": {"mode": "auto-apply"},
+        },
+    )
+    conn = open_db(db_path)
+    _insert_pending(conn, root, "./MEMORY.md", "remove", "")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        dream,
+        "generate",
+        lambda *args, **kwargs: SimpleNamespace(
+            output={"decisions": [{"suggestion_id": 1, "decision": "accept", "reason": "remove"}]},
+            provider="codex", model="gpt-5.6-luna",
+        ),
+        raising=False,
+    )
+
+    assert run_curate(root, db_path, config) == 1
+    assert index.exists()
+    assert statuses(db_path)[1] == "rejected"
+    assert not list(tmp_path.glob("memory-backups/*"))
+
+
+def test_curate_creates_backup_before_accepted_existing_noop_write(tmp_path, monkeypatch):
+    root = tmp_path / "memory"
+    root.mkdir()
+    target = root / "same.md"
+    target.write_text("same body", encoding="utf-8")
+    db_path = tmp_path / "dream.db"
+    config = load_config(
+        tmp_path / "missing-config.toml",
+        overrides={
+            "storage": {"db_path": str(db_path), "memory_root": str(root)},
+            "review": {"mode": "auto-apply"},
+        },
+    )
+    conn = open_db(db_path)
+    _insert_pending(conn, root, "same.md", "update", "same body")
+    conn.commit()
+    conn.close()
+    seen_backups = []
+    real_apply = dream._apply_suggestion
+
+    def checked_apply(*args, **kwargs):
+        seen_backups.append(list(tmp_path.glob("memory-backups/*")))
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(dream, "_apply_suggestion", checked_apply)
+    monkeypatch.setattr(
+        dream,
+        "generate",
+        lambda *args, **kwargs: SimpleNamespace(
+            output={"decisions": [{"suggestion_id": 1, "decision": "accept", "reason": "same"}]},
+            provider="codex", model="gpt-5.6-luna",
+        ),
+        raising=False,
+    )
+
+    assert run_curate(root, db_path, config) == 0
+    assert seen_backups and seen_backups[0]
+    assert list(tmp_path.glob("memory-backups/*"))
+    assert target.read_text(encoding="utf-8") == "same body"
+    assert statuses(db_path)[1] == "accepted"
+
+
+def test_curate_syncs_recall_after_final_index_prune(tmp_path, monkeypatch):
+    root = tmp_path / "memory"
+    root.mkdir()
+    (root / "MEMORY.md").write_text(
+        "- [A](a.md) — keep\n- [Gone](gone.md) — orphan\n", encoding="utf-8"
+    )
+    target = root / "topic.md"
+    target.write_text("old", encoding="utf-8")
+    db_path = tmp_path / "dream.db"
+    config = load_config(
+        tmp_path / "missing-config.toml",
+        overrides={
+            "storage": {"db_path": str(db_path), "memory_root": str(root)},
+            "review": {"mode": "auto-apply"},
+        },
+    )
+    conn = open_db(db_path)
+    dream._sync_recall_documents(conn, root)
+    _insert_pending(conn, root, "topic.md", "update", "new")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        dream,
+        "generate",
+        lambda *args, **kwargs: SimpleNamespace(
+            output={"decisions": [{"suggestion_id": 1, "decision": "accept", "reason": "update"}]},
+            provider="codex", model="gpt-5.6-luna",
+        ),
+        raising=False,
+    )
+
+    assert run_curate(root, db_path, config) == 0
+    conn = sqlite3.connect(db_path)
+    try:
+        recall_body = conn.execute(
+            "SELECT text FROM recall_documents WHERE source_kind='approved_memory' AND source_path='MEMORY.md'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert "gone.md" not in recall_body
+
+
+@pytest.mark.parametrize("case", ["provider-failure", "dry-run"])
+def test_curate_legacy_db_has_no_provider_or_dry_run_writes(tmp_path, monkeypatch, case):
+    root = tmp_path / "memory"
+    root.mkdir()
+    target = root / "legacy.md"
+    target.write_text("old", encoding="utf-8")
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE suggestions ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, "
+        "target_path TEXT NOT NULL, body TEXT NOT NULL, rationale TEXT, "
+        "source_sessions TEXT, status TEXT DEFAULT 'pending', reviewed_at TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO suggestions(kind, target_path, body, rationale, source_sessions, status) "
+        "VALUES ('update', 'legacy.md', 'new', 'legacy', '', 'pending')"
+    )
+    conn.commit()
+    conn.close()
+    before = db_path.read_bytes()
+    config = load_config(
+        tmp_path / "missing-config.toml",
+        overrides={
+            "storage": {"db_path": str(db_path), "memory_root": str(root)},
+            "review": {"mode": "auto-apply"},
+        },
+    )
+    if case == "provider-failure":
+        def fail_provider(*args, **kwargs):
+            raise RuntimeError("provider failed")
+
+        monkeypatch.setattr(dream, "generate", fail_provider, raising=False)
+        expected_rc = 1
+    else:
+        monkeypatch.setattr(
+            dream,
+            "generate",
+            lambda *args, **kwargs: SimpleNamespace(
+                output={"decisions": [{"suggestion_id": 1, "decision": "defer", "reason": "later"}]},
+                provider="codex", model="gpt-5.6-luna",
+            ),
+            raising=False,
+        )
+        expected_rc = 0
+
+    assert run_curate(root, db_path, config, dry_run=case == "dry-run") == expected_rc
+    assert db_path.read_bytes() == before
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(suggestions)")}
+    finally:
+        conn.close()
+    assert not {"sug_file", "base_sha256", "target_existed"} & columns
+    assert not list(tmp_path.glob("memory-backups/*"))
+
+
 def test_curate_dry_run_validates_and_writes_nothing(tmp_path, monkeypatch, capsys):
     root, db_path, config = make_curation_fixture(tmp_path, auto_apply=True)
     before = _fixture_snapshot(root, db_path)
