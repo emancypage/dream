@@ -35,10 +35,10 @@ backups, SHA preconditions, protected files, and database status changes.
 ## Configuration and routing
 
 Add a `review` model stage to the existing stage configuration, with the local
-profile explicitly routed through the `codex` provider. The default local
-profile uses the existing `gpt-5.6-sol` consolidation route unless a separate
-review model is configured. The systemd unit must invoke the LLM curation
-command; it must not invoke Claude or the deterministic accept-all path.
+profile explicitly routed through the `codex` provider using model
+`gpt-5.6-luna` and `reasoning_effort = "high"`. The systemd unit must invoke
+the LLM curation command; it must not invoke Claude or the deterministic
+accept-all path.
 
 The deterministic apply command remains available for explicit emergency use,
 but it is no longer the nightly path.
