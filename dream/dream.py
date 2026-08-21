@@ -40,8 +40,9 @@ from ingest import discover_jsonl, home_project_slug, ingest_file, ingest_config
 from distill import distill_session, sessions_needing_distill  # noqa: E402
 from consolidate import consolidate as run_consolidate  # noqa: E402
 from search import search as fts_search, session_summary  # noqa: E402
-from backend import active_backend, preflight  # noqa: E402
+from backend import active_backend, generate, preflight  # noqa: E402
 from config import load_config  # noqa: E402
+from curate import CURATION_SCHEMA, build_curation_prompt, parse_curation_output  # noqa: E402
 from recall_documents import synchronize_recall_documents  # noqa: E402
 from recall_context import append_diagnostic, parse_hook_payload, recall_preflight, run_context, hook_success_json  # noqa: E402
 from recall_hook_state import claim_hook_event, finish_hook_event, successful_session_start_ids  # noqa: E402
@@ -506,11 +507,238 @@ def _pending_suggestions(conn: sqlite3.Connection) -> list[sqlite3.Row | tuple]:
     ).fetchall()
 
 
+def _safe_suggestion_target(memory_root: Path, target_path: str) -> Path | None:
+    """Resolve a suggestion target only when it remains inside memory_root."""
+    root = memory_root.resolve()
+    target = (memory_root / target_path).resolve()
+    return target if target.is_relative_to(root) else None
+
+
+def _curation_target_snapshot(memory_root: Path, row: tuple) -> dict[str, Any]:
+    """Build the model-facing snapshot without reading an unsafe target path."""
+    sug_id, kind, target_path, body, rationale, sources, sug_file, base_sha, existed = row
+    target = _safe_suggestion_target(memory_root, target_path)
+    if target is None:
+        return {
+            "id": sug_id,
+            "kind": kind,
+            "target_path": target_path,
+            "body": body,
+            "rationale": rationale,
+            "source_sessions": sources,
+            "sug_file": sug_file,
+            "base_sha256": base_sha,
+            "target_existed": bool(existed),
+            "current_body": "",
+            "current_sha256": None,
+            "conflict": True,
+        }
+
+    target_existed = target.exists()
+    current_body = target.read_text(encoding="utf-8") if target_existed else ""
+    current_sha = _file_sha256(target) if target_existed else None
+    conflict = (
+        base_sha is not None and current_sha != base_sha
+    ) or (
+        base_sha is None and existed == 0 and target_existed
+    )
+    return {
+        "id": sug_id,
+        "kind": kind,
+        "target_path": target_path,
+        "body": body,
+        "rationale": rationale,
+        "source_sessions": sources,
+        "sug_file": sug_file,
+        "base_sha256": base_sha,
+        "target_existed": target_existed,
+        "current_body": current_body,
+        "current_sha256": current_sha,
+        "conflict": conflict,
+    }
+
+
+def _drop_suggestion_preview(sug_dir: Path, sug_file: str | None) -> None:
+    if sug_file:
+        (sug_dir / sug_file).unlink(missing_ok=True)
+
+
+def _reject_suggestion(conn: sqlite3.Connection, sug_dir: Path, sug_id, sug_file) -> None:
+    with conn:
+        conn.execute(
+            "UPDATE suggestions SET status='rejected', reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
+            (sug_id,),
+        )
+    _drop_suggestion_preview(sug_dir, sug_file)
+
+
+def _curation_recheck(memory_root: Path, snapshot: dict[str, Any]) -> tuple[Path | None, str, str | None, bool]:
+    """Reread a target and return path, body, SHA, and existence for the apply gate."""
+    target = _safe_suggestion_target(memory_root, snapshot["target_path"])
+    if target is None:
+        return None, "", None, False
+    exists = target.exists()
+    body = target.read_text(encoding="utf-8") if exists else ""
+    sha = _file_sha256(target) if exists else None
+    return target, body, sha, exists
+
+
+def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, rows) -> int:
+    """Curate one complete pending batch through the configured review provider."""
+    if args.config.data["review"]["mode"] != "auto-apply":
+        print("review.mode is suggest-only; curation disabled, leaving suggestions pending")
+        return 0
+    if not rows:
+        print("No pending suggestions.")
+        return 0
+
+    try:
+        snapshots = [_curation_target_snapshot(memory_root, row) for row in rows]
+        prompt = build_curation_prompt(snapshots, memory_root)
+        result = generate("review", prompt, CURATION_SCHEMA, config=args.config)
+        decisions = parse_curation_output(result.output, {row[0] for row in rows})
+        missing_merge_bodies = [
+            sug_id for sug_id, decision in decisions.items()
+            if decision.decision == "merge" and not isinstance(decision.body, str)
+        ]
+        if missing_merge_bodies:
+            raise ValueError(
+                "merge decisions require string bodies: "
+                + ", ".join(str(sug_id) for sug_id in sorted(missing_merge_bodies))
+            )
+    except Exception as exc:
+        print(f"curation error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+    provider = getattr(result, "provider", None) or "unknown"
+    model = getattr(result, "model", None) or "(provider default)"
+    print(f"provider: {provider} / {model}")
+    dry_run = bool(getattr(args, "dry_run", False))
+    for snapshot in snapshots:
+        decision = decisions[snapshot["id"]]
+        suffix = f" body_chars={len(decision.body)}" if decision.body is not None else ""
+        print(
+            f"decision #{snapshot['id']}: {decision.decision} — {decision.reason}{suffix}"
+        )
+    if dry_run:
+        print("dry-run: no files, previews, statuses, or backups changed")
+        return 0
+
+    by_id = {snapshot["id"]: snapshot for snapshot in snapshots}
+    applied: list[int] = []
+    rejected: list[int] = []
+    deferred: list[int] = []
+    conflicts: list[int] = []
+    unsafe: list[int] = []
+    backup: Path | None = None
+
+    for sug_id in sorted(decisions):
+        snapshot = by_id[sug_id]
+        decision = decisions[sug_id]
+        kind = snapshot["kind"]
+        target_path = snapshot["target_path"]
+        sug_file = snapshot["sug_file"]
+        if decision.decision == "reject":
+            _reject_suggestion(conn, memory_root / ".suggestions", sug_id, sug_file)
+            rejected.append(sug_id)
+            continue
+        if decision.decision == "defer":
+            deferred.append(sug_id)
+            continue
+        if decision.decision == "merge" and kind == "remove":
+            deferred.append(sug_id)
+            print(f"deferred #{sug_id} ({target_path}): merge is unsupported for remove suggestions")
+            continue
+
+        target = _safe_suggestion_target(memory_root, target_path)
+        if target is None:
+            _reject_suggestion(conn, memory_root / ".suggestions", sug_id, sug_file)
+            rejected.append(sug_id)
+            unsafe.append(sug_id)
+            print(f"conflict #{sug_id}: unsafe target path; rejected by host safety check")
+            continue
+        if kind == "remove" and target_path == "MEMORY.md":
+            _reject_suggestion(conn, memory_root / ".suggestions", sug_id, sug_file)
+            rejected.append(sug_id)
+            unsafe.append(sug_id)
+            print(f"unsafe #{sug_id} ({target_path}): protected target; rejected by host safety check")
+            continue
+        if snapshot["conflict"] and decision.decision == "accept":
+            deferred.append(sug_id)
+            conflicts.append(sug_id)
+            print(f"conflict #{sug_id} ({target_path}): initial conflict; accept deferred")
+            continue
+
+        rechecked_target, old, current_sha, target_existed = _curation_recheck(memory_root, snapshot)
+        if (
+            rechecked_target is None
+            or current_sha != snapshot["current_sha256"]
+            or target_existed != snapshot["target_existed"]
+        ):
+            deferred.append(sug_id)
+            conflicts.append(sug_id)
+            print(f"conflict #{sug_id} ({target_path}): target changed during curation")
+            continue
+
+        if decision.decision == "merge" and snapshot["conflict"]:
+            with conn:
+                conn.execute(
+                    "UPDATE suggestions SET base_sha256=?, target_existed=? WHERE id=?",
+                    (current_sha, int(target_existed), sug_id),
+                )
+        proposed_body = snapshot["body"] if decision.decision == "accept" else decision.body
+        new_content = _resolved_body(kind, old, proposed_body)
+        mutates_file = (
+            (kind == "remove" and target_existed)
+            or (kind in ("new", "update", "index") and (not target_existed or new_content != old))
+        )
+        if mutates_file and backup is None:
+            backup = _backup_memory(memory_root)
+        try:
+            applied_ok = _apply_suggestion(
+                conn,
+                memory_root,
+                memory_root / ".suggestions",
+                sug_id,
+                kind,
+                target_path,
+                new_content,
+                sug_file,
+            )
+        except Exception as exc:
+            print(
+                f"unsafe application #{sug_id} ({target_path}): "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            unsafe.append(sug_id)
+            continue
+        if applied_ok:
+            applied.append(sug_id)
+        elif sug_id not in conflicts:
+            deferred.append(sug_id)
+            conflicts.append(sug_id)
+
+    if applied and _prune_orphaned_index_lines(memory_root):
+        print("pruned orphaned MEMORY.md links")
+    print(f"applied IDs: {applied}")
+    print(f"rejected IDs: {rejected}")
+    print(f"deferred IDs: {deferred}")
+    print(f"conflict IDs: {conflicts}")
+    print(f"backup: {backup if backup is not None else 'none'}")
+    if unsafe:
+        print(f"unsafe IDs: {unsafe}", file=sys.stderr)
+    return 1 if unsafe else 0
+
+
 def cmd_suggestions(args: argparse.Namespace) -> int:
     conn = open_db_readonly(args.db) if args.suggestions_cmd == "list" else open_db(args.db)
     memory_root = Path(args.memory)
     sug_dir = memory_root / ".suggestions"
     rows = _pending_suggestions(conn)
+
+    if args.suggestions_cmd == "curate-configured":
+        return _cmd_curate_configured(args, conn, memory_root, rows)
 
     if args.suggestions_cmd == "list":
         items = []
@@ -901,6 +1129,9 @@ def main(argv: list[str] | None = None) -> int:
     sall.set_defaults(func=cmd_suggestions)
     sconfigured = ssub.add_parser("apply-configured")
     sconfigured.set_defaults(func=cmd_suggestions)
+    scurate = ssub.add_parser("curate-configured")
+    scurate.add_argument("--dry-run", action="store_true")
+    scurate.set_defaults(func=cmd_suggestions)
 
     pst = sub.add_parser("status", help="Show DB stats")
     pst.set_defaults(func=cmd_status)
