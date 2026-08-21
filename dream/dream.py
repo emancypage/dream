@@ -89,6 +89,8 @@ def open_db(path: Path) -> sqlite3.Connection:
 def _open_curation_readonly(path: Path) -> sqlite3.Connection:
     """Open an existing curation DB read-only, including databases with an active WAL."""
     resolved = path.expanduser().resolve()
+    if not resolved.with_name(f"{resolved.name}-wal").exists():
+        return open_db_readonly(resolved)
     uri = f"file:{quote(str(resolved), safe='/')}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.execute("PRAGMA query_only = ON")

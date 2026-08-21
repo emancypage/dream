@@ -220,6 +220,43 @@ def run_curate(root, db_path, config, dry_run=False):
     )
 
 
+def test_curate_no_wal_uses_immutable_snapshot_without_writes(tmp_path, monkeypatch):
+    root, db_path, config = make_curation_fixture(
+        tmp_path, auto_apply=True, target="existing.md"
+    )
+    assert not Path(f"{db_path}-wal").exists()
+    before = _fixture_snapshot(root, db_path)
+    opened_with_immutable_helper = []
+    real_open_db_readonly = dream.open_db_readonly
+
+    def tracked_open_db_readonly(path):
+        opened_with_immutable_helper.append(path)
+        return real_open_db_readonly(path)
+
+    monkeypatch.setattr(dream, "open_db_readonly", tracked_open_db_readonly)
+    captured = {}
+
+    def fake_review(_stage, prompt, _schema, **_kwargs):
+        captured["prompt"] = prompt
+        return SimpleNamespace(
+            output={
+                "decisions": [
+                    {"suggestion_id": 1, "decision": "defer", "reason": "inspect later"}
+                ]
+            },
+            provider="codex",
+            model="gpt-5.6-luna",
+        )
+
+    monkeypatch.setattr(dream, "generate", fake_review, raising=False)
+
+    assert run_curate(root, db_path, config, dry_run=True) == 0
+    assert opened_with_immutable_helper == [db_path]
+    assert '"target_path": "existing.md"' in captured["prompt"]
+    assert _fixture_snapshot(root, db_path) == before
+    assert not Path(f"{db_path}-wal").exists()
+
+
 def statuses(db_path):
     conn = sqlite3.connect(db_path)
     try:
