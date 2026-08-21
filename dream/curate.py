@@ -30,7 +30,7 @@ CURATION_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["suggestion_id", "decision", "reason"],
+                "required": ["suggestion_id", "decision", "reason", "body"],
                 "additionalProperties": False,
                 "properties": {
                     "suggestion_id": {"type": "integer"},
@@ -52,7 +52,7 @@ class CurationDecision:
     suggestion_id: int
     decision: str
     reason: str
-    body: str | None = None
+    body: str
 
 
 _ROW_FIELDS = (
@@ -158,7 +158,8 @@ For a regular file, a merge body is the complete replacement body, not a patch.
 
 Return exactly one decision for every supplied ID. The only decisions are exactly:
 accept, reject, merge, defer. Every decision needs a concise, non-empty reason.
-Use a body only when returning merge; accept, reject, and defer must not include one.
+Every decision must include a string body. For accept, reject, and defer, return
+"body": "". For merge, return the complete replacement or merge body; the merge body may be empty.
 
 Pending suggestion snapshots:
 {payload}
@@ -198,8 +199,8 @@ def parse_curation_output(
                 f"reason for decision on suggestion ID {suggestion_id} must be non-empty"
             )
         decision = item["decision"]
-        body = item.get("body")
-        if body is not None and decision != "merge":
+        body = item["body"]
+        if decision != "merge" and body != "":
             raise ValueError(
                 f"body is not allowed for decision on suggestion ID {suggestion_id} ({decision})"
             )

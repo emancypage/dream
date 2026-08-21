@@ -28,6 +28,7 @@ def _decision(suggestion_id, decision="defer", reason="needs more evidence", **e
         "suggestion_id": suggestion_id,
         "decision": decision,
         "reason": reason,
+        "body": "",
     }
     value.update(extra)
     return value
@@ -47,6 +48,21 @@ def test_parse_curation_output_returns_typed_decisions():
             body="merged",
         )
     }
+
+
+def test_parse_curation_output_accepts_empty_body_for_non_merge_and_merge():
+    result = parse_curation_output(
+        {
+            "decisions": [
+                _decision(7, "accept", "matches current facts"),
+                _decision(8, "merge", "no replacement needed"),
+            ]
+        },
+        {7, 8},
+    )
+
+    assert result[7].body == ""
+    assert result[8].body == ""
 
 
 @pytest.mark.parametrize(
@@ -70,6 +86,28 @@ def test_parse_curation_output_rejects_body_for_non_merge_decision():
             {"decisions": [_decision(7, "accept", "matches current facts", body="wrong")]},
             {7},
         )
+
+
+def test_parse_curation_output_requires_string_body():
+    with pytest.raises(SchemaValidationError, match=r"\$\.decisions\[0\]\.body: expected string"):
+        parse_curation_output(
+            {"decisions": [_decision(7, "merge", "invalid body", body=None)]},
+            {7},
+        )
+
+
+def test_curation_schema_requires_body_on_every_decision():
+    assert CURATION_SCHEMA["properties"]["decisions"]["items"]["required"] == [
+        "suggestion_id",
+        "decision",
+        "reason",
+        "body",
+    ]
+    missing_body = _decision(7)
+    del missing_body["body"]
+
+    with pytest.raises(SchemaValidationError, match="missing required keys: body"):
+        validate_output({"decisions": [missing_body]}, CURATION_SCHEMA)
 
 
 def test_curation_schema_rejects_extra_keys_at_both_object_levels():
@@ -132,6 +170,8 @@ def test_build_curation_prompt_contains_bounded_review_context_and_safety_rules(
     assert "complete replacement body" in prompt
     assert "accept, reject, merge, defer" in prompt
     assert "concise" in prompt
+    assert '"body": ""' in prompt
+    assert "merge body may be empty" in prompt
 
 
 def test_build_curation_prompt_rejects_field_overrun_before_serializing():
@@ -241,7 +281,7 @@ def test_curate_no_wal_uses_immutable_snapshot_without_writes(tmp_path, monkeypa
         return SimpleNamespace(
             output={
                 "decisions": [
-                    {"suggestion_id": 1, "decision": "defer", "reason": "inspect later"}
+                    {"suggestion_id": 1, "decision": "defer", "reason": "inspect later", "body": ""}
                 ]
             },
             provider="codex",
@@ -284,10 +324,10 @@ def test_curate_accept_merge_reject_and_defer_updates_only_expected_rows(tmp_pat
         return SimpleNamespace(
             output={
                 "decisions": [
-                    {"suggestion_id": 1, "decision": "accept", "reason": "confirmed"},
+                    {"suggestion_id": 1, "decision": "accept", "reason": "confirmed", "body": ""},
                     {"suggestion_id": 2, "decision": "merge", "reason": "updated", "body": "model merged body"},
-                    {"suggestion_id": 3, "decision": "reject", "reason": "obsolete"},
-                    {"suggestion_id": 4, "decision": "defer", "reason": "needs review"},
+                    {"suggestion_id": 3, "decision": "reject", "reason": "obsolete", "body": ""},
+                    {"suggestion_id": 4, "decision": "defer", "reason": "needs review", "body": ""},
                 ]
             },
             provider="codex",
@@ -359,7 +399,7 @@ def test_curate_rejects_memory_alias_remove_before_unlinking(tmp_path, monkeypat
         dream,
         "generate",
         lambda *args, **kwargs: SimpleNamespace(
-            output={"decisions": [{"suggestion_id": 1, "decision": "accept", "reason": "remove"}]},
+            output={"decisions": [{"suggestion_id": 1, "decision": "accept", "reason": "remove", "body": ""}]},
             provider="codex", model="gpt-5.6-luna",
         ),
         raising=False,
@@ -400,7 +440,7 @@ def test_curate_creates_backup_before_accepted_existing_noop_write(tmp_path, mon
         dream,
         "generate",
         lambda *args, **kwargs: SimpleNamespace(
-            output={"decisions": [{"suggestion_id": 1, "decision": "accept", "reason": "same"}]},
+            output={"decisions": [{"suggestion_id": 1, "decision": "accept", "reason": "same", "body": ""}]},
             provider="codex", model="gpt-5.6-luna",
         ),
         raising=False,
@@ -438,7 +478,7 @@ def test_curate_syncs_recall_after_final_index_prune(tmp_path, monkeypatch):
         dream,
         "generate",
         lambda *args, **kwargs: SimpleNamespace(
-            output={"decisions": [{"suggestion_id": 1, "decision": "accept", "reason": "update"}]},
+            output={"decisions": [{"suggestion_id": 1, "decision": "accept", "reason": "update", "body": ""}]},
             provider="codex", model="gpt-5.6-luna",
         ),
         raising=False,
@@ -494,7 +534,7 @@ def test_curate_legacy_db_has_no_provider_or_dry_run_writes(tmp_path, monkeypatc
             dream,
             "generate",
             lambda *args, **kwargs: SimpleNamespace(
-                output={"decisions": [{"suggestion_id": 1, "decision": "defer", "reason": "later"}]},
+                output={"decisions": [{"suggestion_id": 1, "decision": "defer", "reason": "later", "body": ""}]},
                 provider="codex", model="gpt-5.6-luna",
             ),
             raising=False,
@@ -521,10 +561,10 @@ def test_curate_dry_run_validates_and_writes_nothing(tmp_path, monkeypatch, caps
         "generate",
         lambda *args, **kwargs: SimpleNamespace(
             output={"decisions": [
-                {"suggestion_id": 1, "decision": "accept", "reason": "confirmed"},
+                {"suggestion_id": 1, "decision": "accept", "reason": "confirmed", "body": ""},
                 {"suggestion_id": 2, "decision": "merge", "reason": "updated", "body": "merged"},
-                {"suggestion_id": 3, "decision": "reject", "reason": "obsolete"},
-                {"suggestion_id": 4, "decision": "defer", "reason": "later"},
+                {"suggestion_id": 3, "decision": "reject", "reason": "obsolete", "body": ""},
+                {"suggestion_id": 4, "decision": "defer", "reason": "later", "body": ""},
             ]},
             provider="codex", model="gpt-5.6-luna",
         ),
@@ -546,7 +586,7 @@ def test_curate_rejects_incomplete_response_before_any_mutation(tmp_path, monkey
         dream,
         "generate",
         lambda *args, **kwargs: SimpleNamespace(
-            output={"decisions": [{"suggestion_id": 1, "decision": "reject", "reason": "obsolete"}]},
+            output={"decisions": [{"suggestion_id": 1, "decision": "reject", "reason": "obsolete", "body": ""}]},
             provider="codex", model="gpt-5.6-luna",
         ),
         raising=False,
@@ -605,7 +645,7 @@ def test_curate_prompt_has_complete_body_and_never_reads_unsafe_target(tmp_path,
     def fake_review(stage, prompt, schema, **kwargs):
         captured["prompt"] = prompt
         return SimpleNamespace(
-            output={"decisions": [{"suggestion_id": 1, "decision": "defer", "reason": "unsafe"}]},
+            output={"decisions": [{"suggestion_id": 1, "decision": "defer", "reason": "unsafe", "body": ""}]},
             provider="codex", model="gpt-5.6-luna",
         )
 
@@ -624,10 +664,10 @@ def test_curate_prompt_snapshots_complete_current_target_body(tmp_path, monkeypa
         captured["prompt"] = prompt
         return SimpleNamespace(
             output={"decisions": [
-                {"suggestion_id": 1, "decision": "defer", "reason": "inspect"},
-                {"suggestion_id": 2, "decision": "defer", "reason": "inspect"},
-                {"suggestion_id": 3, "decision": "defer", "reason": "inspect"},
-                {"suggestion_id": 4, "decision": "defer", "reason": "inspect"},
+                {"suggestion_id": 1, "decision": "defer", "reason": "inspect", "body": ""},
+                {"suggestion_id": 2, "decision": "defer", "reason": "inspect", "body": ""},
+                {"suggestion_id": 3, "decision": "defer", "reason": "inspect", "body": ""},
+                {"suggestion_id": 4, "decision": "defer", "reason": "inspect", "body": ""},
             ]},
             provider="codex", model="gpt-5.6-luna",
         )
