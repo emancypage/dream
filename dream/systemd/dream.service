@@ -1,5 +1,5 @@
 [Unit]
-Description=dream nightly — ingest + distill + consolidate + apply memory
+Description=dream nightly — ingest + distill + consolidate + Codex curation
 After=network-online.target
 Wants=network-online.target
 
@@ -11,4 +11,4 @@ Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/opt/homebrew/bin:
 ExecStart=%h/.local/bin/dream ingest
 ExecStart=%h/.local/bin/dream distill --yes --limit 50
 ExecStart=%h/.local/bin/dream consolidate
-ExecStart=%h/.local/bin/dream suggestions apply-configured
+ExecStart=%h/.local/bin/dream suggestions curate-configured

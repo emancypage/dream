@@ -60,15 +60,15 @@ Return concise stage results. Preserve exact provider, authentication, schema, c
 
 ## Curate pending suggestions autonomously
 
-When the user asks to review dream, make the decisions rather than handing them an interactive TTY workflow.
+When the user asks to review Dream autonomously, use the configured curation route rather than handing them an interactive TTY workflow.
 
-1. Run `dream suggestions list`; it returns JSON by default.
-2. For each pending suggestion, compare its body with the current target file and its rationale/source sessions.
-3. Accept a clean, current suggestion with `dream suggestions accept <id>`.
-4. Reject a stale, incorrect, redundant, or harmful suggestion with `dream suggestions reject <id>`.
-5. When a suggestion contains a useful change but would regress newer content, construct a merged full body and run `dream suggestions merge <id> --body-file <path>`.
-6. If the CLI reports a hash conflict, reread the live target and merge or reject; never bypass the precondition.
-7. Report accepted, rejected, merged, and unresolved IDs with one-line reasons.
+1. Run `dream suggestions list` when an inventory is useful; it returns JSON by default.
+2. Use `dream suggestions curate-configured --dry-run` for a no-write preview, or `dream suggestions curate-configured` for the automatic route. The review stage uses the configured Codex provider; the production profile is `gpt-5.6-luna` with `reasoning_effort = "high"`.
+3. The model chooses `accept`, `reject`, `merge`, or `defer` and supplies a reason. Host-side checks remain authoritative for target paths, SHA preconditions, protected files, append-only `MEMORY.md` index updates, and backups.
+4. Provider or schema failure aborts before writes. If a target changes concurrently, the suggestion is deferred for a later run; never bypass the precondition.
+5. Report every model decision and reason, including accepted, rejected, merged, deferred, and unresolved IDs.
+6. Keep the explicit `dream suggestions accept <id>`, `dream suggestions reject <id>`, and `dream suggestions merge <id> --body-file <path>` commands available for targeted manual decisions.
+7. Use `dream suggestions apply-configured` only as an explicit deterministic emergency/fallback command, not for the nightly path; it still requires `review.mode = "auto-apply"`.
 
 Do not use `dream review` because it requires interactive TTY input. Do not use `suggestions apply-all` for judgment-based review. Do not edit the SQLite database or `.suggestions` previews directly.
 

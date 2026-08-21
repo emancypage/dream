@@ -12,6 +12,13 @@ from model_types import SchemaValidationError, validate_output
 ROOT = Path(__file__).parent
 
 
+def test_nightly_service_invokes_codex_curation_not_mechanical_apply():
+    service = (ROOT / "systemd" / "dream.service").read_text(encoding="utf-8")
+    assert "dream suggestions curate-configured" in service
+    assert "dream suggestions apply-configured" not in service
+    assert "claude" not in service.lower()
+
+
 def test_default_profile_routes_both_stages_to_codex():
     config = load_config(Path("/nonexistent/dream-config.toml"))
     assert config.stage("distill")["provider"] == "codex"

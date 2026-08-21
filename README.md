@@ -80,10 +80,10 @@ Legacy compatibility variables remain accepted: `DREAM_BACKEND`, `CLAUDE_DREAM_D
 ## Privacy and data flow
 
 - **Local reads.** `dream ingest` and `dream search` read only local transcript files (by default `~/.codex/sessions`) and the local SQLite database. They never transmit anything.
-- **Model calls send content.** The `distill` and `consolidate` stages send selected session content to the model provider configured for that stage — by default the Codex CLI against your ChatGPT subscription. Distillation sends the filtered transcript of a session; consolidation sends the distilled notes plus the current memory store.
+- **Model calls send content.** The `distill` and `consolidate` stages send selected session content to the model provider configured for that stage — by default the Codex CLI against your ChatGPT subscription. Distillation sends the filtered transcript of a session; consolidation sends the distilled notes plus the current memory store. The review stage is routed through the configured Codex provider; the production profile is `gpt-5.6-luna` with `reasoning_effort = "high"` and sends pending suggestions plus bounded target context.
 - **Everything else stays local.** The SQLite database (`~/.claude/dream.db` by default), suggestion previews (`.suggestions/`), and the memory store remain on your machine.
 - **Check your configuration first.** Before the first run, review the `[[sources]]` roots and the `[stages.*]`/`[providers.*]` entries in `~/.config/dream/config.toml` so you know which transcripts are read and where their content is sent.
-- **Local and external effects.** `estimate`, `search`, `status`, `preflight`, `context`, and `suggestions list` only read the persistent local data. Automatic recall opens SQLite through an immutable read-only connection; its small deduplication markers live under `/tmp`. `ingest` reads transcripts and updates the local SQLite index without calling a model. `distill` and `consolidate` make model calls and write local results. Suggestion review commands update local review state; `accept`, `merge`, and configured apply operations can also update memory files, with backups before live-memory writes.
+- **Local and external effects.** `estimate`, `search`, `status`, `preflight`, `context`, and `suggestions list` only read the persistent local data. Automatic recall opens SQLite through an immutable read-only connection; its small deduplication markers live under `/tmp`. `ingest` reads transcripts and updates the local SQLite index without calling a model. `distill`, `consolidate`, and configured curation make model calls and write local results. Suggestion review commands update local review state; `accept`, `merge`, and configured apply operations can also update memory files, with backups before live-memory writes.
 - **Cost / subscription usage.** Each model call can incur cost or consume part of your subscription limit. `dream estimate -v` shows how many sessions a distillation run would cover before you run it.
 - **Consent.** Do not run `dream` on confidential transcripts unless you have consciously agreed to send their selected content to the configured provider.
 
@@ -208,13 +208,17 @@ Machine-readable review:
 
 ```bash
 dream suggestions list
+dream suggestions curate-configured --dry-run
+dream suggestions curate-configured
 dream suggestions accept 12
 dream suggestions reject 13
 dream suggestions merge 14 --body-file /tmp/merged.md
 dream suggestions apply-configured
 ```
 
-`accept` and `merge` refuse to write when the target changed after suggestion creation. `apply-configured` applies all pending suggestions only when `review.mode = "auto-apply"`; in `suggest-only` mode it exits successfully without writing.
+For autonomous user-requested review, use `curate-configured` and report each model decision and reason. The `--dry-run` form is the no-write preview; the form without it is the automatic route used by the nightly service. The model chooses `accept`, `reject`, `merge`, or `defer`, while host-side checks retain authority over target paths, SHA preconditions, protected files, append-only `MEMORY.md` index updates, and backups. Provider or schema failure aborts before writes, and a concurrent target change is deferred for a later run. `accept` and `merge` still refuse to write when the target changed after suggestion creation.
+
+`apply-configured` remains an explicit deterministic emergency/fallback command, is not the nightly path, and requires `review.mode = "auto-apply"`; in `suggest-only` mode it exits successfully without writing. The explicit `accept`, `reject`, and `merge` commands remain available for targeted manual decisions.
 
 The legacy `dream review` interactive diff remains available.
 
@@ -237,10 +241,10 @@ Each session records source, external identity, content revision, and parser ver
 dream ingest
 dream distill --yes --limit 50
 dream consolidate
-dream suggestions apply-configured
+dream suggestions curate-configured
 ```
 
-Provider routing and review mode come from TOML; the unit contains no provider/model selection.
+The review stage asks the configured Codex provider for accept/reject/merge/defer decisions. Provider routing and review mode come from TOML; the unit contains no provider/model selection. Production uses `gpt-5.6-luna` with `reasoning_effort = "high"`.
 
 ```bash
 cp dream/systemd/dream.{service,timer} ~/.config/systemd/user/
