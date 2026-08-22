@@ -189,6 +189,16 @@ The lexical store is local, raw transcripts are disabled by default, and rendere
 results are marked as untrusted reference data with source provenance. `recall.diagnostic_path` receives
 bounded JSONL diagnostics; diagnostics never contain raw document bodies.
 
+### Codex hook timeout
+
+`dream hooks install` generates both Dream hooks with a five-second timeout. The
+timeout applies to `SessionStart` and `UserPromptSubmit`; it accommodates the
+local recall command, which can take a few seconds while starting Python and
+reading the SQLite index. The generated setting is written to the user-local
+`~/.codex/hooks.json`, not to this repository; `dream/recall_hooks.py` is the
+repository source of truth. Re-run `dream hooks install` after upgrading an
+installation that was created with an older timeout.
+
 Optional `recall.embedder` and `recall.reranker` adapters are disabled by default,
 cache by content hash and adapter fingerprint, accept at most 100 candidates, and
 fall back to lexical results on unavailable adapters, invalid output, missing
