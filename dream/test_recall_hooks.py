@@ -65,6 +65,7 @@ def test_generated_commands_are_relative_and_document_valid(tmp_path):
     install_hooks(path, "/usr/local/bin/dream")
     document = json.loads(path.read_text())
     validate_hooks_document(document)
+    assert document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"] == 2
     commands = [command["command"] for groups in document["hooks"].values() for group in groups for command in group["hooks"]]
     assert all(not command.startswith("/") for command in commands)
     assert all(command.get("statusMessage") == MARKER for groups in document["hooks"].values() for group in groups for command in group["hooks"] if "statusMessage" in command)

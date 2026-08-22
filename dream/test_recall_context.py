@@ -13,7 +13,23 @@ def _settings():
 def test_parse_hook_payload_and_exact_success_json():
     query = parse_hook_payload("UserPromptSubmit", {"session_id": "s", "prompt": "hello", "cwd": "/tmp", "repository_roots": ["/tmp"]})
     assert query.hook_event == "prompt"
-    assert json.loads(hook_success_json("ctx")) == {"continue": True, "hookSpecificOutput": {"additionalContext": "ctx"}}
+
+
+def test_hook_success_json_includes_codex_event_name():
+    assert json.loads(hook_success_json("UserPromptSubmit", "ctx")) == {
+        "continue": True,
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": "ctx",
+        },
+    }
+    assert json.loads(hook_success_json("SessionStart", "ctx")) == {
+        "continue": True,
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": "ctx",
+        },
+    }
 
 
 def test_missing_hook_fields_fail_open_parser():

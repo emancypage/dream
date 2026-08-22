@@ -53,7 +53,7 @@ def _targets(command_name: str) -> dict[str, tuple[str | None, dict]]:
         ),
         "UserPromptSubmit": (
             None,
-            {"type": "command", "command": f"{name} context prompt", "timeout": 1.5, "statusMessage": MARKER, "additionalContextLimit": 1200},
+            {"type": "command", "command": f"{name} context prompt", "timeout": 2, "statusMessage": MARKER, "additionalContextLimit": 1200},
         ),
     }
 

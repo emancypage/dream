@@ -60,8 +60,14 @@ def run_context(conn, query: RecallQuery, settings, explain: bool = False, *, em
     return RecallResult(tuple(selected), rendered, mode, None, diagnostics)
 
 
-def hook_success_json(context: str) -> str:
-    return json.dumps({"continue": True, "hookSpecificOutput": {"additionalContext": context}}, ensure_ascii=False, separators=(",", ":"))
+def hook_success_json(hook_event_name: str, context: str) -> str:
+    return json.dumps({
+        "continue": True,
+        "hookSpecificOutput": {
+            "hookEventName": hook_event_name,
+            "additionalContext": context,
+        },
+    }, ensure_ascii=False, separators=(",", ":"))
 
 
 def append_diagnostic(settings, diagnostic: dict) -> None:

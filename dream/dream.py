@@ -1099,7 +1099,7 @@ def cmd_context(args: argparse.Namespace) -> int:
         )
         if not settings.enabled:
             if not explain:
-                print(hook_success_json(""))
+                print(hook_success_json(event_name, ""))
             return 0
         use_hook_state = query.hook_event != "prompt" or settings.first_prompt_only
         if use_hook_state and not (attempt_token := claim_hook_event(query.session_id, query.hook_event)):
@@ -1118,7 +1118,7 @@ def cmd_context(args: argparse.Namespace) -> int:
                 "fallback_reason": result.diagnostics.fallback_reason,
             }, ensure_ascii=False, separators=(",", ":")))
         else:
-            print(hook_success_json(result.rendered_context))
+            print(hook_success_json(event_name, result.rendered_context))
         return 0
     except Exception as exc:
         if attempt_token is not None:
