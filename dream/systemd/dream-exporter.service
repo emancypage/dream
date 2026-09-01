@@ -1,0 +1,19 @@
+[Unit]
+Description=Dream Prometheus metrics exporter
+After=network.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+Environment=DREAM_METRICS_BIND=100.85.174.35
+Environment=DREAM_METRICS_PORT=9409
+ExecStart=%h/.local/bin/dream-metrics serve
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

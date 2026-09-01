@@ -264,12 +264,36 @@ dream suggestions curate-configured
 The review stage asks the configured Codex provider for accept/reject/merge/defer decisions. Provider routing and review mode come from TOML; the unit contains no provider/model selection. Production uses `gpt-5.6-luna` with `reasoning_effort = "high"`.
 
 ```bash
-cp dream/systemd/dream.{service,timer} ~/.config/systemd/user/
+./install.sh
 systemctl --user daemon-reload
 systemctl --user enable --now dream.timer
 ```
 
 On macOS, schedule the same commands with `launchd` or cron.
+
+## Monitoring (Linux)
+
+The scheduled service records a bounded JSON state file at
+`~/.local/state/dream/run.json`. Each stage is wrapped by `dream-stage`; a
+failure preserves the failing stage and a safe error code. The separate
+`dream-exporter.service` exposes only numeric Prometheus metrics and never
+exports provider error text or transcript contents.
+
+The exporter should bind to an address reachable by Prometheus but not to every
+network interface. On this setup it listens on the laptop's Tailscale address
+`100.85.174.35:9409`. The main metric is `dream_run_health`: `3` = success,
+`2` = running, `1` = stale, `0` = failed, and `-1` = no recorded run.
+
+The test-backed patchers add the exporter target and four panels to the existing
+fleet dashboard:
+
+```bash
+python3 dream/monitoring_prometheus.py /path/to/prometheus.yml 100.85.174.35:9409
+python3 dream/monitoring_dashboard.py /path/to/rpi-fleet.json
+```
+
+Both patchers are idempotent, reject ambiguous targets, and preserve unrelated
+dashboard panels. Back up the live files before applying generated output.
 
 ## Main files
 
@@ -290,3 +314,5 @@ Paths are relative to `dream/`.
 | `recall_documents.py`, `recall_query.py` | canonical synchronization and lexical retrieval |
 | `recall_context.py`, `recall_hooks.py` | fail-open context execution and Codex hook management |
 | `recall_eval.py`, `recall_adapters.py` | fixture evaluation, calibration, and optional adapter contracts |
+| `metrics.py`, `stage_runner.py` | run-state persistence and Prometheus exporter |
+| `monitoring_prometheus.py`, `monitoring_dashboard.py` | idempotent Prometheus and Grafana patchers |
