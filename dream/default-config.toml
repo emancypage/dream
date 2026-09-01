@@ -32,6 +32,12 @@ root = "~/.codex/sessions"
 enabled = true
 
 [[sources]]
+name = "opencode"
+type = "opencode-sqlite"
+root = "~/.local/share/opencode"
+enabled = true
+
+[[sources]]
 name = "claude-history"
 type = "claude-jsonl"
 root = "~/.claude/projects"

@@ -15,4 +15,8 @@ def create_source(source_type: str, root: Path) -> TranscriptSource:
         from sources.claude_jsonl import ClaudeJSONLSource
 
         return ClaudeJSONLSource(root)
+    if source_type == "opencode-sqlite":
+        from sources.opencode_sqlite import OpenCodeSQLiteSource
+
+        return OpenCodeSQLiteSource(root)
     raise ConfigError(f"unsupported source type: {source_type}")

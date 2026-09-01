@@ -163,7 +163,7 @@ def _validate(data: dict[str, Any]) -> list[str]:
             raise ConfigError(f"provider {name} has unsupported type: {provider.get('type')!r}")
     for source in data.get("sources", []):
         _unknown_keys(f"source {source.get('name', '?')}", source, _SOURCE_KEYS)
-        if source.get("type") not in {"codex-jsonl", "claude-jsonl"}:
+        if source.get("type") not in {"codex-jsonl", "claude-jsonl", "opencode-sqlite"}:
             raise ConfigError(f"unsupported source type: {source.get('type')!r}")
     _unknown_keys("review", data.get("review", {}), _REVIEW_KEYS)
     if data.get("review", {}).get("mode") not in {"suggest-only", "auto-apply"}:

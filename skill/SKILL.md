@@ -44,7 +44,7 @@ automatic recall unless duplicate injection is intentional.
 ## Route the request
 
 - For status, run `dream status`.
-- For ingestion, run `dream ingest`.
+- For ingestion, run `dream ingest`. Configured sources include Codex JSONL (`codex-jsonl`) and Open Code SQLite (`opencode-sqlite`); Claude JSONL stays disabled unless enabled.
 - For estimation, run `dream estimate -v`.
 - For distillation, run `dream distill --yes` and preserve any user-supplied limit or project filter.
 - For consolidation, run `dream consolidate`.

@@ -2,7 +2,7 @@
 
 `dream` ingests agent transcripts, filters them to visible user/assistant turns, distils sessions into structured findings, and consolidates those findings into reviewable persistent-memory suggestions.
 
-Transcript sources and model providers are independent. The packaged profile reads Codex JSONL and runs both model stages through `codex exec`; Claude JSONL and Claude CLI remain optional adapters.
+Transcript sources and model providers are independent. The packaged profile reads Codex JSONL and Open Code SQLite sessions and runs both model stages through `codex exec`; Claude JSONL and Claude CLI remain optional adapters.
 
 ## Requirements
 
@@ -59,6 +59,12 @@ type = "codex-jsonl"
 root = "~/.codex/sessions"
 enabled = true
 
+[[sources]]
+name = "opencode"
+type = "opencode-sqlite"
+root = "~/.local/share/opencode"
+enabled = true
+
 [review]
 mode = "suggest-only"
 ```
@@ -79,7 +85,7 @@ Legacy compatibility variables remain accepted: `DREAM_BACKEND`, `CLAUDE_DREAM_D
 
 ## Privacy and data flow
 
-- **Local reads.** `dream ingest` and `dream search` read only local transcript files (by default `~/.codex/sessions`) and the local SQLite database. They never transmit anything.
+- **Local reads.** `dream ingest` and `dream search` read only local transcript stores (by default Codex JSONL under `~/.codex/sessions` and Open Code SQLite at `~/.local/share/opencode/opencode.db`) and the local Dream SQLite database. They never transmit anything.
 - **Model calls send content.** The `distill` and `consolidate` stages send selected session content to the model provider configured for that stage — by default the Codex CLI against your ChatGPT subscription. Distillation sends the filtered transcript of a session; consolidation sends the distilled notes plus the current memory store. The review stage is routed through the configured Codex provider; the production profile is `gpt-5.6-luna` with `reasoning_effort = "high"` and sends pending suggestions plus bounded target context.
 - **Everything else stays local.** The SQLite database (`~/.claude/dream.db` by default), suggestion previews (`.suggestions/`), and the memory store remain on your machine.
 - **Check your configuration first.** Before the first run, review the `[[sources]]` roots and the `[stages.*]`/`[providers.*]` entries in `~/.config/dream/config.toml` so you know which transcripts are read and where their content is sent.
@@ -99,12 +105,13 @@ Codex skill / shell / systemd
 transcript sources  stage router  SQLite + memory
          |           |           |
 codex-jsonl        model provider  suggestions
-claude-jsonl       codex/claude    conflict-safe apply
+opencode-sqlite    codex/claude    conflict-safe apply
+claude-jsonl
 ```
 
 The pipeline stages are:
 
-1. `ingest`: discover configured sources, filter transcripts, index messages with SQLite FTS5.
+1. `ingest`: discover configured sources (Codex JSONL, Open Code SQLite, optional Claude JSONL), filter to visible user/assistant turns, and index messages with SQLite FTS5.
 2. `distill`: call the provider configured for the `distill` stage once per changed session revision.
 3. `consolidate`: call the configured `consolidate` provider and produce suggestions.
 4. `suggestions`: inspect and resolve suggestions with file-version preconditions and backups.

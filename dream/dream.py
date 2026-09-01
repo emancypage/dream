@@ -12,10 +12,10 @@ Subcommands:
   status        Show DB stats
 
 Safe defaults:
-  * `ingest` is idempotent (mtime-checked)
+  * `ingest` is idempotent (content-revision checked)
   * `distill` requires --yes once you exceed --max-sessions (default 5)
-  * `consolidate` writes only to memory/.suggestions/, never to live memory files
-  * only explicit review/apply commands touch user-curated memory
+  * `consolidate` writes suggestions only
+  * live memory writes happen via review/curate when review.mode is auto-apply
 """
 
 from __future__ import annotations
@@ -1135,10 +1135,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--db", help="SQLite DB path; overrides configuration")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    pi = sub.add_parser("ingest", help="Scan JSONL transcripts into DB")
+    pi = sub.add_parser("ingest", help="Scan configured transcript sources into SQLite")
     pi.add_argument("--projects", help="Legacy one-off Claude projects root")
     pi.add_argument("--source", action="append", help="Configured source name; repeatable")
-    pi.add_argument("--force", action="store_true", help="Re-ingest even if mtime unchanged")
+    pi.add_argument("--force", action="store_true", help="Re-ingest even if content revision is unchanged")
     pi.add_argument("--verbose", "-v", action="store_true")
     pi.set_defaults(func=cmd_ingest)
 

@@ -59,3 +59,20 @@ def test_codex_adapter_import_does_not_import_claude_adapter():
         "assert 'claude_cli' not in sys.modules"
     )
     subprocess.run([sys.executable, "-c", code], check=True, env=os.environ.copy())
+
+
+def test_default_profile_enables_opencode_sqlite_and_keeps_claude_disabled():
+    config = load_config(Path("/nonexistent/dream-config.toml"))
+    sources = {source["name"]: source for source in config.sources}
+    assert sources["opencode"]["type"] == "opencode-sqlite"
+    assert sources["opencode"]["enabled"] is True
+    assert sources["opencode"]["root"] == "~/.local/share/opencode"
+    assert sources["claude-history"]["enabled"] is False
+
+
+def test_module_help_describes_auto_apply_memory_writes():
+    import dream
+
+    assert "auto-apply" in dream.__doc__
+    assert "never to live memory files" not in dream.__doc__
+    assert "writes suggestions only" in dream.__doc__
