@@ -184,3 +184,65 @@ def test_identical_arm_payloads_and_call_provenance(env,monkeypatch):
     doc.sha256='new-constitution'
     assert g.generate_pairs(conn,cfg,source='synthetic',limit=1)['generated']==1
     assert len({p['seed_id'] for p in storage.records(conn,'character_pairs')})==2
+
+@pytest.mark.parametrize('marker', ['line\nbreak', 'a"quote', 'a\\path'])
+def test_raw_retention_markers(env,marker):
+    g,cfg,conn=env
+    from retention_policy import RetentionPolicy
+    assert not g._allowed({'nested':[marker]},RetentionPolicy(text_markers=(marker,)))
+
+def test_empty_and_cross_message_excerpt_rejected(env,monkeypatch):
+    g,cfg,conn=env
+    output=extraction(); output['context_excerpt']=''
+    monkeypatch.setattr(g.backend,'generate',lambda *a,**k: SimpleNamespace(output=output))
+    assert g.generate_pairs(conn,cfg,source='corrections',limit=1)['failures']
+    assert not storage.records(conn,'character_moments')
+
+def test_failed_expansion_and_child_retry_without_refresh(env,monkeypatch):
+    g,cfg,conn=env
+    g.load_constitution(cfg).seeds=({'id':'seed-a','trait_id':'trait-a','prompt':'Task'},)
+    cfg.data['character']['max_seed_expansions']=1
+    state={'fail_expansion':True,'fail_child':True,'expansions':0}
+    def fake(stage,prompt,schema,**kw):
+        import json
+        data=json.loads(prompt)
+        if 'seed' in data:
+            state['expansions']+=1
+            if state['fail_expansion']: raise RuntimeError('failed expansion')
+            return SimpleNamespace(output={'prompt':'Child task'})
+        if 'Child task' in prompt and state['fail_child']: raise RuntimeError('failed child')
+        return SimpleNamespace(output={'response':'chosen' if 'Approved constitution:' in kw['system_prompt'] else 'baseline'})
+    monkeypatch.setattr(g.backend,'generate',fake)
+    assert g.generate_pairs(conn,cfg,source='synthetic',limit=1,expand_seeds=True)['generated']==1
+    state['fail_expansion']=False
+    assert g.estimate(conn,cfg,source='synthetic',limit=1,expand_seeds=True)['source_items']==1
+    assert g.generate_pairs(conn,cfg,source='synthetic',limit=1,expand_seeds=True)['failures']
+    state['fail_child']=False
+    assert g.generate_pairs(conn,cfg,source='synthetic',limit=1)['generated']==1
+    assert state['expansions']==2
+
+def test_excerpt_cannot_cross_original_message_boundary(env,monkeypatch):
+    g,cfg,conn=env
+    conn.execute('DELETE FROM messages')
+    conn.executemany('INSERT INTO messages(session_id,seq,role,text) VALUES (?,?,?,?)', [('s',1,'user','first'),('s',2,'assistant','middle'),('s',3,'user','last'),('s',4,'assistant','Long answer'),('s',5,'user','Nie tak, shorter please')])
+    conn.commit()
+    output=extraction(); output['context_excerpt']='first\nmiddle'
+    monkeypatch.setattr(g.backend,'generate',lambda *a,**k: SimpleNamespace(output=output))
+    assert g.generate_pairs(conn,cfg,source='corrections',limit=1)['failures']
+    assert not storage.records(conn,'character_moments')
+
+def test_identity_marker_excluded_before_calls(env,monkeypatch):
+    g,cfg,conn=env
+    cfg.memory_root.mkdir()
+    (cfg.memory_root/'.dream-retention.json').write_text('{"text_markers":["private"]}')
+    conn.execute("UPDATE sessions SET jsonl_path='/private/source'"); conn.commit()
+    monkeypatch.setattr(g.backend,'generate',lambda *a,**k: pytest.fail('unexpected call'))
+    assert g.generate_pairs(conn,cfg,source='corrections',limit=1)['source_items']==0
+
+def test_refresh_estimate_has_attempt_and_supersedes(env,monkeypatch):
+    g,cfg,conn=env
+    monkeypatch.setattr(g.backend,'generate',lambda stage,*a,**k: SimpleNamespace(output=extraction() if stage=='character_extract' else {'response':'Brief answer'}))
+    g.generate_pairs(conn,cfg,source='corrections',limit=1)
+    pair=storage.records(conn,'character_pairs')[0]
+    work=g.estimate(conn,cfg,source='corrections',limit=1,refresh=True)['work_items'][0]
+    assert work['generation_attempt']==2 and work['supersedes_id']==pair['id']

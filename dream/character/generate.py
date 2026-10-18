@@ -29,7 +29,7 @@ CUE = re.compile(r"(?<!\w)(?:nie(?: tak)?|źle|cofnij|stop|don't|actually|that's
 
 
 def _allowed(value, policy):
-    return not policy.excludes(text=canonical_json(value))
+    return storage._text_allowed(value, policy)
 
 
 def _source(conn, session_id):
@@ -41,7 +41,7 @@ def _source(conn, session_id):
     return result
 
 
-def _select(conn, config, source, limit, refresh):
+def _select(conn, config, source, limit, refresh, expand_seeds=False):
     if source not in ('corrections','synthetic','all') or type(limit) is not int or limit <= 0:
         raise ValueError('source and positive limit required')
     doc=load_constitution(config); policy=policy_for(config); check_constitution(doc,policy)
@@ -49,12 +49,18 @@ def _select(conn, config, source, limit, refresh):
     items=[]; settings=config.data['character']
     moments=storage.eligible_records(conn,config,'character_moments',doc); pairs=storage.eligible_records(conn,config,'character_pairs',doc)
     def add(item):
-        item['work_key']=content_hash({'input':item,'constitution':doc.sha256,'prompt_version':prompt_version(),'policy':policy_fingerprint(policy),'bounds':{'context':settings['max_context_codepoints'],'response':settings['max_response_codepoints']},'extract':config.stage('character_extract'),'generate':config.stage('character_generate')})
+        item['work_key']=item.pop('_work_key',None) or content_hash({'input':item,'constitution':doc.sha256,'prompt_version':prompt_version(),'policy':policy_fingerprint(policy),'bounds':{'context':settings['max_context_codepoints'],'response':settings['max_response_codepoints']},'extract':config.stage('character_extract'),'generate':config.stage('character_generate')})
         previous=[p for p in pairs if p.get('work_key')==item['work_key']]
         item['attempt']=max((p.get('generation_attempt',1) for p in previous),default=0)+1
         item['supersedes_id']=max(previous,key=lambda p:p.get('generation_attempt',1))['id'] if previous else None
         old=next((m for m in moments if m.get('work_key')==item['work_key']),None)
-        if not refresh and (previous or old and (not old.get('is_correction') or not old.get('context_sufficient'))):
+        expansion_only=False
+        if previous and item['kind']=='synthetic' and expand_seeds and settings['max_seed_expansions']>0:
+            expanded=next((r for r in storage.eligible_records(conn,config,'character_seeds',doc) if r.get('expansion_work_key')==item['work_key']),None)
+            child_pairs=[p for p in pairs if expanded and p.get('seed_id')==expanded['id']]
+            expansion_only=not refresh and expanded is None
+        item['expansion_only']=expansion_only
+        if not refresh and (previous and not expansion_only or old and (not old.get('is_correction') or not old.get('context_sufficient'))):
             skipped['completed']+=1; return
         item['moment']=old if not refresh else None
         items.append(item)
@@ -77,7 +83,7 @@ def _select(conn, config, source, limit, refresh):
                 rejected=messages[i-1]['content']
                 if len(rejected)>settings['max_response_codepoints'] or len(message['content'])>settings['max_context_codepoints']:
                     skipped['oversized']+=1; continue
-                if not _allowed([context,rejected,message],policy):
+                if not _allowed([identity,context,rejected,message],policy):
                     skipped['excluded']+=1; continue
                 add({'kind':'correction','identity':identity,'correction_seq':message['seq'],'assistant_seq':messages[i-1]['seq'],'messages':context,'rejected':rejected,'correction':message['content'],'omitted_message_count':len(prior)-len(context),'source_hash':content_hash(_source(conn,sid))})
     if source in ('synthetic','all'):
@@ -88,20 +94,27 @@ def _select(conn, config, source, limit, refresh):
             if not _allowed(seed,policy): skipped['excluded']+=1; continue
             if len(seed['prompt'])>settings['max_context_codepoints']: skipped['oversized']+=1; continue
             add({'kind':'synthetic','seed':seed,'messages':[{'role':'user','content':seed['prompt']}]})
+        for stored in storage.eligible_records(conn,config,'character_seeds',doc):
+            if stored.get('origin')!='expanded' or not _allowed(stored,policy):
+                continue
+            seed=stored['seed']
+            if len(seed['prompt'])>settings['max_context_codepoints']:
+                skipped['oversized']+=1; continue
+            add({'kind':'synthetic','seed':seed,'stored_seed':stored,'messages':stored['prompt_messages'],'_work_key':stored['work_key'],'origin':'expanded','parent_expansion_id':stored['parent_expansion_id'],'expansion_call':stored['expansion_call']})
     return doc,policy,items[:limit],skipped
 
 
 def estimate(conn, config, *, source, limit, refresh=False, expand_seeds=False):
     if not config.data['character']['enabled']: return {'source_items':0,'skipped':{'disabled':1},'failures':[]}
-    doc,policy,items,skipped=_select(conn,config,source,limit,refresh)
+    doc,policy,items,skipped=_select(conn,config,source,limit,refresh,expand_seeds)
     corrections=sum(i['kind']=='correction' for i in items); seeds=len(items)-corrections
-    expansions=min(seeds,config.data['character']['max_seed_expansions']) if expand_seeds else 0
-    return {'source_items':len(items),'work_ids':[i['work_key'] for i in items],'bounded_codepoints':sum(len(canonical_json(i)) for i in items),'call_bounds':{'extraction':corrections,'responses':corrections+2*seeds+2*expansions,'expansion':expansions,'judging':2*(len(items)+expansions)},'routes':{s:dict(config.stage(s)) for s in ('character_extract','character_generate')},'skipped':skipped,'failures':[]}
+    expansions=min(sum(i['kind']=='synthetic' and not i.get('origin') for i in items),config.data['character']['max_seed_expansions']) if expand_seeds else 0
+    return {'source_items':len(items),'work_ids':[i['work_key'] for i in items],'work_items':[{'work_id':i['work_key'],'generation_attempt':i['attempt'],'supersedes_id':i['supersedes_id']} for i in items],'bounded_codepoints':sum(len(canonical_json(i)) for i in items),'call_bounds':{'extraction':corrections,'responses':corrections+2*seeds+2*expansions,'expansion':expansions,'judging':2*(len(items)+expansions)},'routes':{s:dict(config.stage(s)) for s in ('character_extract','character_generate')},'skipped':skipped,'failures':[]}
 
 
 def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=False):
     if not config.data['character']['enabled']: return {'generated':0,'failures':[],'skipped':{'disabled':1}}
-    doc,policy,items,skipped=_select(conn,config,source,limit,refresh)
+    doc,policy,items,skipped=_select(conn,config,source,limit,refresh,expand_seeds)
     fingerprint=policy_fingerprint(policy)
     result={'generated':0,'source_items':len(items),'failures':[],'skipped':skipped}
     expansion_budget=config.data['character']['max_seed_expansions'] if expand_seeds else 0
@@ -155,8 +168,31 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
                     record=dict(record,id=old['id'],revision=old['revision']+1)
                     return storage.update_record(writer,table,record,expected_sha=old['content_sha256'])
             return storage.insert_record(writer,table,record)
+    def schedule_expansion(item, parent_id):
+        nonlocal expansion_budget
+        if item['kind']!='synthetic' or item.get('origin') or expansion_budget<=0:
+            return
+        expansion_budget-=1
+        stored=next((r for r in storage.eligible_records(conn,config,'character_seeds',doc) if r.get('expansion_work_key')==item['work_key']),None)
+        if stored is None:
+            expanded,expansion_call=call(item,'character_generate','character-expand-v1.md',{'seed':item['seed']},EXPAND_SCHEMA)
+            prompt=expanded['prompt']
+            if not prompt.strip() or len(prompt)>config.data['character']['max_context_codepoints']:
+                raise ValueError('invalid expansion length')
+            child_seed={'id':item['seed']['id']+'-expanded-'+content_hash(prompt)[:16],'trait_id':item['seed']['trait_id'],'prompt':prompt}
+            key=content_hash({'parent':item['work_key'],'prompt':prompt})
+            record={'id':'seed-'+content_hash({'seed':child_seed,'constitution':doc.sha256}), 'work_key':key,'constitution_sha256':doc.sha256,'constitution_version':doc.version,'revision':1,'excluded':False,'origin':'expanded','expansion_work_key':item['work_key'],'parent_expansion_id':parent_id,'expansion_call':expansion_call,'human_seed_id':item['seed']['id'],'trait_id':item['seed']['trait_id'],'seed':child_seed,'prompt_messages':[{'role':'user','content':prompt}],'provenance':{'parent_seed_id':parent_id}}
+            stored=persist(item,'character_seeds',record)
+        child_seed=stored['seed']; key=stored['work_key']
+        previous=[p for p in storage.records(conn,'character_pairs') if p.get('work_key')==key]
+        if refresh or not previous:
+            items.append({'kind':'synthetic','seed':child_seed,'stored_seed':stored,'messages':stored['prompt_messages'],'work_key':key,'attempt':max((p['generation_attempt'] for p in previous),default=0)+1,'supersedes_id':max(previous,key=lambda p:p['generation_attempt'])['id'] if previous else None,'origin':'expanded','parent_expansion_id':stored['parent_expansion_id'],'expansion_call':stored['expansion_call']})
     for item in items:
         try:
+            if item.get('expansion_only'):
+                parent_id='seed-'+content_hash({'seed':item['seed'],'constitution':doc.sha256})
+                schedule_expansion(item,parent_id)
+                continue
             moment=item.get('moment'); calls=[]; seed_record=None
             base={'work_key':item['work_key'],'constitution_sha256':doc.sha256,'constitution_version':doc.version,'prompt_version':prompt_version(),'created_at':datetime.now(timezone.utc).isoformat(),'revision':1,'excluded':False}
             provenance={'source_kind':item['kind'],'constitution_sha256':doc.sha256,'reconstruction_hash':content_hash(item['messages']),'context_status':'bounded_visible_reconstruction' if item['kind']=='correction' else 'approved_human_seed','omitted_message_count':item.get('omitted_message_count',0)}
@@ -167,7 +203,7 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
                     output,meta=call(item,'character_extract','character-extract-v1.md',{'messages':item['messages'],'assistant_response':item['rejected'],'user_correction':item['correction'],'trait_ids':list(doc.traits)},EXTRACT_SCHEMA)
                     if output['is_correction'] and (not output['trait_ids'] or len(set(output['trait_ids']))!=len(output['trait_ids']) or not output['rationale'].strip()):
                         raise ValueError('positive correction needs traits and rationale')
-                    if output['context_excerpt'] not in '\n'.join(m['content'] for m in item['messages']) or output['corrected_assistant_response']!=item['rejected'] or output['user_correction']!=item['correction'] or any(t not in doc.traits for t in output['trait_ids']) or len(output['rationale'])>2000: raise ValueError('invalid extraction evidence')
+                    if not output['context_excerpt'].strip() or not any(output['context_excerpt'] in m['content'] for m in item['messages']) or output['corrected_assistant_response']!=item['rejected'] or output['user_correction']!=item['correction'] or any(t not in doc.traits for t in output['trait_ids']) or len(output['rationale'])>2000: raise ValueError('invalid extraction evidence')
                     moment=persist(item,'character_moments',dict(base,**output,id='moment-'+uuid.uuid4().hex,provenance=provenance,**item['identity'],assistant_seq=item['assistant_seq'],correction_seq=item['correction_seq'],prompt_messages=item['messages'],extraction=meta,disposition='completed'))
                 if not moment['is_correction'] or not moment['context_sufficient']:
                     skipped['negative']=skipped.get('negative',0)+1; continue
@@ -177,9 +213,10 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
             else:
                 seed=item['seed']; messages=item['messages']
                 seed_record=dict(base,id='seed-'+content_hash({'seed':seed,'constitution':doc.sha256}),human_seed_id=seed['id'],human_seed_hash=content_hash(seed),trait_id=seed['trait_id'],prompt_messages=messages,origin=item.get('origin','human'),parent_expansion_id=item.get('parent_expansion_id'),expansion_call=item.get('expansion_call'),provenance={'source_kind':'human_seed','human_seed_id':seed['id']})
-                stored=seed_record
+                stored=item.get('stored_seed') or seed_record
+                if item.get('stored_seed'): seed_record=None
                 chosen,a=response(item,messages,'chosen'); rejected,b=response(item,messages,'baseline'); calls=[a,b]
-                provenance['source_content_sha256']=None
+                provenance['source_content_sha256']=stored.get('content_sha256')
                 provenance['human_seed_id']=stored['human_seed_id']
                 if stored.get('parent_expansion_id'):
                     provenance['parent_expansion_id']=stored['parent_expansion_id']
@@ -187,17 +224,7 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
             if chosen.strip()==rejected.strip(): raise ValueError('equal responses')
             pair=dict(base,id='pair-'+uuid.uuid4().hex,generation_attempt=item['attempt'],supersedes_id=item['supersedes_id'],source_kind=item['kind'],prompt_messages=item['messages'],chosen=chosen,rejected=rejected,rationale=rationale,trait_ids=traits,conflict=conflict,provenance=provenance,generator_calls=calls,status='pending',edited=False,**source_fields)
             persist(item,'character_pairs',pair,seed_record=seed_record); result['generated']+=1
-            if item['kind']=='synthetic' and not item.get('origin') and expansion_budget>0:
-                expansion_budget-=1
-                expanded,expansion_call=call(item,'character_generate','character-expand-v1.md',{'seed':item['seed']},EXPAND_SCHEMA)
-                prompt=expanded['prompt']
-                if not prompt.strip() or len(prompt)>config.data['character']['max_context_codepoints']:
-                    raise ValueError('invalid expansion length')
-                child_seed={'id':item['seed']['id']+'-expanded-'+content_hash(prompt)[:16],'trait_id':item['seed']['trait_id'],'prompt':prompt}
-                key=content_hash({'parent':item['work_key'],'prompt':prompt})
-                previous=[p for p in storage.records(conn,'character_pairs') if p.get('work_key')==key]
-                if refresh or not previous:
-                    items.append({'kind':'synthetic','seed':child_seed,'messages':[{'role':'user','content':prompt}],'work_key':key,'attempt':max((p['generation_attempt'] for p in previous),default=0)+1,'supersedes_id':max(previous,key=lambda p:p['generation_attempt'])['id'] if previous else None,'origin':'expanded','parent_expansion_id':source_fields['seed_id'],'expansion_call':expansion_call})
+            schedule_expansion(item,source_fields.get('seed_id'))
         except sqlite3.Error:
             raise
         except (ValueError,RuntimeError,TimeoutError,OSError) as exc:
