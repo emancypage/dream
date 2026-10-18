@@ -83,14 +83,13 @@ def run(args):
     cfg = args.config
     cfg = replace(cfg, data={**cfg.data, 'storage': {**cfg.data['storage'], 'db_path': str(args.db)}})
     action = args.character_cmd
-    if action in ('generate', 'judge') and not cfg.data['character']['enabled']:
+    if (action in ('generate', 'judge') or action == 'eval' and not args.report) and not cfg.data['character']['enabled']:
         print(json.dumps({'skipped': 'character disabled'}))
         return 0
     conn = None
     try:
         guard_path(cfg.db_path, cfg)
         mutation = (action in ('generate', 'judge', 'accept', 'reject', 'defer', 'edit')
-                    or action in ('render', 'export') and not args.preview
                     or action == 'eval' and not args.report)
         if mutation:
             _initialize_for_mutation(cfg)

@@ -20,7 +20,7 @@ def records(conn, table):
         rows = conn.execute(f'SELECT payload_json FROM {_table(table)} ORDER BY id').fetchall()
     except sqlite3.OperationalError as exc:
         if 'no such table' in str(exc):
-            raise ValueError('character schema missing; initialize through a writing command') from exc
+            raise ValueError('character schema missing; initialize through ingest or a database-writing character command') from exc
         raise
     return [json.loads(row[0]) for row in rows]
 
