@@ -2,11 +2,12 @@
 
 ## Status
 
-Proposed design for review before implementation.
+Approved for implementation on 2026-10-18, with the decisions below.
 
 Date: 2026-10-18. Base: `ec3ff2f` on fresh `main`, including merged PR #1.
-Branch: `feat/character`. This document proposes behavior. It does not authorize
-implementation, provider calls on real transcripts, deployment, or publication.
+Branch: `feat/character`. Szymon approved implementation and the plan without another review stop. Real
+provider calls on real transcripts, local config edits, push, and publication
+still require a separate request.
 
 ## Goal and scope
 
@@ -59,7 +60,7 @@ model internals which Dream's CLI providers do not expose. It stays future work.
   Existing recall remains relevance-ranked, untrusted reference data.
 - `metrics.STAGES` is a fixed tuple of four stages. `finish_run` and `seed_success`
   name `curation` as the last stage. `dream/systemd/dream.service` wraps every stage
-  with `dream-stage --continue-on-error`. It contains no Claude command.
+  with `dream-stage --continue-on-error`. It contains no literal provider command. Provider selection belongs in config.
 
 ## Architecture and alternatives
 
@@ -124,12 +125,12 @@ review is the only mode. Unknown auto-apply and review-mode keys fail validation
 | Key | Contract and proposed value |
 | --- | --- |
 | `enabled` | Boolean, false in packaged defaults. Enables character writing/model commands, not automatic execution. |
-| `constitution_path` | Nonempty path, proposed `~/.config/dream/character/constitution.md`. Location awaits decision 5. |
+| `constitution_path` | Nonempty path, proposed `~/.config/dream/character/constitution.md`. Approved outside the memory root. |
 | `state_root` | Nonempty path, `~/.local/state/dream/character/`, outside memory and protected instruction directories. |
 | `allow_same_family_judge` | Boolean, false. An explicit override must appear in provenance and reports. |
-| `hook_injection` | Boolean, false. Recognition and implementation depend on decision 3. |
-| `render_max_pairs` | Positive integer, rejects booleans. Default awaits decision 4. |
-| `render_budget_codepoints` | Positive integer covering the whole rendered block. Default awaits decision 4. |
+| `hook_injection` | Boolean, false. Implemented for session-start only. |
+| `render_max_pairs` | Positive integer, rejects booleans. Approved default 3. |
+| `render_budget_codepoints` | Positive integer covering the whole rendered block. Approved default 12000. |
 | `max_context_codepoints` | Positive integer, proposed 12000 per original task window. |
 | `max_response_codepoints` | Positive integer, proposed 8000 per candidate response. Oversized complete records defer. |
 | `max_seed_expansions` | Nonnegative integer, proposed 0. Expansion is explicit, bounded, and separate from trait creation. |
@@ -285,8 +286,12 @@ Body sections are `Traits`, `Priority order`, `Hard constraints`, and `Seed
 prompts per trait`. Traits use stable human IDs such as `trait-01`, first-person
 text, and a `Why:` line. Seeds have unique human IDs and an explicit trait ID.
 About ten traits is guidance, not a hard count. Approval validation rejects empty
-required sections, unresolved template slots, missing reasons, unknown trait
-references, and missing seed prompts for declared traits. Structural validation
+required sections, unresolved required-section template slots, missing reasons, unknown trait
+references . Seed prompts are optional for approval. Empty seed TODO slots do not block
+approval. Only Traits with Why lines, Priority order, and Hard constraints are
+required. Synthetic generation and expansion skip seedless traits and report a
+clean skip, including `--source all`. All other character commands work without
+seeds. Structural validation
 cannot prove that a statement is first-person or that the human wrote it.
 
 After approval of this design, ship
@@ -309,7 +314,7 @@ This one-time installation creates a draft. Runtime commands never write it.
 
 Generate, judge, render, export, and eval require an approved constitution before
 provider work or writes. List/show can explain a draft and stale history safely.
-The live document stays outside memory by recommendation, pending decision 5.
+The live document stays outside memory by recommendation, as approved.
 Reject resolved references to it in consolidation input and recall synchronization
 and reads, including symlinks placed in memory and already indexed aliases.
 Do not add it as an approved-memory document.
@@ -416,16 +421,17 @@ names within one family do not satisfy independence. Validate against the config
 or synthetic response model family, and against the eval response family when
 evaluating. The original rejected session response may have unknown provider/model
 identity because the ingest schema does not store it. Preserve any source-derived
-identity as evidence and otherwise record unknown. Do not claim judge independence
-from that historical response or infer its model family from the session source.
+identity as evidence and otherwise record unknown. Do not claim judge independence from that historical response. For
+`sessions.source = "claude"`, treat the source as reliable evidence of an
+Anthropic-written original response. When the judge is Anthropic, show the overlap
+warning in review, export, and eval provenance. Other unknown sources stay unknown.
 If reliable source evidence shows overlap between the historical model and judge,
 display that overlap as a warning in review and export provenance. It does not
 replace the required independence from Dream's regeneration model.
 
-Default recommendation is on-demand judging outside systemd. Same-family use
+Judging runs nightly through configuration after generation. Same-family use
 requires the explicit false-by-default override. Record it in both verdicts,
-review display, exports, and eval reports. Do not relax the service invariant
-without decision 1. Config validation does not execute a provider.
+review display, exports, and eval reports. The systemd unit contains no literal provider commands. Config validation does not execute a provider.
 
 Use `prompts/character-judge-v1.md`. Provide the approved constitution, task
 context, anonymously labeled response A/B, and separately marked correction
@@ -505,7 +511,7 @@ rerendering after a policy or constitution change. Dream-managed files are rebui
 or invalidated by retention cleanup. Hook mode must never trust a cached block
 without validating its full current-policy manifest.
 
-Optional hook design, only if decision 3 approves it: compose a separate trusted
+Approved hook design: compose a separate trusted
 character section in `cmd_context` on session-start events, including compact.
 Build it from human-approved sources through the same pure renderer. Keep
 `run_context(..., memory_root=...)`, query relevance, and
@@ -523,7 +529,7 @@ budgets, approval/edit/SHA/policy filtering, no timestamps, and output backups.
 `test_character_security.py` covers quoted instruction attacks, protected aliases,
 and the inability to promote recalled approved-memory text, distilled summaries,
 or raw transcripts into the trusted section. These tests prove host data flow,
-not how any model will respond to the resulting text. If hooks ship, extend context and hook
+not how any model will respond to the resulting text. Extend context and hook
 tests for compact, budget limits, fail-open behavior, and separation.
 
 ## M6. Fixed-probe evaluation
@@ -636,28 +642,22 @@ rendered manifests, and dependent evaluation results. Prose-only semantic
 exclusions remain prompt guidance; deterministic matching has the same limits as
 existing retention. Never claim paraphrase detection without model judgment.
 
-Use the existing retention backup directory and `affected-records.json`. Include
-all affected character rows and managed-file bytes in that same snapshot before
-mutation. Pending pairs become rejected with a retention reason. Accepted pairs
-become excluded, with retained ID/hash and minimal non-content audit metadata.
-Scrub excluded moment, seed, pair, judgment, review-event, and eval payloads in the
-live database after backup, so the private backup is the only retained payload.
-Original `sessions` and `messages` stay unchanged, as current retention promises.
-Backups remain private historical copies, excluded from recall and exports.
+Use the existing retention backup directory and `affected-records.json`. Preview
+counts affected moments, expanded seeds, pairs in every review state, judgments,
+review events, eval results, and managed files. Human seeds live in the constitution
+and are never changed. Back up every affected row and managed file byte, including
+human review reasons. Then delete the affected derived rows and all their lineage
+dependents. Do not retain scrubbed payloads or audit tombstones in live tables.
+Original sessions and messages remain unchanged.
 
-Compare every affected row's revision/hash with the snapshot in conditional
-updates. For metadata and append-only judgment/review rows without a revision
-column, compare all stored snapshot columns using NULL-safe equality. Retention
-is the only operation allowed to scrub those historical payloads. In the cleanup
-write transaction, recheck each parent's complete child-ID/hash set. A new judgment,
-review event, or eval dependency after backup defers the affected parent and its
-dependent group, so no unbacked child is scrubbed or deleted. A human edit, acceptance, new judgment, changed policy, or changed file
-after snapshot defers that record and its dependent cleanup. Report deferred IDs
-and paths for retry. Source exclusion already hides them at read time. Do not
-reintroduce their payload through a deferred child record. Recheck protected
-identities before every file deletion. Managed block/export/report files with
-affected lineage are removed or rebuilt, only if their hashes still match the
-snapshot. User-modified files defer. Do not follow symlinks while invalidating them.
+Inside the character cleanup write transaction, recompute the complete affected
+set and its content hashes. If it differs from the backup snapshot, roll back the
+whole character part, report the conflict, and ask for a rerun. There is no per-row
+partial character deferral. Existing memory cleanup semantics remain unchanged.
+Delete or invalidate matching managed files, so rerender or re-export is required.
+Leave user-modified files in place and report them. Recheck protected identities
+before file deletion. Read-time policy filtering remains active before cleanup.
+Cleanup works with a draft or missing constitution and without a provider.
 
 `test_character_retention.py` mirrors `test_retention_policy.py`: pre-call project
 skips, pre/post model marker filtering, late-policy hiding, alias protections,
@@ -667,30 +667,25 @@ independent memory roots.
 Extend the existing retention tests for the combined backup and unchanged source
 transcripts. Cleanup must work with a draft or missing constitution and no provider.
 
-## Nightly integration, conditional on decisions 1 and 2
+## Nightly integration
 
-The recommendation is on-demand generation and judging for the first release.
-This is a recommendation, not a decision. If generation joins nightly, add one
-`character` stage after curation using:
+After curation, add two separately measured stages:
 
 ```text
-dream-stage --continue-on-error character -- dream character generate --source all --limit 10
+dream-stage --continue-on-error character_generate -- dream character generate --source all --limit 10
+dream-stage --continue-on-error character_judge -- dream character judge --limit 10
 ```
 
-The exact limit is a proposed operational value for approval. No accept, edit,
-render, export, eval, or Claude-backed judge runs in systemd under the recommended
-routing. Validate the generation route and extraction route are Codex for this
-profile. If disabled, the optional scheduled generation stage reports a clear
-skip without provider calls. An enabled but invalid route fails that stage.
+Both limits are operational values Szymon can adjust. With character disabled,
+both stages report a clean skip and make no provider calls. Preflight is command-
+scoped. The unit contains no literal provider commands. All provider selection
+lives in config, including Claude-backed memory review and character judging.
+Review, accept, edit, render, export, and eval never run in systemd.
 
-Update `metrics.STAGES`, `finish_run`, `seed_success`, `stage_runner` choices,
-exporter label tests, `monitoring_dashboard.py` assumptions, and
-`test_nightly_failure_isolation.py`. Update the fake command's mapping from
-`character generate` to the new metrics stage. Check every stage failure still
-runs later commands, preserves failed health, and returns 1 for direct execution.
-Do not add Claude or silently route the judge through the generation model.
-`test_character_failures.py` covers each item call failing between healthy items,
-no completed-result advancement, fatal database errors, and interruptions.
+Update `metrics.STAGES`, `finish_run`, `seed_success`, stage runner choices,
+exporter/dashboard assumptions, and nightly-isolation tests for both stages.
+Every failed stage preserves failed health while later stages still run.
+Direct character commands return 1 if any item fails.
 
 ## Delivery order after approval
 
@@ -699,7 +694,7 @@ test-first commits. Start with M1 and the shared configuration, path protections
 versioned schema, and backup contract. Build retention support alongside every
 table's introduction. Then add generation, judging, and human review. Add render,
 export, and fixed-probe evaluation once accepted revision semantics are tested.
-Optional nightly and hook changes follow the explicit decisions below.
+Nightly generation/judging and the disabled-by-default hook are included.
 
 Before every implementation commit run:
 
@@ -713,57 +708,41 @@ results and targets are fakes. No real transcript leaves the machine during
 development. A live smoke test requires Szymon's explicit request. Do not push or
 open a pull request unless asked.
 
-## Open decisions
+## Approved decisions and repository gaps
 
-These require Szymon's decision before the implementation plan fixes their values.
+Szymon approved these choices on 2026-10-18:
 
-1. Judge routing versus the Claude-free nightly unit. Choose on-demand judging
-   with a different family, same-family nightly judging with an explicit recorded
-   override, or explicitly relax the invariant. Recommendation is on-demand.
-2. Nightly generation. Choose on-demand initially or add the conditional character
-   stage and its metrics/dashboard work. Recommendation is on-demand initially.
-3. Hook injection. Choose file rendering only or ship the separate trusted
-   session-start section behind a false-by-default flag. Recommendation is file
-   rendering only in this iteration.
-4. Default K and whole-block codepoint budget. A reviewable starting proposal is
-   K = 3 and 12000 codepoints. These are not adopted defaults. A constitution
-   exceeding the selected budget causes an explicit error, never silent truncation.
-5. Constitution location. Recommendation is the config directory outside memory.
-   A hidden protected file inside memory would also need explicit exclusion from
-   consolidation and indexing, and offers no deployment benefit. No location is
-   treated as approved yet.
-6. Conflicts and gaps between the brief and current repository:
-   - Migration backups currently detect old provider columns, not every missing
-     schema version. Version 3 needs an explicit pre-DDL backup check. Existing
-     version 2 behavior stays authoritative until this change is approved.
-   - Existing configuration is strict about option names, but does not validate
-     all stage value types. Strict character values need new validation. Do not
-     silently change unrelated configuration contracts.
-   - `backend.preflight` checks every configured route today. Simply adding a
-     Claude judge would make it a requirement for unrelated commands. Proposed
-     command-scoped checks need review.
-   - Packaged `stages.review` already contains a concrete model. The brief says
-     new stage defaults route providers only. Apply that rule to new character
-     stages; do not remove the existing review model as unrelated work.
-   - Earlier recall docs show old timeouts and hook output. Current code emits
-     `hookEventName`, uses five-second hooks, relevance-aware rendering, and
-     memory-root retention filtering. The code wins. Do not copy the old contract.
-   - Current cleanup conditionally updates files and distilled records, but its
-     pending-suggestion updates do not compare a snapshot revision. Character
-     cleanup must use conditional updates for every new row. Broad changes to
-     memory suggestion cleanup are outside this design.
-   - The brief's failure wording can read as aborting the whole command before
-     any write, while also requiring per-item isolation. Proposed interpretation
-     is no write or success advancement for the failed item, while healthy items
-     may complete. This differs from curation's whole-batch atomic judgment rule.
-   - The older recall spec puts behavioral instructions in checked-in docs or
-     `AGENTS.md`. Character introduces a new human-owned config document and
-     optional trusted context. It does not convert recalled memory into rules or
-     enable native Memories. The new document needs explicit approval as an
-     additional source of behavior.
-   - Synthetic outputs without reported model identity cannot prove exact model
-     identity if a CLI silently changes a route. Proposed local explicit model IDs
-     and provenance distinguish requested identity from verified identity.
+1. Judge runs nightly through config. Its family must differ from both extraction
+   and regeneration families. Same-family override defaults to false.
+2. Add `character_generate` and `character_judge` after curation, each with limit 10.
+   Disabled character stages skip without provider calls.
+3. Ship file rendering and separate trusted session-start hook injection. The
+   injection flag defaults to false.
+4. Render at most 3 pairs within 12000 total codepoints.
+5. Constitution lives at `~/.config/dream/character/constitution.md`.
+6. Use per-item model-failure isolation, command-scoped preflight, a version-3
+   pre-DDL backup, and strict new-character config validation. Keep the existing
+   review model defaults and memory suggestion cleanup unchanged.
+7. Claude transcript source is reliable evidence of historical Anthropic overlap.
+   Display it in review, export, and eval. Verdicts against chosen still need
+   explicit human acknowledgement.
+8. Seeds are optional for constitution approval. Seedless synthetic traits skip.
+9. Retention deletes affected derived character records and lineage after backup.
+   Character cleanup has one all-or-nothing snapshot check. User-modified managed
+   files remain in place and are reported.
+
+The earlier Claude-free nightly assumption was wrong. Local review already routes
+through Claude. The binding rule is provider-neutral unit commands with routing
+in config. Earlier recall docs also show old hook timeouts. Current code wins with
+five-second hooks, `hookEventName`, query-aware rendering, and policy filtering.
+The existing migration backup detector covers provider-column changes only;
+character v3 adds a pre-DDL check. Existing config does not validate every old
+stage value type; strict validation is limited to new character values. The existing
+memory suggestion cleanup remains outside scope. No compatibility code is added.
+
+## Remaining open decisions
+
+None from design review. Stop only if planning finds a new conflict with code.
 
 ## Architecture consultation
 
@@ -772,12 +751,12 @@ its findings about historical model identity, stale-pair regeneration, constitut
 retention checks, false-positive starvation, reconstructed task context, incomplete
 eval evidence, and fixed-probe trait bindings. It also removes a redundant review
 mode setting and limits deterministic security claims to host data flow.
-The consultation does not approve the design or decide the six choices above.
+Szymon subsequently approved the revised design and resolved its choices above.
 
-## First-session acceptance
+## Implementation acceptance
 
-The only repository change in this session is this proposed spec, committed with
-a `docs:` prefix on `feat/character`. No implementation plan, template, migration,
-provider run, local config edit, push, or PR is part of the first session.
-The final report names the commit, checks, unresolved decisions, and the first
-implementation unit after approval.
+Update and commit this approved spec, write and commit the implementation plan,
+then implement M1–M8 test-first on `feat/character` without another plan review.
+Before every commit run the full hermetic suite and `git diff --check`. Do not
+run real providers against transcripts, edit local config, push, or open a PR.
+Report commits, final test count, and anything deferred.
