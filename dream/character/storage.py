@@ -130,7 +130,21 @@ def open_writer(config):
 
 
 def mark_stale(conn, document):
-    """Mark old unreviewed pairs in the caller's mutation transaction."""
+    """Observe current identity and mark stale pairs in the mutation transaction."""
+    observe_constitution(conn, document)
     for pair in records(conn, 'character_pairs'):
         if pair.get('constitution_sha256') != document.sha256 and pair.get('status') in ('pending', 'deferred', 'edited'):
             update_record(conn, 'character_pairs', dict(pair, revision=pair['revision'] + 1, status='stale'), expected_sha=pair['content_sha256'])
+
+
+def observe_constitution(conn, document):
+    """Record human approval metadata, never the writable constitution body."""
+    from datetime import datetime, timezone
+    if get_record(conn, 'character_constitutions', document.sha256) is None:
+        insert_record(conn, 'character_constitutions', {
+            'id': document.sha256, 'constitution_sha256': document.sha256,
+            'constitution_version': document.version,
+            'approved_at': getattr(document, 'approved_at', None),
+            'observed_at': datetime.now(timezone.utc).isoformat(),
+            'created_at': datetime.now(timezone.utc).isoformat(),
+        })

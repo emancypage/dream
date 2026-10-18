@@ -259,6 +259,10 @@ def _validate_character(data):
             raise ConfigError(f"character.{key} must be a nonempty path")
         if key in ints and (type(value) is not int or value < (0 if key == "max_seed_expansions" else 1)):
             raise ConfigError(f"character.{key} must be a positive integer")
+    constitution = Path(raw["constitution_path"]).expanduser().resolve()
+    memory_root = DreamConfig(data, None).memory_root.resolve()
+    if constitution.is_relative_to(memory_root):
+        raise ConfigError("character constitution_path must stay outside the memory root")
     for name, stage in data.get("stages", {}).items():
         if not name.startswith("character_"):
             continue

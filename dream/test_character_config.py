@@ -53,3 +53,9 @@ def test_explicit_unknown_claude_auth_rejected(tmp_path):
             'character': {'enabled': True},
             'providers': {'claude': {'auth': 'unknown-auth'}},
         })
+
+
+def test_constitution_path_cannot_be_inside_generated_memory(tmp_path):
+    root = tmp_path / 'memory'
+    with pytest.raises(ConfigError, match='outside'):
+        load_config(tmp_path / 'absent', {'storage': {'memory_root': str(root)}, 'character': {'constitution_path': str(root / 'rules.md')}})

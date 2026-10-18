@@ -60,3 +60,18 @@ def test_updates_recompute_hash_and_require_new_revision():
         update_record(conn, 'character_pairs', dict(updated, revision=3), expected_sha=old['content_sha256'])
     with pytest.raises(ValueError):
         update_record(conn, 'character_pairs', updated)
+
+
+def test_successful_write_observes_constitution_metadata(tmp_path):
+    from types import SimpleNamespace
+    import dream
+    from character import storage
+    conn = dream.open_db(tmp_path / 'dream.db')
+    doc = SimpleNamespace(sha256='constitution-hash', version='human-v1', approved_at='2026-10-18T10:00:00Z')
+    storage.observe_constitution(conn, doc)
+    storage.observe_constitution(conn, doc)
+    observations = storage.records(conn, 'character_constitutions')
+    assert len(observations) == 1
+    assert observations[0]['constitution_version'] == 'human-v1'
+    assert observations[0]['approved_at'] == doc.approved_at
+    assert 'text' not in observations[0]
