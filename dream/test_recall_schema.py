@@ -409,7 +409,7 @@ def test_recall_fts_is_separate_from_messages_fts(tmp_path):
 def test_fresh_db_records_migration_markers_1_and_2(tmp_path):
     conn = open_db(tmp_path / "dream.db")
     versions = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
-    assert versions == {1, 2}
+    assert versions == {1, 2, 3}
     conn.close()
 
 
@@ -451,7 +451,7 @@ def test_migration_preserves_legacy_transcript_rows_and_messages_fts(tmp_path):
                   "recall_embeddings", "recall_documents_fts"):
         assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
     versions = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
-    assert versions == {1, 2}
+    assert versions == {1, 2, 3}
     conn.close()
 
     # Reopening is idempotent and changes nothing.
@@ -460,7 +460,7 @@ def test_migration_preserves_legacy_transcript_rows_and_messages_fts(tmp_path):
     assert conn.execute(
         "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'postgres'"
     ).fetchone()[0] == 1
-    assert {row[0] for row in conn.execute("SELECT version FROM schema_migrations")} == {1, 2}
+    assert {row[0] for row in conn.execute("SELECT version FROM schema_migrations")} == {1, 2, 3}
     conn.close()
 
 

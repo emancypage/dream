@@ -22,3 +22,15 @@ echo "dream stage runner -> $HOME/.local/bin/dream-stage"
 echo "dream skill -> $HOME/.codex/skills/dream"
 echo "dream config -> $HOME/.config/dream/config.toml"
 echo "systemd units -> $HOME/.config/systemd/user/ (run systemctl --user daemon-reload separately)"
+
+# Install the human-owned draft once; refuse symlink directories and targets.
+CHARACTER_DIR="$HOME/.config/dream/character"
+if [ -L "$HOME/.config" ] || [ -L "$HOME/.config/dream" ] || [ -L "$CHARACTER_DIR" ] || [ -L "$CHARACTER_DIR/constitution.md" ]; then
+    echo "Refusing symlink character constitution path" >&2
+    exit 1
+fi
+mkdir -p "$CHARACTER_DIR"
+if [ ! -e "$CHARACTER_DIR/constitution.md" ]; then
+    ( set -o noclobber; cat "$REPO_DIR/dream/character/constitution.template.md" > "$CHARACTER_DIR/constitution.md" )
+    chmod 0600 "$CHARACTER_DIR/constitution.md"
+fi

@@ -224,3 +224,75 @@ CREATE TRIGGER IF NOT EXISTS recall_documents_ad AFTER DELETE ON recall_document
             old.source_kind, old.trust_level, old.project_slug, old.source_path,
             old.source_updated_at, old.indexed_at, old.source_version);
 END;
+
+CREATE TABLE IF NOT EXISTS character_constitutions (
+ id TEXT PRIMARY KEY,
+ work_key TEXT UNIQUE,
+ revision INTEGER NOT NULL CHECK(revision > 0),
+ content_sha256 TEXT NOT NULL,
+ payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS character_constitutions_identity ON character_constitutions(revision, content_sha256);
+
+CREATE TABLE IF NOT EXISTS character_moments (
+ id TEXT PRIMARY KEY,
+ work_key TEXT UNIQUE,
+ revision INTEGER NOT NULL CHECK(revision > 0),
+ content_sha256 TEXT NOT NULL,
+ payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS character_moments_identity ON character_moments(revision, content_sha256);
+
+CREATE TABLE IF NOT EXISTS character_seeds (
+ id TEXT PRIMARY KEY,
+ work_key TEXT UNIQUE,
+ revision INTEGER NOT NULL CHECK(revision > 0),
+ content_sha256 TEXT NOT NULL,
+ payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS character_seeds_identity ON character_seeds(revision, content_sha256);
+
+CREATE TABLE IF NOT EXISTS character_pairs (
+ id TEXT PRIMARY KEY,
+ work_key TEXT UNIQUE,
+ revision INTEGER NOT NULL CHECK(revision > 0),
+ content_sha256 TEXT NOT NULL,
+ payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS character_pairs_identity ON character_pairs(revision, content_sha256);
+
+CREATE TABLE IF NOT EXISTS character_judgments (
+ id TEXT PRIMARY KEY,
+ work_key TEXT UNIQUE,
+ revision INTEGER NOT NULL CHECK(revision > 0),
+ content_sha256 TEXT NOT NULL,
+ payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS character_judgments_identity ON character_judgments(revision, content_sha256);
+
+CREATE TABLE IF NOT EXISTS character_review_events (
+ id TEXT PRIMARY KEY,
+ work_key TEXT UNIQUE,
+ revision INTEGER NOT NULL CHECK(revision > 0),
+ content_sha256 TEXT NOT NULL,
+ payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS character_review_events_identity ON character_review_events(revision, content_sha256);
+
+CREATE TABLE IF NOT EXISTS character_eval_runs (
+ id TEXT PRIMARY KEY,
+ work_key TEXT UNIQUE,
+ revision INTEGER NOT NULL CHECK(revision > 0),
+ content_sha256 TEXT NOT NULL,
+ payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS character_eval_runs_identity ON character_eval_runs(revision, content_sha256);
+
+CREATE TABLE IF NOT EXISTS character_eval_results (
+ id TEXT PRIMARY KEY,
+ work_key TEXT UNIQUE,
+ revision INTEGER NOT NULL CHECK(revision > 0),
+ content_sha256 TEXT NOT NULL,
+ payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS character_eval_results_identity ON character_eval_results(revision, content_sha256);

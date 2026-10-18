@@ -111,9 +111,12 @@ def _backup_before_schema_migration(conn: sqlite3.Connection, path: Path) -> Pat
         or "distillation_key" not in _table_columns(conn, "distilled")
         or "base_sha256" not in _table_columns(conn, "suggestions")
     )
+    migrations = _table_columns(conn, "schema_migrations")
+    version = conn.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0] if migrations else 0
+    needs_upgrade = needs_upgrade or version < 3
     if not needs_upgrade:
         return None
-    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup_path = path.with_name(f"{path.name}.bak-provider-migration-{stamp}")
     if not backup_path.exists():
         dest = sqlite3.connect(backup_path)
@@ -121,6 +124,7 @@ def _backup_before_schema_migration(conn: sqlite3.Connection, path: Path) -> Pat
             conn.backup(dest)
         finally:
             dest.close()
+        backup_path.chmod(0o600)
     return backup_path
 
 
@@ -218,6 +222,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # other recall tables plus their FTS5 index and triggers are created by
         # schema.sql above; messages_fts is never dropped or recreated).
         conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (2)")
+        conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (3)")
 
 
 def rebuild_recall_fts(conn: sqlite3.Connection) -> None:

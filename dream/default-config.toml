@@ -68,3 +68,24 @@ remote_data_egress = false
 enabled = false
 type = "none"
 remote_data_egress = false
+
+[character]
+enabled = false
+constitution_path = "~/.config/dream/character/constitution.md"
+state_root = "~/.local/state/dream/character"
+allow_same_family_judge = false
+hook_injection = false
+render_max_pairs = 3
+render_budget_codepoints = 12000
+max_context_codepoints = 12000
+max_response_codepoints = 8000
+max_seed_expansions = 0
+
+[stages.character_extract]
+provider = "codex"
+[stages.character_generate]
+provider = "codex"
+[stages.character_judge]
+provider = "claude"
+[stages.character_eval_response]
+provider = "codex"
