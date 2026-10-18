@@ -88,3 +88,31 @@ def test_review_race_rechecks_live_row(env,monkeypatch):
     monkeypatch.setattr(storage,'open_writer',raced)
     with pytest.raises(ValueError): r.review_pair(db,c,'p','reject',expected_sha=p['content_sha256'],reason='Checked')
     assert not storage.records(db,'character_review_events')
+
+@pytest.mark.parametrize('action',['accept','reject','defer','edit'])
+def test_persisted_stale_cannot_revive(env,action):
+    j,r,c,db,p=env
+    p=storage.update_record(db,'character_pairs',dict(p,revision=2,status='stale'),expected_sha=p['content_sha256']); db.commit()
+    with pytest.raises(ValueError):
+        r.review_pair(db,c,'p',action,expected_sha=p['content_sha256'],reason='Checked',body='Edited')
+    assert storage.get_record(db,'character_pairs','p')['status']=='stale'
+
+
+def test_accept_rejects_changed_source_parent(env,monkeypatch):
+    j,r,c,db,p=env
+    parent=storage.insert_record(db,'character_seeds',dict(id='seed',revision=1,constitution_sha256='abc',seed={'prompt':'Original'}))
+    p=storage.update_record(db,'character_pairs',dict(p,revision=2,seed_id='seed',provenance={'source_content_sha256':parent['content_sha256']}),expected_sha=p['content_sha256']); db.commit()
+    judged((j,r,c,db,p),monkeypatch)
+    storage.update_record(db,'character_seeds',dict(parent,revision=2,seed={'prompt':'Changed'}),expected_sha=parent['content_sha256']); db.commit()
+    with pytest.raises(ValueError): r.review_pair(db,c,'p','accept',expected_sha=p['content_sha256'],reason='Checked')
+
+def test_stale_history_includes_old_judgments_and_reasons(env):
+    j,r,c,db,p=env
+    old=storage.insert_record(db,'character_pairs',dict(p,id='old',constitution_sha256='old'))
+    storage.insert_record(db,'character_judgments',dict(id='old-judge',revision=1,pair_id='old',constitution_sha256='old',rationale='Historical verdict'))
+    storage.insert_record(db,'character_review_events',dict(id='old-event',revision=1,pair_id='old',constitution_sha256='old',reason='Historical reason'))
+    db.commit()
+    shown=r.show_pair(db,c,'old')
+    assert shown['status']=='stale'
+    assert shown['judgments'][0]['rationale']=='Historical verdict'
+    assert shown['review_events'][0]['reason']=='Historical reason'

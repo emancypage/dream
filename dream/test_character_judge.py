@@ -102,3 +102,40 @@ def test_pair_race_discards_both_calls(env,monkeypatch):
     monkeypatch.setattr(j.backend,'generate',fake)
     assert j.judge_pairs(db,c,limit=1)['failures']
     assert not storage.records(db,'character_judgments')
+
+@pytest.mark.parametrize('when',['first','second','commit'])
+def test_source_parent_race_discards(env,monkeypatch,when):
+    from contextlib import contextmanager
+    j,r,c,db,p=env
+    parent=storage.insert_record(db,'character_moments',dict(id='moment',revision=1,constitution_sha256='abc',user_correction='Shorter',rationale='Too long'))
+    p=storage.update_record(db,'character_pairs',dict(p,revision=2,moment_id=parent['id'],provenance={'source_content_sha256':parent['content_sha256']}),expected_sha=p['content_sha256']); db.commit()
+    def change():
+        storage.update_record(db,'character_moments',dict(parent,revision=2,rationale='Changed'),expected_sha=parent['content_sha256']); db.commit()
+    seq=iter([verdict(),verdict('B','violates','supports')]); count=0
+    def fake(*a,**k):
+        nonlocal count
+        count+=1
+        if when==('first' if count==1 else 'second'): change()
+        return SimpleNamespace(output=next(seq))
+    monkeypatch.setattr(j.backend,'generate',fake)
+    original=storage.open_writer
+    @contextmanager
+    def raced(config):
+        change()
+        with original(config) as writer: yield writer
+    if when=='commit': monkeypatch.setattr(storage,'open_writer',raced)
+    assert j.judge_pairs(db,c,limit=1)['failures']
+    assert not storage.records(db,'character_judgments')
+
+
+def test_session_message_race_discards(env,monkeypatch):
+    j,r,c,db,p=env
+    db.execute("INSERT INTO sessions(session_id,project_slug,jsonl_path,jsonl_mtime) VALUES ('s','p','/source',1)")
+    db.execute("INSERT INTO messages(session_id,seq,role,text) VALUES ('s',1,'user','Original')")
+    storage.update_record(db,'character_pairs',dict(p,revision=2,provenance={'session_id':'s'}),expected_sha=p['content_sha256']); db.commit()
+    def fake(*a,**k):
+        db.execute("UPDATE messages SET text='Changed' WHERE session_id='s'"); db.commit()
+        return SimpleNamespace(output=verdict())
+    monkeypatch.setattr(j.backend,'generate',fake)
+    assert j.judge_pairs(db,c,limit=1)['failures']
+    assert not storage.records(db,'character_judgments')

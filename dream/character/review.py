@@ -19,6 +19,18 @@ def _context(config, document=None):
     return doc,policy
 
 
+def check_source_parent(conn, config, pair, document):
+    """Require displayed evidence to match its recorded source identity."""
+    parent_id=pair.get('moment_id') or pair.get('seed_id')
+    if parent_id is None:
+        return None
+    table='character_moments' if pair.get('moment_id') else 'character_seeds'
+    parent=next((row for row in storage.eligible_records(conn,config,table,document) if row['id']==parent_id),None)
+    if parent is None or parent['content_sha256']!=pair.get('provenance',{}).get('source_content_sha256'):
+        raise ValueError('source evidence changed or unavailable')
+    return parent
+
+
 def _pairs(conn,config,doc):
     return storage.eligible_records(conn,config,'character_pairs',doc)
 
@@ -67,6 +79,8 @@ def review_pair(conn,config,id,action,*,expected_sha,reason='',body=None,acknowl
     doc,policy=_context(config); fingerprint=policy_fingerprint(policy)
     initial=next((p for p in _pairs(conn,config,doc) if p['id']==id),None)
     if initial is None or initial['content_sha256']!=expected_sha: raise ValueError('pair changed or unavailable')
+    if initial.get('status')=='stale': raise ValueError('stale pair requires generation refresh')
+    if action=='accept': check_source_parent(conn,config,initial,doc)
     if not storage._text_allowed({'body':body,'reason':reason},policy): raise ValueError('review conflicts with policy')
     with storage.open_writer(config) as writer:
         writer.execute('BEGIN IMMEDIATE')
@@ -74,8 +88,10 @@ def review_pair(conn,config,id,action,*,expected_sha,reason='',body=None,acknowl
         if current_doc.sha256!=doc.sha256 or policy_fingerprint(current_policy)!=fingerprint: raise ValueError('inputs changed')
         pair=next((p for p in _pairs(writer,config,doc) if p['id']==id),None)
         if pair is None or pair['content_sha256']!=expected_sha: raise ValueError('pair changed or unavailable')
+        if pair.get('status')=='stale': raise ValueError('stale pair requires generation refresh')
         flags=[]
         if action=='accept':
+            check_source_parent(writer,config,pair,doc)
             if pair['status'] in ('rejected','stale'): raise ValueError('pair state cannot be accepted')
             judgments=_judgments(writer,config,pair,doc)
             if not judgments: raise ValueError('current complete judgment required')

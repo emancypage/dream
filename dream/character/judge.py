@@ -12,7 +12,8 @@ from character import storage
 from character.constitution import load_constitution
 from character.safety import policy_for,check_constitution,policy_fingerprint
 from character.types import content_hash,canonical_json
-from character.review import candidate_hash
+from character.review import candidate_hash, check_source_parent
+from character.generate import _source
 
 PROMPT=Path(__file__).resolve().parent.parent/'prompts'/'character-judge-v1.md'
 ASSESSMENT={'type':'object','properties':{'trait_id':{'type':'string'},'a_assessment':{'type':'string','enum':['supports','violates','unclear']},'b_assessment':{'type':'string','enum':['supports','violates','unclear']},'rationale':{'type':'string'}},'required':['trait_id','a_assessment','b_assessment','rationale'],'additionalProperties':False}
@@ -46,14 +47,28 @@ def judge_pairs(conn,config,*,limit):
     identity=content_hash({'route':config.stage('character_judge'),'family':family,'prompt_version':version})
     done=storage.eligible_records(conn,config,'character_judgments',doc)
     pairs=[p for p in storage.eligible_records(conn,config,'character_pairs',doc) if p.get('status') not in ('accepted','rejected','stale') and not any(j.get('pair_id')==p['id'] and j.get('pair_revision')==p['revision'] and j.get('pair_sha256')==p['content_sha256'] and j.get('judge_identity')==identity and j.get('complete') is True for j in done)][:limit]
+    source_snapshots={}
+    def session_snapshot(pair,db,parent):
+        session_id=pair.get('session_id') or pair.get('provenance',{}).get('session_id')
+        if not session_id and parent:
+            session_id=parent.get('session_id') or parent.get('provenance',{}).get('session_id')
+        if not session_id: return None
+        source=_source(db,session_id)
+        if source is None: raise ValueError('source session unavailable')
+        return content_hash(source)
     def check(pair,db):
         current=policy_for(config)
         if load_constitution(config).sha256!=doc.sha256 or policy_fingerprint(current)!=fingerprint or prompt_version()!=version: raise ValueError('inputs changed')
         check_constitution(doc,current)
         live=next((p for p in storage.eligible_records(db,config,'character_pairs',doc) if p['id']==pair['id']),None)
         if live is None or live['content_sha256']!=pair['content_sha256']: raise ValueError('pair changed or unavailable')
+        parent=check_source_parent(db,config,pair,doc)
+        snapshot=session_snapshot(pair,db,parent)
+        if pair['id'] in source_snapshots and source_snapshots[pair['id']]!=snapshot: raise ValueError('source session changed')
     for pair in pairs:
         try:
+            parent=check_source_parent(conn,config,pair,doc)
+            source_snapshots[pair['id']]=session_snapshot(pair,conn,parent)
             check(pair,conn)
             if not pair.get('trait_ids') or any(t not in doc.traits for t in pair['trait_ids']): raise ValueError('invalid traits')
             evidence=None
