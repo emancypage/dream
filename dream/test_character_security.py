@@ -88,3 +88,40 @@ def test_pair_edited_after_pure_render_cannot_be_written(env,monkeypatch):
     with pytest.raises(ValueError,match='pair changed'):
         safety.write_artifacts(c,{'block.md':result['text']},result['manifest'])
     assert not (Path(c.data['character']['state_root'])/'block.md').exists()
+
+
+def _accepted_with_parent(env,monkeypatch,parent_kind):
+    from test_character_review import judged
+    from character import storage,review,render,export
+    j,r,c,db,p=env
+    table='character_moments' if parent_kind=='moment' else 'character_seeds'
+    parent=storage.insert_record(db,table,{'id':'moment-parent','revision':1,'constitution_sha256':'abc','disposition':'completed','prompt_messages':[]})
+    p=storage.update_record(db,'character_pairs',dict(p,revision=2,**{parent_kind+'_id':parent['id']},provenance={'source_content_sha256':parent['content_sha256']}),expected_sha=p['content_sha256']); db.commit()
+    judged((j,r,c,db,p),monkeypatch)
+    accepted=r.review_pair(db,c,'p','accept',expected_sha=p['content_sha256'],reason='Checked source')
+    document=r.load_constitution(c)
+    monkeypatch.setattr(render,'load_constitution',lambda config:document)
+    monkeypatch.setattr(export,'load_constitution',lambda config:document)
+    monkeypatch.setattr('character.constitution.load_constitution',lambda config:document)
+    return c,db,parent,accepted
+
+
+@pytest.mark.parametrize('parent_kind',['moment','seed'])
+def test_changed_source_parent_excluded_from_render_and_export(env,monkeypatch,parent_kind):
+    from character import storage,render,export
+    c,db,parent,pair=_accepted_with_parent(env,monkeypatch,parent_kind)
+    storage.update_record(db,'character_moments' if parent_kind=='moment' else 'character_seeds',dict(parent,revision=2,note='Changed source'),expected_sha=parent['content_sha256']); db.commit()
+    assert not render.render_block(db,c)['manifest']['pair_ids']
+    assert export.export_pairs(db,c)['text']==''
+
+
+@pytest.mark.parametrize('parent_kind',['moment','seed'])
+def test_changed_source_after_preview_cannot_be_written(env,monkeypatch,parent_kind):
+    from character import storage,render
+    c,db,parent,pair=_accepted_with_parent(env,monkeypatch,parent_kind)
+    result=render.render_block(db,c)
+    assert result['manifest']['pair_ids']==['p']
+    storage.update_record(db,'character_moments' if parent_kind=='moment' else 'character_seeds',dict(parent,revision=2,note='Changed source'),expected_sha=parent['content_sha256']); db.commit()
+    db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    with pytest.raises(ValueError,match='pair changed'):
+        safety.write_artifacts(c,{'block.md':result['text']},result['manifest'])

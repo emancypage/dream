@@ -110,6 +110,8 @@ def run(args):
                     raise ValueError('eval requires --limit before model calls')
                 result = evaluate(conn, cfg, fixtures=Path(args.fixtures), limit=args.limit)
                 if result.get('run_id'):
+                    conn.close()
+                    conn = open_db_readonly(cfg.db_path)
                     report = report_run(conn, cfg, result['run_id'])
                     stem = 'eval-' + result['run_id']
                     _save(cfg, report, {stem + '.json': canonical_json(report), stem + '.md': report['markdown']}, stem + '.manifest.json')

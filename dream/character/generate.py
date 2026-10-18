@@ -3,6 +3,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import re
+import json
 import logging
 import sqlite3
 import uuid
@@ -28,6 +29,17 @@ EXPAND_SCHEMA = {'type':'object','properties':{'prompt':{'type':'string'}},'requ
 CUE = re.compile(r"(?<!\w)(?:nie(?: tak)?|źle|cofnij|stop|don't|actually|that's wrong)(?!\w)", re.I)
 
 
+def public_probe_inputs():
+    data = json.loads((PROMPTS.parent / 'fixtures/character/public.json').read_text(encoding='utf-8'))
+    return ({probe['id'] for probe in data['probes']},
+            {message['content'].strip() for probe in data['probes'] for message in probe['messages']})
+
+
+def is_public_input(messages, seed_id=None):
+    ids, texts = public_probe_inputs()
+    return seed_id in ids or any(message['content'].strip() in texts for message in messages)
+
+
 def _allowed(value, policy):
     return storage._text_allowed(value, policy)
 
@@ -49,11 +61,15 @@ def _select(conn, config, source, limit, refresh, expand_seeds=False):
     items=[]; settings=config.data['character']
     moments=storage.eligible_records(conn,config,'character_moments',doc); pairs=storage.eligible_records(conn,config,'character_pairs',doc)
     def add(item):
+        if is_public_input(item['messages'], item.get('seed', {}).get('id')):
+            skipped['public_probe']=skipped.get('public_probe',0)+1
+            return
         item['work_key']=item.pop('_work_key',None) or content_hash({'input':item,'constitution':doc.sha256,'prompt_version':prompt_version(),'policy':policy_fingerprint(policy),'bounds':{'context':settings['max_context_codepoints'],'response':settings['max_response_codepoints']},'extract':config.stage('character_extract'),'generate':config.stage('character_generate')})
         previous=[p for p in pairs if p.get('work_key')==item['work_key']]
-        item['attempt']=max((p.get('generation_attempt',1) for p in previous),default=0)+1
+        prior_moments=[m for m in moments if m.get('work_key')==item['work_key']]
+        item['attempt']=max([p.get('generation_attempt',1) for p in previous]+[m['generation_attempt'] for m in prior_moments]+[0])+1
         item['supersedes_id']=max(previous,key=lambda p:p.get('generation_attempt',1))['id'] if previous else None
-        old=next((m for m in moments if m.get('work_key')==item['work_key']),None)
+        old=max(prior_moments,key=lambda m:m['generation_attempt']) if prior_moments else None
         expansion_only=False
         if previous and item['kind']=='synthetic' and expand_seeds and settings['max_seed_expansions']>0:
             expanded=next((r for r in storage.eligible_records(conn,config,'character_seeds',doc) if r.get('expansion_work_key')==item['work_key']),None)
@@ -155,20 +171,13 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
                         stored=storage.insert_record(writer,'character_seeds',seed_record)
                     record['provenance']['source_content_sha256']=stored['content_sha256']
                 existing=[r for r in storage.records(writer,table) if r.get('work_key')==record['work_key']]
-                if max((r.get('generation_attempt',1) for r in existing),default=0)+1!=record['generation_attempt']:
+                if any(r.get('generation_attempt',1)>=record['generation_attempt'] for r in existing):
                     raise ValueError('generation attempt changed')
                 dependency=record.get('moment_id') or record.get('seed_id')
                 parent_table='character_moments' if record.get('moment_id') else 'character_seeds'
                 parent=storage.get_record(writer,parent_table,dependency)
                 if parent is None or parent['content_sha256']!=record['provenance']['source_content_sha256']:
                     raise ValueError('source record changed')
-            if table=='character_moments':
-                old=next((r for r in storage.records(writer,table) if r.get('work_key')==record['work_key']),None)
-                if old:
-                    record=dict(record,id=old['id'],revision=old['revision']+1)
-                    stored_record=storage.update_record(writer,table,record,expected_sha=old['content_sha256'])
-                    storage.mark_stale(writer,doc)
-                    return stored_record
             stored_record=storage.insert_record(writer,table,record)
             storage.mark_stale(writer,doc)
             return stored_record
@@ -181,7 +190,7 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
         if stored is None:
             expanded,expansion_call=call(item,'character_generate','character-expand-v1.md',{'seed':item['seed']},EXPAND_SCHEMA)
             prompt=expanded['prompt']
-            if not prompt.strip() or len(prompt)>config.data['character']['max_context_codepoints']:
+            if not prompt.strip() or len(prompt)>config.data['character']['max_context_codepoints'] or is_public_input([{'content':prompt}]):
                 raise ValueError('invalid expansion length')
             child_seed={'id':item['seed']['id']+'-expanded-'+content_hash(prompt)[:16],'trait_id':item['seed']['trait_id'],'prompt':prompt}
             key=content_hash({'parent':item['work_key'],'prompt':prompt})
@@ -208,7 +217,7 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
                     if output['is_correction'] and (not output['trait_ids'] or len(set(output['trait_ids']))!=len(output['trait_ids']) or not output['rationale'].strip()):
                         raise ValueError('positive correction needs traits and rationale')
                     if not output['context_excerpt'].strip() or not any(output['context_excerpt'] in m['content'] for m in item['messages']) or output['corrected_assistant_response']!=item['rejected'] or output['user_correction']!=item['correction'] or any(t not in doc.traits for t in output['trait_ids']) or len(output['rationale'])>2000: raise ValueError('invalid extraction evidence')
-                    moment=persist(item,'character_moments',dict(base,**output,id='moment-'+uuid.uuid4().hex,provenance=provenance,**item['identity'],assistant_seq=item['assistant_seq'],correction_seq=item['correction_seq'],prompt_messages=item['messages'],extraction=meta,disposition='completed'))
+                    moment=persist(item,'character_moments',dict(base,**output,generation_attempt=item['attempt'],id='moment-'+uuid.uuid4().hex,provenance=provenance,**item['identity'],assistant_seq=item['assistant_seq'],correction_seq=item['correction_seq'],prompt_messages=item['messages'],extraction=meta,disposition='completed'))
                 if not moment['is_correction'] or not moment['context_sufficient']:
                     skipped['negative']=skipped.get('negative',0)+1; continue
                 chosen,meta=response(item,item['messages'],'chosen'); calls=[meta]; rejected=item['rejected']; traits=moment['trait_ids']; rationale=moment['rationale']; conflict=moment['agreement']=='conflict'

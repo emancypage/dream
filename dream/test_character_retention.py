@@ -104,3 +104,15 @@ def test_retention_command_reports_retry_as_nonzero(setup, monkeypatch, capsys):
     monkeypatch.setattr('character.retention.apply_snapshot', lambda *a: {'rerun_required': True, 'modified_files': []})
     assert dream.cmd_retention(SimpleNamespace(db=cfg.db_path, memory=str(cfg.memory_root), config=cfg, apply=True)) == 1
     assert 'Rerun' in capsys.readouterr().err
+
+
+def test_retention_checks_managed_file_text_without_excluded_rows(setup):
+    conn, cfg = setup
+    (cfg.memory_root / '.dream-retention.json').write_text(json.dumps({'text_markers': ['managed block']}))
+    preview = apply_retention(conn, cfg.memory_root, config=cfg)
+    assert 'block.md' in preview['character']['managed_files']
+    assert not any(preview['character']['rows'].values())
+    result = apply_retention(conn, cfg.memory_root, config=cfg, apply=True)
+    assert result['character']['rerun_required'] is False
+    assert not (Path(cfg.data['character']['state_root']) / 'block.md').exists()
+    assert len(records(conn, 'character_pairs')) == 2

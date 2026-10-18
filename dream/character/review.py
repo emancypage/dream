@@ -67,6 +67,10 @@ def accepted_pairs(conn,config,document=None):
         if pair.get('status')!='accepted' or pair.get('accepted_revision')!=pair['revision'] or pair.get('accepted_candidate_sha256')!=candidate_hash(pair): continue
         event=next((e for e in events if e.get('pair_id')==pair['id'] and e.get('action')=='accept' and e.get('origin')=='human_cli' and e.get('accepted_revision')==pair['revision'] and e.get('candidate_sha256')==candidate_hash(pair)),None)
         if event is None: continue
+        try:
+            check_source_parent(conn,config,pair,doc)
+        except ValueError:
+            continue
         judgments=_judgments(conn,config,pair,doc,exact=False)
         accepted.append(dict(pair,acceptance_reason=event['reason'],review_event=event,judgments=judgments,historical_overlap_warning=any(j.get('historical_overlap_warning') for j in judgments),same_family_override=any(j.get('same_family_override') for j in judgments)))
     return accepted

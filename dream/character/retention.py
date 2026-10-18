@@ -38,17 +38,35 @@ def collect(conn, config):
             if isinstance(value, list):
                 return any(references(v) for v in value)
             return False
-        if not references(manifest) and not policy.excludes(text=raw.decode('utf-8')):
-            continue
-        files[path.name] = base64.b64encode(raw).decode('ascii')
-        expected[path.name] = content_hash({'bytes': files[path.name]})
+        managed = {}
         for name, expected_sha in manifest.get('files', {}).items():
             if not isinstance(name, str) or Path(name).name != name or name in ('.', '..'):
                 raise ValueError('invalid managed artifact name')
             target = guard_path(root / name, config, output_root=root)
             if target.is_file():
-                files[name] = base64.b64encode(target.read_bytes()).decode('ascii')
-                expected[name] = expected_sha
+                managed[name] = (target.read_bytes(), expected_sha)
+        def excluded_bytes(body):
+            text = body.decode('utf-8')
+            if policy.excludes(text=text):
+                return True
+            for line in text.splitlines():
+                try:
+                    value = json.loads(line)
+                except ValueError:
+                    continue
+                if not storage._text_allowed(value, policy):
+                    return True
+            return False
+        known_pairs = {row['id'] for row in all_rows['character_pairs']}
+        missing_lineage = any(identity not in known_pairs for identity in manifest.get('pair_ids', []))
+        if not (references(manifest) or missing_lineage or not storage._text_allowed(manifest, policy)
+                or any(excluded_bytes(body) for body, _ in managed.values())):
+            continue
+        files[path.name] = base64.b64encode(raw).decode('ascii')
+        expected[path.name] = content_hash({'bytes': files[path.name]})
+        for name, (body, expected_sha) in managed.items():
+            files[name] = base64.b64encode(body).decode('ascii')
+            expected[name] = expected_sha
     return {'rows': affected, 'files': files, 'expected_files': expected,
             'policy_fingerprint': policy_fingerprint(policy)}
 

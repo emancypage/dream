@@ -268,3 +268,30 @@ def test_prompt_template_change_discards_provider_output(env, monkeypatch):
     monkeypatch.setattr(g.backend, 'generate', fake)
     assert g.generate_pairs(conn, cfg, source='corrections', limit=1)['failures']
     assert storage.records(conn, 'character_moments') == []
+
+
+def test_public_probe_content_cannot_become_synthetic_input(env, monkeypatch):
+    import json
+    g, cfg, conn = env
+    fixture_path = Path(__file__).parent / 'fixtures/character/public.json'
+    assert fixture_path.is_file(), 'public probes must ship with character evaluation'
+    probe = json.loads(fixture_path.read_text())['probes'][0]
+    g.load_constitution(cfg).seeds = ({'id': 'copied-seed', 'trait_id': 'trait-a', 'prompt': probe['messages'][0]['content']},)
+    monkeypatch.setattr(g.backend, 'generate', lambda *a, **k: pytest.fail('held-out public probe reached generator'))
+    result = g.generate_pairs(conn, cfg, source='synthetic', limit=1)
+    assert result['generated'] == 0
+    assert result['skipped']['public_probe'] == 1
+
+
+def test_refresh_preserves_immutable_moment_evidence(env, monkeypatch):
+    g, cfg, conn = env
+    monkeypatch.setattr(g.backend, 'generate', lambda stage, *a, **k: SimpleNamespace(output=extraction() if stage == 'character_extract' else {'response': 'Brief answer'}))
+    assert g.generate_pairs(conn, cfg, source='corrections', limit=1)['generated'] == 1
+    original = storage.records(conn, 'character_moments')[0]
+    first_pair = storage.records(conn, 'character_pairs')[0]
+    assert g.generate_pairs(conn, cfg, source='corrections', limit=1, refresh=True)['generated'] == 1
+    assert storage.get_record(conn, 'character_moments', original['id']) == original
+    moments = storage.records(conn, 'character_moments')
+    assert len(moments) == 2
+    assert len({pair['moment_id'] for pair in storage.records(conn, 'character_pairs')}) == 2
+    assert storage.get_record(conn, 'character_moments', first_pair['moment_id'])['content_sha256'] == first_pair['provenance']['source_content_sha256']
