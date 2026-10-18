@@ -86,16 +86,16 @@ Files: `character/__init__.py`, `constitution.py`, `types.py`, `safety.py`,
 Tests: `test_character_constitution.py`, `test_character_config.py`,
 `test_character_safety.py`, `test_character_storage.py`.
 
-- [ ] Write tests for draft refusal, seedless approval, exact template text,
+- [x] Write tests for draft refusal, seedless approval, exact template text,
   unknown/type-invalid config, family routing, aliases, read-only no-writes,
   migration backup before DDL, and unchanged existing review defaults.
-- [ ] Run focused tests and confirm missing implementation fails.
-- [ ] Implement the shared interfaces above. Add the strict character section and
+- [x] Run focused tests and confirm missing implementation fails.
+- [x] Implement the shared interfaces above. Add the strict character section and
   four provider-only routes. Add optional backend system_prompt and stage-scoped
   preflight. Implement v3 pre-DDL backup and additive tables.
-- [ ] Validate all required sections, stable IDs, timestamp, and optional seeds.
+- [x] Validate all required sections, stable IDs, timestamp, and optional seeds.
   Installer only creates an absent draft with no symlink overwrite.
-- [ ] Run focused tests, full suite, and whitespace checks. Commit
+- [x] Run focused tests, full suite, and whitespace checks. Commit
   `feat: add character constitution and host contracts`.
 
 ### Task 2. M2 generation and cost estimate
@@ -107,15 +107,15 @@ Interfaces: `estimate(conn, config, *, source, limit, refresh=False,
 expand_seeds=False) -> dict`; `generate_pairs(conn, config, *, source, limit,
 refresh=False, expand_seeds=False) -> dict`.
 
-- [ ] Write failing tests for English/Polish cues, visible bounded context,
+- [x] Write failing tests for English/Polish cues, visible bounded context,
   exclusions before calls, seedless skips, negative dispositions, limits,
   no correction leakage, synthetic arm isolation, provenance, refresh attempts,
   provider/schema failures, input races, and fatal storage errors.
-- [ ] Confirm failures, then implement shared selection for estimate and generate.
+- [x] Confirm failures, then implement shared selection for estimate and generate.
   Provider responses require host schema/identity/length checks. Keep conflicts.
   Both synthetic arms commit together. No failed success cursor is saved.
-- [ ] Include source='claude' historical-family evidence. Reject equal responses.
-- [ ] Run focused and full tests, whitespace check, then commit
+- [x] Include source='claude' historical-family evidence. Reject equal responses.
+- [x] Run focused and full tests, whitespace check, then commit
   `feat: generate character preference pairs`.
 
 ### Task 3. M3 judging and M4 manual review
@@ -127,14 +127,14 @@ Interfaces: `judge_pairs(conn, config, *, limit) -> dict`;
 `review_pair(conn, config, id, action, *, expected_sha, reason='',
 body=None, acknowledge_flags=False) -> dict`.
 
-- [ ] Test two swapped calls, normalized verdicts/assessments, failed second calls,
+- [x] Test two swapped calls, normalized verdicts/assessments, failed second calls,
   mandatory family checks versus extract/generate, recorded override, and history
   overlap warning. Confirm tests fail first.
-- [ ] Implement advisory judgments tied to pair revision/hash. No auto-accept.
-- [ ] Test and implement revision-bound human transitions. Accept requires current
+- [x] Implement advisory judgments tied to pair revision/hash. No auto-accept.
+- [x] Test and implement revision-bound human transitions. Accept requires current
   judgment and explicit flag acknowledgement. Edits clear judgment and acceptance,
   require a reason, and preserve original rejected evidence. Stale reads do not write.
-- [ ] Run focused/full tests and whitespace check. Commit
+- [x] Run focused/full tests and whitespace check. Commit
   `feat: judge and review character pairs`.
 
 ### Task 4. M5 rendering, M7 export, and session-start hook
@@ -144,17 +144,17 @@ Files: `character/render.py`, `export.py`, `dream.py`, `recall_documents.py`,
 Interfaces: `render_block(conn, config) -> dict` with text/manifest;
 `export_pairs(conn, config) -> dict` with text/manifest; previews do not write.
 
-- [ ] Write failing tests for deterministic bytes, full constitution budget,
+- [x] Write failing tests for deterministic bytes, full constitution budget,
   trait coverage and ties, accepted-current-revision eligibility, policy changes,
   protected outputs, exact DPO fields, and source overlap provenance.
-- [ ] Implement complete-example selection and stable dream-dpo-v1 serialization.
+- [x] Implement complete-example selection and stable dream-dpo-v1 serialization.
   Back up and atomically write fixed filenames under validated state root.
-- [ ] Test and implement separate trusted session-start composition. Reuse the
+- [x] Test and implement separate trusted session-start composition. Reuse the
   pure renderer, respect hook total limit, retain relevance-ranked untrusted recall,
   five-second timeout, compact behavior, fail-open handling, and default-off flag.
-- [ ] Exclude protected constitution identities and aliases from consolidation
+- [x] Exclude protected constitution identities and aliases from consolidation
   input, recall sync, and read-time recall. Never promote recalled text to character.
-- [ ] Run focused/full tests and whitespace check. Commit
+- [x] Run focused/full tests and whitespace check. Commit
   `feat: render and export approved character context`.
 
 ### Task 5. M6 paired fixed-probe evaluation
@@ -166,15 +166,15 @@ Interfaces: target protocol `identity()` and `respond(messages, context_block,
 request_settings)`; `evaluate(conn, config, *, fixtures, limit) -> dict`;
 `report_run(conn, config, run_id) -> dict` with JSON data and Markdown table.
 
-- [ ] Write failing tests for multi-turn trajectories, same baseline/A route,
+- [x] Write failing tests for multi-turn trajectories, same baseline/A route,
   trait-text hashes, unsupported skips, no public-fixture generation, controls,
   strict 0..4 scoring, swapped disagreement, partial failure, common scored subset,
   retained call provenance, and current-policy report filtering.
-- [ ] Implement baseline and A through the existing provider API. Add only the
+- [x] Implement baseline and A through the existing provider API. Add only the
   target interface for future B. Store generated responses separately from valid
   completed scores. Failed second judgment saves no scored result.
-- [ ] Keep reports private and deterministic apart from recorded run metadata.
-- [ ] Run focused/full tests and whitespace check. Commit
+- [x] Keep reports private and deterministic apart from recorded run metadata.
+- [x] Run focused/full tests and whitespace check. Commit
   `feat: evaluate character context against fixed probes`.
 
 ### Task 6. M8 retention, CLI, nightly integration, and documentation
@@ -184,26 +184,64 @@ Files: `character/retention.py`, `cli.py`, `retention_cleanup.py`, `dream.py`,
 Tests: `test_character_retention.py`, `test_character_cli.py`,
 `test_nightly_failure_isolation.py`, `test_provider_architecture.py`.
 
-- [ ] Test preview affected lineage across every state, backup contents, deletion,
+- [x] Test preview affected lineage across every state, backup contents, deletion,
   all-or-nothing race rollback, draft/missing constitution, protected managed files,
   user-modified outputs, and unchanged source transcripts. Confirm failures first.
-- [ ] Integrate character snapshot into the same affected-records.json backup.
+- [x] Integrate character snapshot into the same affected-records.json backup.
   Recompute affected set/hashes inside write transaction. A mismatch deletes no
   character rows and reports rerun_required. Keep old memory cleanup semantics.
-- [ ] Wire all character CLI commands with read-only versus writable openers,
+- [x] Wire all character CLI commands with read-only versus writable openers,
   exact required flags, JSON output, safe exit codes, and clean disabled skips.
-- [ ] Test and add separate character_generate and character_judge nightly stages.
+- [x] Test and add separate character_generate and character_judge nightly stages.
   Extend fixed metrics tuple and last-stage completion logic. Verify no literal
   provider commands or human review/deployment commands run in systemd.
-- [ ] Document config, approval, seedless behavior, provider data flows, limits,
+- [x] Document config, approval, seedless behavior, provider data flows, limits,
   manual workflow, hook budgets, retention, copied-file limits, and DPO format.
-- [ ] Run focused/full tests and whitespace check. Commit
+- [x] Run focused/full tests and whitespace check. Commit
   `feat: integrate character retention and nightly commands`.
 
 ### Task 7. Final branch review
 
-- [ ] Review the complete diff against every M1–M8 requirement. Use a fresh reviewer.
-- [ ] Fix material findings with tests and separate logical commits.
-- [ ] Run full hermetic suite, CLI help and preview checks, and git diff --check.
-- [ ] Report commit IDs, test count, and any unfinished result. Do not push or
+- [x] Review the complete diff against every M1–M8 requirement. Use a fresh reviewer.
+- [x] Fix material findings with tests and separate logical commits.
+- [x] Run full hermetic suite, CLI help and preview checks, and git diff --check.
+- [x] Report commit IDs, test count, and any unfinished result. Do not push or
   change local installed configuration. Do not run a real model smoke test.
+
+## Execution record
+
+M1–M8 are implemented. The deployment and retention integration shared explicit
+protected-source arguments, so Tasks 4 and 6 runtime changes landed together.
+Astra reviewed the architecture and the complete branch. Its material findings
+received regression tests and fixes. The final operator docs explain setup,
+provider data flow, manual approval, file deployment, evaluation, and retention.
+
+Validation uses fake providers and temporary databases. Live model behavior and
+local activation are outside this run, as requested. No implementation milestone
+is deferred. The user-owned untracked session logs remain unchanged.
+
+## Verification and commits
+
+The final hermetic suite passes 446 tests. The CLI workflow test covers generation,
+judging, explicit human acceptance, rendering, export, evaluation, reporting, and
+retention cleanup with fake providers. CLI help and whitespace checks pass.
+
+The runtime commits are listed below. The final operator-guide documentation
+commit follows them in branch history.
+
+| Commit | Change |
+| --- | --- |
+| `6d5daac` | docs: propose character pipeline design |
+| `64f1896` | docs: approve character pipeline decisions |
+| `a3e304a` | docs: plan character pipeline implementation |
+| `892448a` | feat: add character constitution and host contracts |
+| `da74766` | fix: guard character destinations and provider auth |
+| `27a840a` | feat: generate character preference pairs |
+| `658a0c5` | fix: filter raw character data and retry expansion work |
+| `0eeaf46` | feat: judge and review character pairs |
+| `47d8430` | fix: bind character review to immutable source evidence |
+| `3319967` | feat: deploy character context with retention and nightly commands |
+| `f31b512` | fix: preserve character evidence and invalidate excluded artifacts |
+| `ba3b2e2` | feat: evaluate character context against fixed probes |
+| `7bad6ca` | fix: close character protection and provenance gaps |
+| `99a11a9` | fix: keep character file deployment database-read-only |

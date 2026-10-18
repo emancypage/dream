@@ -182,7 +182,10 @@ Add migration version 3. The migration backup check must detect a database below
 version 3 before `executescript` creates any character tables. Use SQLite backup
 for an existing database. Record version 3 only after successful creation. Never
 replace existing tables or FTS indexes. Fresh databases need no pre-migration copy.
-Read commands report missing character schema and never migrate it.
+Read commands report missing character schema and never migrate it. Enabled
+database-mutating character commands can initialize it through the guarded writer
+with a pre-DDL backup. Render and export keep SQLite read-only even when saving
+files. Schema initialization is host setup before processing model work items.
 
 All derived rows carry `constitution_sha256`, `constitution_version`,
 `prompt_version`, and UTC `created_at`. Prompt version is a content hash of the
@@ -236,7 +239,8 @@ judgments. Accepted old-SHA pairs remain in history but cannot render or export.
 Returning to old constitution bytes does not silently revive a pair already
 marked stale. Reconsideration requires `generate --refresh` and fresh acceptance.
 Refresh creates a new pair row with a host-incremented generation attempt and
-supersedes ID. It preserves old pair and review history. Normal generation skips
+supersedes ID. Refreshed extraction also gets a new immutable moment row, so old
+pairs retain their original correction evidence. It preserves old pair and review history. Normal generation skips
 completed work keys, including rejected pairs. Explicit refresh also allows a new
 attempt after rejection and never overwrites an accepted or rejected row. The
 estimator reports which old pair each fresh attempt supersedes.
@@ -418,7 +422,9 @@ fake `GenerationResult` and monkeypatch patterns from provider and ingest tests.
 `codex-cli` route with `chatgpt-subscription` is `openai`; `claude-cli` is
 `anthropic`. Unknown auth/family combinations fail. Different route names or model
 names within one family do not satisfy independence. Validate against the configured regeneration
-or synthetic response model family, and against the eval response family when
+or synthetic response model family, including stored candidate call families and
+the source moment's extraction family. Changing current routes cannot erase that
+provenance. Also validate against the eval response family when
 evaluating. The original rejected session response may have unknown provider/model
 identity because the ingest schema does not store it. Preserve any source-derived
 identity as evidence and otherwise record unknown. Do not claim judge independence from that historical response. For

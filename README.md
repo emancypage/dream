@@ -86,7 +86,7 @@ Legacy compatibility variables remain accepted: `DREAM_BACKEND`, `CLAUDE_DREAM_D
 ## Privacy and data flow
 
 - **Local reads.** `dream ingest` and `dream search` read only local transcript stores (by default Codex JSONL under `~/.codex/sessions` and Open Code SQLite at `~/.local/share/opencode/opencode.db`) and the local Dream SQLite database. They never transmit anything.
-- **Model calls send content.** The `distill` and `consolidate` stages send selected session content to the model provider configured for that stage — by default the Codex CLI against your ChatGPT subscription. Distillation sends the filtered transcript of a session; consolidation sends the distilled notes plus the current memory store. The review stage is routed through the configured Codex provider; the production profile is `gpt-5.6-luna` with `reasoning_effort = "high"` and sends pending suggestions plus bounded target context.
+- **Model calls send content.** The `distill` and `consolidate` stages send selected session content to the model provider configured for that stage — by default the Codex CLI against your ChatGPT subscription. Distillation sends the filtered transcript of a session; consolidation sends the distilled notes plus the current memory store. The review stage uses its configured provider and sends pending suggestions plus bounded target context.
 - **Everything else stays local.** The SQLite database (`~/.claude/dream.db` by default), suggestion previews (`.suggestions/`), and the memory store remain on your machine.
 - **Check your configuration first.** Before the first run, review the `[[sources]]` roots and the `[stages.*]`/`[providers.*]` entries in `~/.config/dream/config.toml` so you know which transcripts are read and where their content is sent.
 - **Local and external effects.** `estimate`, `search`, `status`, `preflight`, `context`, and `suggestions list` only read the persistent local data. Automatic recall opens SQLite through an immutable read-only connection; its small deduplication markers live under `/tmp`. `ingest` reads transcripts and updates the local SQLite index without calling a model. `distill`, `consolidate`, and configured curation make model calls and write local results. Suggestion review commands update local review state; `accept`, `merge`, and configured apply operations can also update memory files, with backups before live-memory writes.
@@ -308,9 +308,11 @@ dream ingest
 dream distill --yes --limit 50
 dream consolidate
 dream suggestions curate-configured
+dream character generate --source all --limit 10
+dream character judge --limit 10
 ```
 
-The review stage asks the configured Codex provider for accept/reject/merge/defer decisions. Provider routing and review mode come from TOML; the unit contains no provider/model selection. Production uses `gpt-5.6-luna` with `reasoning_effort = "high"`.
+The review stage asks its configured provider for accept/reject/merge/defer decisions. The unit contains no literal provider commands. TOML selects all providers and models, including Claude-backed review when configured.
 
 ```bash
 ./install.sh
@@ -329,15 +331,14 @@ failure preserves the failing stage and a safe error code. The separate
 exports provider error text or transcript contents.
 
 The exporter should bind to an address reachable by Prometheus but not to every
-network interface. On this setup it listens on the laptop's Tailscale address
-`100.85.174.35:9409`. The main metric is `dream_run_health`: `3` = success,
+network interface. Configure it to listen on the private address reachable by monitoring. The main metric is `dream_run_health`: `3` = success,
 `2` = running, `1` = stale, `0` = failed, and `-1` = no recorded run.
 
 The test-backed patchers add the exporter target and four panels to the existing
 fleet dashboard:
 
 ```bash
-python3 dream/monitoring_prometheus.py /path/to/prometheus.yml 100.85.174.35:9409
+python3 dream/monitoring_prometheus.py /path/to/prometheus.yml MONITOR_ADDRESS:9409
 python3 dream/monitoring_dashboard.py /path/to/rpi-fleet.json
 ```
 
@@ -365,3 +366,139 @@ Paths are relative to `dream/`.
 | `recall_eval.py`, `recall_adapters.py` | fixture evaluation, calibration, and optional adapter contracts |
 | `metrics.py`, `stage_runner.py` | run-state persistence and Prometheus exporter |
 | `monitoring_prometheus.py`, `monitoring_dashboard.py` | idempotent Prometheus and Grafana patchers |
+
+## Character pipeline
+
+Character is disabled by default. It builds preference pairs and deploys approved
+examples through context. It never changes model weights. Memory suggestion
+curation cannot accept character pairs. Each pair needs an explicit human decision.
+
+The installer creates a draft constitution at
+`~/.config/dream/character/constitution.md` only if it does not exist. Edit that
+file yourself. Keep the trait IDs stable and fill each trait's `Why:` line, the
+priority order, and hard constraints. Seed prompts are optional. Remove unused
+trait TODO slots before approval. Set `status` and `approved_at` yourself when you
+approve the document. Dream never approves or edits the live constitution.
+
+Configure the new routes in your local TOML. Packaged stage defaults select only
+providers; set explicit model IDs locally before enabling model calls.
+
+```toml
+[character]
+enabled = false
+constitution_path = "~/.config/dream/character/constitution.md"
+state_root = "~/.local/state/dream/character"
+allow_same_family_judge = false
+hook_injection = false
+render_max_pairs = 3
+render_budget_codepoints = 12000
+max_context_codepoints = 12000
+max_response_codepoints = 8000
+max_seed_expansions = 0
+
+[stages.character_extract]
+provider = "codex"
+
+[stages.character_generate]
+provider = "codex"
+
+[stages.character_judge]
+provider = "claude"
+
+[stages.character_eval_response]
+provider = "codex"
+```
+
+The judge family must differ from both extraction and regeneration families.
+Codex with ChatGPT subscription auth is OpenAI; Claude CLI is Anthropic. The
+same-family override is explicit and is recorded in provenance. Provider checks
+are scoped to the command. Disabled character stages need no model or executable.
+Historical Claude-session responses carry an overlap warning when Claude judges
+them. The original response can benefit from that shared-family bias. Review must
+show the warning, including verdicts against the proposed chosen response.
+
+```bash
+dream character estimate --source all --limit 10
+dream character generate --source all --limit 10
+dream character judge --limit 10
+dream character list
+dream character show PAIR_ID
+dream character accept PAIR_ID --expected-sha HASH --reason "Reviewed against the constitution"
+dream character defer PAIR_ID --expected-sha HASH
+dream character reject PAIR_ID --expected-sha HASH --reason "The answer lacks evidence"
+dream character edit PAIR_ID --expected-sha HASH --body-file /tmp/chosen.txt --reason "Corrected the example"
+dream character render --preview
+dream character render
+dream character export --format dpo-jsonl --preview
+dream character export --format dpo-jsonl
+```
+
+Enabled database-writing commands initialize the new schema with a backup before
+model work. Normal ingestion also initializes it. Read-only commands report a
+missing schema without migrating it. Render and export also keep SQLite read-only,
+including when saving files. Copy the pair hash from `show`. Editing invalidates judgment and acceptance, so
+judge it again before accepting. Conflict, inconsistent judgment, or a verdict
+against chosen requires `--acknowledge-flags` and a human reason. Generation
+`--refresh` creates a new attempt and keeps old review history. Synthetic generation
+skips traits without seeds without treating that as a failure. Seed expansion is
+explicit through `--expand-seeds` and bounded by `max_seed_expansions`.
+
+`render` writes a character block and manifest under the state directory. It uses
+the complete approved constitution and at most three accepted examples. It counts
+the header and complete examples within the codepoint budget. An oversized
+constitution causes an error. Dream never installs the block into `AGENTS.md`,
+`CLAUDE.md`, or native Codex Memories. You choose where to load it. Copies outside
+Dream's state directory must be replaced manually after a constitution or policy
+change.
+
+Setting `hook_injection = true` adds a separate trusted character section to
+session-start context. Recall stays a separate untrusted section with relevance
+ranking. The hook makes no model calls and writes no database state. Its total
+context limit can be smaller than the file-rendering budget. A character block
+which cannot fit is omitted with a diagnostic; the constitution is never cut.
+The flag defaults to false. Review any changed hook definition before trusting it.
+
+Character data flow is explicit. Extraction sends a bounded visible task window,
+the original assistant response, the following correction, and the constitution
+to the extraction provider. Regeneration sends the bounded original task window
+and constitution, without the later correction. Synthetic chosen and baseline
+responses use the same model; only chosen receives the constitution. Judge calls
+send the pair and constitution twice with swapped response order. All model calls
+receive the local retention policy. Estimate makes no model calls and reports item
+and call bounds before generation. These calls consume provider usage.
+
+```bash
+dream character eval --fixtures dream/fixtures/character/public.json --limit 10
+dream character eval --report RUN_ID
+```
+
+Evaluation compares baseline with the rendered block on fixed multi-turn probes
+and neutral task controls. It uses an independent-family judge and swapped order.
+Reports include failed, unsupported, and inconsistent samples. A trait-specific
+probe must match its trait text hash; reusing an ID for a different trait does not
+silently reuse its score. Public probes never become generation seeds. Evaluation sends fixed probes and the rendered examples to the response provider,
+and both trajectories plus the constitution to the judge. Reports
+stay local until you choose to publish them. Context deployment does not prove
+the same robustness as weight training.
+
+DPO export uses the versioned `dream-dpo-v1` format. Each JSONL row has `prompt`,
+`chosen`, `rejected`, and `metadata`, including constitution identity, human review,
+and source provenance. Correction prompts are bounded visible-context
+reconstructions; original tool and system context may be unavailable. Export
+includes accepted current-policy pairs only. There is no trainer, model download,
+LoRA implementation, or endpoint in this release.
+
+Retention applies before model calls, writes, and reads. `dream retention` previews
+affected derived character rows and managed files. `--apply` includes them in the
+same `affected-records.json` backup as other affected memories, then deletes the
+rows and their lineage dependents. It never changes human seeds in the constitution
+or original transcripts. A changed affected set aborts the character cleanup and
+requires a rerun. User-modified managed files stay in place and are reported.
+A retention conflict inside the constitution blocks character use until you edit
+the human-owned document. Private backups remain historical copies outside recall.
+
+The nightly service adds `character_generate` and `character_judge` after memory
+curation, each with a limit of 10. Each stage has separate failure metrics and
+continues after earlier stage failures. Both skip cleanly while character is
+disabled. The service contains no literal provider commands; configuration selects
+the providers. Human review, rendering, export, and evaluation never run nightly.
