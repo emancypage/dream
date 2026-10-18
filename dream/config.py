@@ -285,7 +285,7 @@ def _validate_character(data):
 def provider_family(config: DreamConfig, stage: str) -> str:
     """Return a known provider/auth family; never infer one from a model name."""
     provider = config.provider(config.stage(stage)["provider"])
-    if provider.get("type") == "claude-cli":
+    if provider.get("type") == "claude-cli" and "auth" not in provider:
         return "anthropic"
     if provider.get("type") == "codex-cli" and provider.get("auth") == "chatgpt-subscription":
         return "openai"

@@ -45,3 +45,11 @@ def test_unknown_character_provider_auth_rejected_even_with_override(tmp_path):
             'character': {'enabled': True, 'allow_same_family_judge': True},
             'providers': {'codex': {'auth': 'unknown-auth'}},
         })
+
+
+def test_explicit_unknown_claude_auth_rejected(tmp_path):
+    with pytest.raises(ConfigError, match='family|auth'):
+        load_config(tmp_path / 'absent', {
+            'character': {'enabled': True},
+            'providers': {'claude': {'auth': 'unknown-auth'}},
+        })

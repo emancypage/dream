@@ -27,11 +27,16 @@ def _same(a, b):
         return False
 
 
-def protected_paths(config):
+def protected_paths(config, candidate=None):
     root = config.memory_root.expanduser()
     result = [Path(config.data['character']['constitution_path']).expanduser(), root / POLICY_FILE]
-    for ancestor in (root, *root.parents, Path.cwd(), *Path.cwd().parents):
-        result.extend((ancestor / 'AGENTS.md', ancestor / 'CLAUDE.md'))
+    bases = [root, Path.cwd(), config.db_path.expanduser().parent, Path(config.data['character']['state_root']).expanduser(), Path(config.data['character']['state_root']).expanduser() / 'backups']
+    if candidate is not None:
+        bases.append(Path(candidate).expanduser().parent)
+    for base in bases:
+        for location in (base, base.resolve()):
+            for ancestor in (location, *location.parents):
+                result.extend((ancestor / 'AGENTS.md', ancestor / 'CLAUDE.md'))
     for tree in (root, Path.home() / '.codex' / 'memories'):
         if tree.exists():
             result.extend(p for p in tree.rglob('*') if p.is_file())
@@ -49,7 +54,7 @@ def guard_path(path, config, *, output_root=None):
         raise ValueError('protected memory destination')
     if candidate.name in {'AGENTS.md', 'CLAUDE.md', POLICY_FILE}:
         raise ValueError('protected instruction destination')
-    if any(_same(candidate, protected) for protected in protected_paths(config)):
+    if any(_same(candidate, protected) for protected in protected_paths(config, candidate)):
         raise ValueError('protected destination identity')
     if output_root is not None:
         root = Path(output_root).expanduser().resolve()

@@ -42,3 +42,14 @@ def test_state_root_escape(tmp_path):
     cfg = load_config(tmp_path / 'absent')
     with pytest.raises(ValueError, match='escapes'):
         guard_path(tmp_path / 'outside', cfg, output_root=tmp_path / 'state')
+
+
+def test_database_hardlink_to_adjacent_instruction(tmp_path):
+    instruction = tmp_path / 'AGENTS.md'
+    instruction.write_text('human instructions')
+    db = tmp_path / 'character.db'
+    os.link(instruction, db)
+    cfg = load_config(tmp_path / 'absent', {'storage': {'db_path': str(db)}})
+    with pytest.raises(ValueError, match='protected'):
+        guard_path(db, cfg)
+    assert instruction.read_text() == 'human instructions'
