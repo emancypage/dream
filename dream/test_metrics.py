@@ -9,6 +9,28 @@ import metrics
 
 
 class MetricsStateTest(unittest.TestCase):
+    def test_multiple_continued_failures_survive_later_success_and_finalize(self):
+        state_path = self._path()
+        metrics.start_run(state_path, now=100.0)
+        for stage, stamp in [("ingest", 101.0), ("distill", 102.0)]:
+            metrics.start_stage(state_path, stage=stage, now=stamp)
+            state = metrics.finish_stage(
+                state_path, stage=stage, success=False, now=stamp,
+                error_code="provider_failed", continue_on_error=True,
+            )
+            self.assertNotIn("finished_at", state)
+        metrics.start_stage(state_path, stage="curation", now=103.0)
+        metrics.finish_stage(state_path, stage="curation", success=True, now=104.0)
+        metrics.finish_run(state_path, success=True, now=110.0)
+        state = metrics.finalize_run(state_path, service_result="success", exit_status="0", now=111.0)
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["stage"], "ingest")
+        self.assertEqual(state["started_at"], 100.0)
+        self.assertEqual(state["finished_at"], 110.0)
+        self.assertEqual(state["completed_stages"], ["curation"])
+        self.assertEqual([failure["stage"] for failure in state["failed_stages"]], ["ingest", "distill"])
+        self.assertIn("dream_run_health 0", metrics.render_metrics(state, now=111.0))
+
     def test_start_run_writes_running_state(self):
         state_path = self._path()
 

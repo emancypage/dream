@@ -27,6 +27,7 @@ def run_stage(
     command: Sequence[str],
     *,
     runner: Callable[[Sequence[str]], int] | None = None,
+    continue_on_error: bool = False,
 ) -> int:
     metrics.start_stage(STATE_PATH, stage=stage)
     execute = runner or _run_subprocess
@@ -38,17 +39,24 @@ def run_stage(
             stage=stage,
             success=False,
             error_code="command_not_found",
+            continue_on_error=continue_on_error,
         )
-        return 127
-    if return_code == 0:
-        metrics.finish_stage(STATE_PATH, stage=stage, success=True)
+        return_code = 127
     else:
-        metrics.finish_stage(
-            STATE_PATH,
-            stage=stage,
-            success=False,
-            error_code=_error_code(return_code),
-        )
+        if return_code == 0:
+            metrics.finish_stage(STATE_PATH, stage=stage, success=True)
+        else:
+            metrics.finish_stage(
+                STATE_PATH,
+                stage=stage,
+                success=False,
+                error_code=_error_code(return_code),
+                continue_on_error=continue_on_error and return_code > 0,
+            )
+    if continue_on_error and return_code > 0:
+        print(f"dream-stage: {stage} exited with status {return_code}; continuing remaining stages. Failure retained in run metrics.",
+              file=sys.stderr)
+        return 0
     return return_code
 
 
@@ -59,6 +67,8 @@ def _run_subprocess(command: Sequence[str]) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--continue-on-error", action="store_true",
+                        help="Run later scheduled stages while retaining this failure in metrics")
     parser.add_argument("stage", choices=metrics.STAGES)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -68,7 +78,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not command:
         print("dream-stage: command is required after --", file=sys.stderr)
         return 2
-    return run_stage(args.stage, command)
+    return run_stage(args.stage, command, continue_on_error=args.continue_on_error)
 
 
 if __name__ == "__main__":

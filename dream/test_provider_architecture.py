@@ -19,6 +19,13 @@ def test_nightly_service_invokes_codex_curation_not_mechanical_apply():
     assert "claude" not in service.lower()
 
 
+def test_nightly_service_continues_after_individual_stage_failures():
+    service = (ROOT / "systemd" / "dream.service").read_text(encoding="utf-8")
+    stages = [line for line in service.splitlines() if line.startswith("ExecStart=")]
+    assert len(stages) == 4
+    assert all("dream-stage --continue-on-error " in line for line in stages)
+
+
 def test_default_profile_routes_both_stages_to_codex():
     config = load_config(Path("/nonexistent/dream-config.toml"))
     assert config.stage("distill")["provider"] == "codex"

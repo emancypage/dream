@@ -180,6 +180,50 @@ def make_fixture(path: Path) -> Path:
     return db_path
 
 
+def test_opencode_reads_v2_workspace_schema_without_branch(tmp_path):
+    db_path = make_fixture(tmp_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            DROP TABLE workspace;
+            CREATE TABLE workspace (
+                id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                binding TEXT,
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL
+            );
+        """)
+    source = OpenCodeSQLiteSource(tmp_path)
+    parsed = source.parse(next(iter(source.discover())))
+    assert parsed.git_branch is None
+    assert [(message.role, message.text) for message in parsed.messages] == [
+        ("user", "real request"),
+        ("assistant", "final result"),
+    ]
+
+
+def test_opencode_preserves_branch_from_legacy_workspace(tmp_path):
+    db_path = make_fixture(tmp_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            INSERT INTO workspace(id, type, branch, project_id, time_used)
+            VALUES ('workspace-1', 'worktree', 'topic', 'proj-1', ?)
+        """, (CREATED_MS,))
+        conn.execute("UPDATE session SET workspace_id='workspace-1' WHERE id='ses_root'")
+    source = OpenCodeSQLiteSource(tmp_path)
+    assert source.parse(next(iter(source.discover()))).git_branch == "topic"
+
+
+def test_opencode_reads_sessions_without_workspace_id(tmp_path):
+    db_path = make_fixture(tmp_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("ALTER TABLE session DROP COLUMN workspace_id")
+    source = OpenCodeSQLiteSource(tmp_path)
+    parsed = source.parse(next(iter(source.discover())))
+    assert parsed.git_branch is None
+    assert len(parsed.messages) == 2
+
+
 def test_opencode_source_keeps_only_visible_user_and_assistant_text(tmp_path):
     db_path = make_fixture(tmp_path)
     source = OpenCodeSQLiteSource(tmp_path)

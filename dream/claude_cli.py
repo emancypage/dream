@@ -198,34 +198,34 @@ def call_claude(
 
 # Plain (built-in) Claude Code tools → user-facing status label.
 _TOOL_LABELS: dict[str, str] = {
-    "WebSearch": "🔍 szukam w necie…",
-    "WebFetch": "🌐 czytam stronę…",
-    "Bash": "⚙️ odpalam komendę…",
-    "Read": "📄 czytam pliki…",
-    "Grep": "🔎 przeszukuję pliki…",
-    "Glob": "🔎 przeszukuję pliki…",
-    "Edit": "✏️ edytuję plik…",
-    "Write": "✏️ zapisuję plik…",
-    "NotebookEdit": "✏️ edytuję notebook…",
-    "TodoWrite": "📝 planuję…",
-    "Task": "🤖 odpalam agenta…",
-    "Agent": "🤖 odpalam agenta…",
+    "WebSearch": "🔍 searching the web…",
+    "WebFetch": "🌐 reading the page…",
+    "Bash": "⚙️ running a command…",
+    "Read": "📄 reading files…",
+    "Grep": "🔎 searching files…",
+    "Glob": "🔎 searching files…",
+    "Edit": "✏️ editing a file…",
+    "Write": "✏️ writing a file…",
+    "NotebookEdit": "✏️ editing a notebook…",
+    "TodoWrite": "📝 planning…",
+    "Task": "🤖 starting an agent…",
+    "Agent": "🤖 starting an agent…",
 }
 
 # MCP tool names arrive as mcp__<server>__<tool> (e.g. mcp__claude_ai_Gmail__search_threads).
 # Match on the server segment so every tool from that server gets the right label.
 _MCP_SERVER_LABELS: list[tuple[str, str]] = [
-    ("Gmail", "📧 sprawdzam mail…"),
-    ("Calendar", "📅 zerkam w kalendarz…"),
-    ("Drive", "📁 grzebię w Drive…"),
-    ("pinecone", "🧠 przeszukuję wektory…"),
-    ("sentry", "🐞 sprawdzam Sentry…"),
+    ("Gmail", "📧 checking email…"),
+    ("Calendar", "📅 checking the calendar…"),
+    ("Drive", "📁 searching Drive…"),
+    ("pinecone", "🧠 searching vectors…"),
+    ("sentry", "🐞 checking Sentry…"),
 ]
 
 
 def _tool_label(name: str) -> str:
-    """Map a tool_use name to a short Polish status label. Defensive: unknown
-    tools (incl. future MCP servers) degrade to a generic 'using a tool' label."""
+    """Map a tool_use name to a short English status label. Defensive: unknown
+    tools (including future MCP servers) degrade to a generic 'using a tool' label."""
     if name in _TOOL_LABELS:
         return _TOOL_LABELS[name]
     if name.startswith("mcp__"):
@@ -234,8 +234,8 @@ def _tool_label(name: str) -> str:
         for needle, label in _MCP_SERVER_LABELS:
             if needle.lower() in server.lower():
                 return label
-        return "🛠️ używam integracji…"
-    return "🛠️ używam narzędzia…"
+        return "🛠️ using an integration…"
+    return "🛠️ using a tool…"
 
 
 def _consume_stream(lines, on_status: Callable[[str], None] | None) -> dict | None:

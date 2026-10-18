@@ -19,6 +19,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from retention_policy import load_retention_policy
 
 # One fixed namespace for every stable document ID, regardless of source kind.
 _DOCUMENT_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "dream-recall-documents")
@@ -296,6 +297,17 @@ def synchronize_recall_documents(
     if include_raw_transcripts:
         transcript_rows = _collect_transcripts(conn)
         completed.add("raw_transcript")
+
+    policy = load_retention_policy(memory_root)
+    def retained(row):
+        return not (
+            policy.excludes(source_path=row["source_path"], project_slug=row["project_slug"], text=row["text"])
+            or (row["source_kind"] == "approved_memory" and memory_root is not None
+                and policy.excludes_memory_path(memory_root, row["source_path"]))
+        )
+    memory_rows = [row for row in memory_rows if retained(row)]
+    distilled_rows = [row for row in distilled_rows if retained(row)]
+    transcript_rows = [row for row in transcript_rows if retained(row)]
 
     existing: dict[str, dict] = {
         row[0]: {

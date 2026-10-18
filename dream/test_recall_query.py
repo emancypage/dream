@@ -32,7 +32,7 @@ def test_normalization_and_structured_terms_are_deterministic():
 def test_fts_match_quotes_user_syntax():
     match = build_safe_fts_match('alpha OR beta) NEAR("secret")')
     assert match is not None
-    assert " OR " not in match
+    assert match == '"alpha" OR "beta" OR "near" OR "secret"'
     assert ")" not in match
     assert '"alpha"' in match
 
@@ -45,3 +45,25 @@ def test_lexical_rank_has_component_ranks_and_soft_cross_project_results(tmp_pat
     assert results[0].document.id == "a"
     assert results[0].component_ranks
     assert {candidate.document.id for candidate in results} == {"a", "b"}
+
+
+def test_natural_language_prompt_finds_topic_without_matching_every_word(tmp_path):
+    conn = _db(tmp_path)
+    query = RecallQuery("How can I improve the postgres migration?", "s1", "prompt", "/home/a/api", (), 4000, frozenset(), False)
+    results = rank_lexical(conn, query)
+    assert results[0].document.id == "a"
+    assert "fts" in results[0].component_ranks
+
+
+def test_prompt_does_not_recall_documents_only_because_of_working_directory(tmp_path):
+    conn = _db(tmp_path)
+    query = RecallQuery("pottery glazing", "s1", "prompt", "/home/a/api", (), 4000, frozenset(), False)
+    assert rank_lexical(conn, query) == []
+
+
+def test_home_directory_alone_does_not_recall_other_projects(tmp_path):
+    conn = _db(tmp_path)
+    query = RecallQuery(str(Path.home()), "s1", "session-start:startup", str(Path.home()), (), 6000, frozenset(), False)
+    conn.execute("UPDATE recall_documents SET project_slug = ?", (str(Path.home()).replace("/", "-") + "-unrelated",))
+    conn.commit()
+    assert rank_lexical(conn, query) == []

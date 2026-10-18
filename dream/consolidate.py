@@ -16,6 +16,7 @@ from pathlib import Path
 
 from backend import generate
 from config import DreamConfig, load_config
+from retention_policy import POLICY_FILE, load_retention_policy, filter_notes, empty_notes
 
 DEFAULT_MODEL = None
 PROMPT_PATH = Path(__file__).parent / "prompts" / "consolidate.md"
@@ -106,10 +107,14 @@ def read_current_memory(memory_root: Path) -> str:
     if not memory_root.exists():
         return "(memory root is empty — no files yet)"
     chunks = []
+    policy = load_retention_policy(memory_root)
     for f in sorted(memory_root.glob("*.md")):
         if f.name.startswith("."):
             continue
-        chunks.append(f"### FILE: {f.name}\n\n{f.read_text(encoding='utf-8')}\n")
+        body = f.read_text(encoding='utf-8')
+        if policy.excludes(source_path=f.name, text=body) or policy.excludes_memory_path(memory_root, f.name):
+            continue
+        chunks.append(f"### FILE: {f.name}\n\n{body}\n")
     blob = "\n---\n".join(chunks)
     if len(blob) > MAX_CURRENT_MEMORY_CHARS:
         print(
@@ -200,6 +205,10 @@ def consolidate(
 ) -> list[Suggestion]:
     cfg = config or load_config()
     batch = _fit_batch(collect_distilled_batch(conn, since_iso, limit=max_sessions))
+    policy = load_retention_policy(memory_root)
+    projects = dict(conn.execute("SELECT session_id, project_slug FROM sessions"))
+    batch = [(sid, ts, empty_notes() if policy.excludes(project_slug=projects.get(sid))
+              else filter_notes(notes, policy), dkey) for sid, ts, notes, dkey in batch]
     # Even with no new sessions, still run the staleness audit over the existing
     # store — that's the whole point of this pass. Only skip entirely when there is
     # truly nothing to look at.
@@ -221,12 +230,24 @@ def consolidate(
     # structured suggestions). 600s was too tight once a multi-night backlog piled up
     # (timed out 06-07 + 06-08, batch only ~33k chars so it's the generation, not size).
     # 1800s gives headroom; systemd unit is TimeoutStartSec=infinity so this is the only cap.
+    prompt += policy.context()
     res = generate("consolidate", prompt, CONSOLIDATE_SCHEMA, model=model, config=cfg)
     payload = res.output
 
     suggestions: list[Suggestion] = []
     for s in payload.get("suggestions", []):
         target_path = s.get("target_path", "")
+        if (memory_root / target_path).resolve() == (memory_root / POLICY_FILE).resolve():
+            continue
+        if s.get("kind") != "remove" and any(
+            policy.excludes(project_slug=projects.get(sid)) for sid in s.get("source_sessions", [])
+        ):
+            continue
+        if s.get("kind") != "remove" and (
+            policy.excludes(source_path=target_path, text=s.get("body", "") + "\n" + s.get("rationale", ""))
+            or policy.excludes_memory_path(memory_root, target_path)
+        ):
+            continue
         existed, base_hash = base_state.get(target_path, (False, None))
         suggestions.append(Suggestion(
             kind=s.get("kind", "new"),

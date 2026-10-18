@@ -49,6 +49,7 @@ from recall_context import append_diagnostic, parse_hook_payload, recall_preflig
 from recall_hook_state import claim_hook_event, finish_hook_event, successful_session_start_ids  # noqa: E402
 from recall_hooks import install_hooks, uninstall_hooks  # noqa: E402
 from storage import open_db_readonly  # noqa: E402
+from retention_policy import POLICY_FILE, excludes_source_sessions, load_retention_policy  # noqa: E402
 
 
 def _sync_recall_documents(conn: sqlite3.Connection, memory_root,
@@ -317,7 +318,11 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         print(f"{name}: scanned {seen}, ingested {ingested}, {messages} messages stored.")
     print(f"DB: {args.db}")
     _sync_recall_documents(conn, args.config.memory_root)
-    return 0
+    failures = getattr(results, "failures", [])
+    if failures:
+        print(f"Ingestion completed with {len(failures)} source/session errors. Failed items remain eligible for retry.",
+              file=sys.stderr)
+    return 1 if failures else 0
 
 
 def cmd_estimate(args: argparse.Namespace) -> int:
@@ -479,9 +484,22 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
     resolved_target = tgt.resolve()
     contained = resolved_target.is_relative_to(resolved_root)
     protected = kind == "remove" and resolved_target == resolved_root / "MEMORY.md"
+    if resolved_target == (resolved_root / POLICY_FILE).resolve():
+        _reject_suggestion(conn, sug_dir, sug_id, sug_file)
+        print(f"  rejected #{sug_id}: the local retention policy is user-controlled")
+        return False
     state = conn.execute(
-        "SELECT base_sha256, target_existed FROM suggestions WHERE id=?", (sug_id,)
+        "SELECT base_sha256, target_existed, source_sessions FROM suggestions WHERE id=?", (sug_id,)
     ).fetchone()
+    policy = load_retention_policy(memory_root)
+    if kind != "remove" and (
+        policy.excludes(source_path=target_path, text=new_content or "")
+        or policy.excludes_memory_path(memory_root, target_path)
+        or excludes_source_sessions(conn, policy, state[2] if state else None)
+    ):
+        _reject_suggestion(conn, sug_dir, sug_id, sug_file)
+        print(f"  rejected #{sug_id}: excluded by local memory retention policy")
+        return False
     base_sha = state[0] if state else None
     target_existed = state[1] if state else None
     conflict = (
@@ -1054,6 +1072,17 @@ def cmd_recall_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_retention(args: argparse.Namespace) -> int:
+    from retention_cleanup import apply_retention
+    conn = open_db(args.db) if args.apply else open_db_readonly(args.db)
+    try:
+        result = apply_retention(conn, Path(args.memory), apply=args.apply)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        conn.close()
+
+
 def cmd_hooks(args: argparse.Namespace) -> int:
     path = Path(args.path).expanduser()
     if args.hooks_cmd == "install":
@@ -1106,7 +1135,8 @@ def cmd_context(args: argparse.Namespace) -> int:
             if explain:
                 print(json.dumps({"candidate_count": 0, "selected_count": 0, "fallback_reason": "duplicate-or-running"}, separators=(",", ":")))
             return 0
-        result = run_context(conn, query, settings, explain=explain, allow_cache_writes=False)
+        result = run_context(conn, query, settings, explain=explain, allow_cache_writes=False,
+                             memory_root=args.config.memory_root)
         if attempt_token is not None:
             finish_hook_event(query.session_id, query.hook_event, succeeded=True, selected_ids=[candidate.document.id for candidate in result.selected], attempt_token=attempt_token)
         if explain:
@@ -1204,6 +1234,11 @@ def main(argv: list[str] | None = None) -> int:
 
     pst = sub.add_parser("status", help="Show DB stats")
     pst.set_defaults(func=cmd_status)
+
+    pret = sub.add_parser("retention", help="Preview or apply local memory exclusions")
+    pret.add_argument("--memory")
+    pret.add_argument("--apply", action="store_true", help="Back up and remove excluded generated memories")
+    pret.set_defaults(func=cmd_retention)
 
     ppre = sub.add_parser("preflight", help="Check configured provider executables and auth")
     ppre.set_defaults(func=cmd_preflight)

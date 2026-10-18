@@ -5,8 +5,9 @@ from __future__ import annotations
 import re
 
 from recall_scrub import scrub_text
+from recall_query import query_terms
 
-_BOUNDARY = re.compile(r"(?<=[.!?])\s+|\n+")
+_BOUNDARY = re.compile(r'(?<=[.!?])\s+|\n+|"\s*,\s*"')
 
 
 def make_excerpt(text: str, normalized_query: str, max_codepoints: int) -> str:
@@ -16,10 +17,10 @@ def make_excerpt(text: str, normalized_query: str, max_codepoints: int) -> str:
     if len(value) <= max_codepoints:
         return value
     chunks = [chunk.strip() for chunk in _BOUNDARY.split(value) if chunk.strip()]
-    terms = [term for term in normalized_query.split() if term]
+    terms = set(query_terms(normalized_query))
     ordered = sorted(
         enumerate(chunks),
-        key=lambda item: (not any(term.casefold() in item[1].casefold() for term in terms), item[0]),
+        key=lambda item: (-len(terms.intersection(query_terms(item[1]))), item[0]),
     )
     selected: list[str] = []
     used = 0
@@ -34,7 +35,7 @@ def make_excerpt(text: str, normalized_query: str, max_codepoints: int) -> str:
     return " ".join(selected)
 
 
-def render_context(candidates, budget_codepoints: int) -> str:
+def render_context(candidates, budget_codepoints: int, query_text: str) -> str:
     if budget_codepoints <= 0:
         return ""
     blocks: list[str] = []
@@ -50,7 +51,7 @@ def render_context(candidates, budget_codepoints: int) -> str:
         remaining = budget_codepoints - used - (2 if blocks else 0) - len(header)
         if remaining <= 0:
             continue
-        excerpt = make_excerpt(candidate.scrubbed_excerpt or doc.text, "", remaining)
+        excerpt = make_excerpt(candidate.scrubbed_excerpt or doc.text, query_text, min(1000, remaining))
         block = header + excerpt
         if not excerpt or used + (2 if blocks else 0) + len(block) > budget_codepoints:
             continue

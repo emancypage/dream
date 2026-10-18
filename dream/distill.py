@@ -13,6 +13,7 @@ from typing import Iterable
 
 from backend import generate
 from config import DreamConfig, load_config
+from retention_policy import load_retention_policy, filter_notes
 
 DEFAULT_MODEL = None
 PROMPT_PATH = Path(__file__).parent / "prompts" / "distill.md"
@@ -107,6 +108,11 @@ def distill_session(
         return None
     started_at, cwd, project_slug, source_revision, parser_version = session_row
 
+    cfg = config or load_config()
+    policy = load_retention_policy(memory_root or cfg.memory_root)
+    if policy.excludes(project_slug=project_slug):
+        return None
+
     messages = load_session_messages(conn, session_id)
     if not messages:
         return None
@@ -120,9 +126,9 @@ def distill_session(
         .replace("{{transcript}}", transcript)
     )
 
-    cfg = config or load_config()
+    prompt += policy.context()
     res = generate("distill", prompt, DISTILL_SCHEMA, model=model, config=cfg)
-    notes = res.output
+    notes = filter_notes(res.output, policy)
     summary = notes.get("summary", "")[:500]
 
     result = DistillResult(
@@ -235,4 +241,7 @@ def sessions_needing_distill(
         sql += " AND s.project_slug = ?"
         params.append(project_slug)
     sql += " ORDER BY s.started_at DESC"
-    return [(r[0], r[1]) for r in conn.execute(sql, params).fetchall()]
+    policy = load_retention_policy(cfg.memory_root)
+    excluded_sessions = {row[0] for row in conn.execute("SELECT session_id, project_slug FROM sessions")
+                         if policy.excludes(project_slug=row[1])}
+    return [(r[0], r[1]) for r in conn.execute(sql, params).fetchall() if r[0] not in excluded_sessions]

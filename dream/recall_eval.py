@@ -99,7 +99,7 @@ def _evaluate(data: dict, conn, settings: RecallSettings, threshold: float | Non
         started = time.perf_counter()
         candidates = rank_lexical(conn, query)
         selected = select_recall_candidates(candidates, query, settings, calibration)
-        rendered = render_context(selected, query.requested_codepoint_budget)
+        rendered = render_context(selected, query.requested_codepoint_budget, query.query_text)
         latencies.append((time.perf_counter() - started) * 1000)
         selected_ids = [candidate.document.id for candidate in selected]
         relevant = set(item.get("relevant", ()))

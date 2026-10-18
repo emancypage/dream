@@ -21,3 +21,12 @@ def test_session_start_has_no_threshold_and_deduplicates_hashes():
     values = [_candidate("a", "approved_memory", "user_approved", .01, "same"), _candidate("b", "distilled_summary", "model_distilled", .9, "same")]
     selected = select_recall_candidates(values, _query("session-start:startup"), None, {})
     assert len(selected) == 1
+
+
+def test_selection_preserves_relevance_order_across_source_kinds_and_projects():
+    values = [
+        _candidate("best", "distilled_summary", "model_distilled", .9, project="z-project"),
+        _candidate("second", "approved_memory", "user_approved", .5, project="a-project"),
+    ]
+    selected = select_recall_candidates(values, _query(), None, {})
+    assert [candidate.document.id for candidate in selected] == ["best", "second"]

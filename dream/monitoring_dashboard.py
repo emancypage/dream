@@ -50,7 +50,7 @@ def _health_mappings() -> list[dict[str, Any]]:
             "type": "value",
             "options": {
                 "-1": {"text": "BRAK DANYCH", "color": "gray"},
-                "0": {"text": "BŁĄD", "color": "red"},
+                "0": {"text": "ERROR", "color": "red"},
                 "1": {"text": "NIEAKTUALNY", "color": "orange"},
                 "2": {"text": "W TRAKCIE", "color": "blue"},
                 "3": {"text": "OK", "color": "green"},

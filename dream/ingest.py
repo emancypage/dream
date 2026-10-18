@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 from config import DreamConfig, load_config
 from sources.base import Message, ParsedSession
@@ -86,14 +87,59 @@ def ingest_parsed_session(
     return True, len(parsed.messages)
 
 
-def ingest_source(source, conn: sqlite3.Connection, force: bool = False) -> tuple[int, int, int]:
+class IngestionResults(list[tuple[str, int, int, int]]):
+    """Per-source counts and source errors, without discarding completed work."""
+
+    def __init__(self):
+        super().__init__()
+        self.failures: list[str] = []
+
+
+def ingest_source(
+    source,
+    conn: sqlite3.Connection,
+    force: bool = False,
+    *,
+    on_error: Callable[[str, Exception], None] | None = None,
+) -> tuple[int, int, int]:
     seen = ingested = messages = 0
-    for ref in source.discover():
+    try:
+        refs = iter(source.discover())
+    except Exception as exc:
+        if on_error is None:
+            raise
+        on_error("discovery", exc)
+        return seen, ingested, messages
+    while True:
+        try:
+            ref = next(refs)
+        except StopIteration:
+            break
+        except Exception as exc:
+            if on_error is None:
+                raise
+            on_error("discovery", exc)
+            break
         seen += 1
-        parsed = source.parse(ref)
+        try:
+            parsed = source.parse(ref)
+        except Exception as exc:
+            if on_error is None:
+                raise
+            on_error(f"session {ref.external_session_id}", exc)
+            continue
         if parsed is None:
             continue
-        changed, count = ingest_parsed_session(parsed, conn, force=force)
+        # A transcript can disappear after parsing. Isolate filesystem errors,
+        # while SQLite storage failures remain fatal. The session transaction
+        # rolls back any partial writes before either error leaves it.
+        try:
+            changed, count = ingest_parsed_session(parsed, conn, force=force)
+        except OSError as exc:
+            if on_error is None:
+                raise
+            on_error(f"session {ref.external_session_id}", exc)
+            continue
         if changed:
             ingested += 1
             messages += count
@@ -105,16 +151,29 @@ def ingest_configured_sources(
     config: DreamConfig | None = None,
     selected: set[str] | None = None,
     force: bool = False,
-) -> list[tuple[str, int, int, int]]:
+) -> IngestionResults:
     cfg = config or load_config()
-    results = []
+    results = IngestionResults()
     for source_cfg in cfg.sources:
         if not source_cfg.get("enabled", True) and not (selected and source_cfg["name"] in selected):
             continue
         if selected and source_cfg["name"] not in selected:
             continue
-        source = create_source(source_cfg["type"], Path(source_cfg["root"]).expanduser())
-        results.append((source_cfg["name"], *ingest_source(source, conn, force=force)))
+        name = source_cfg["name"]
+
+        def report_error(operation: str, exc: Exception) -> None:
+            message = f"{name}: {operation} failed: {type(exc).__name__}: {exc}"
+            results.failures.append(message)
+            print(message, file=sys.stderr)
+
+        try:
+            source = create_source(source_cfg["type"], Path(source_cfg["root"]).expanduser())
+        except Exception as exc:
+            report_error("initialization", exc)
+            results.append((name, 0, 0, 0))
+            continue
+        counts = ingest_source(source, conn, force=force, on_error=report_error)
+        results.append((name, *counts))
     return results
 
 

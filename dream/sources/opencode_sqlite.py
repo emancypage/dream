@@ -41,6 +41,10 @@ def _table_names(conn: sqlite3.Connection) -> set[str]:
     return {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def _revision(session_id: str, *parts: object) -> str:
     payload = "\0".join(str(part or 0) for part in (session_id, *parts)).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
@@ -104,12 +108,8 @@ class OpenCodeSQLiteSource:
         if opened is None:
             return
         db_path, conn = opened
-        names = _table_names(conn)
-        workspace_join = (
-            "LEFT JOIN workspace w ON w.id = s.workspace_id" if "workspace" in names else ""
-        )
         rows = conn.execute(
-            f"""
+            """
             SELECT
                 s.id,
                 s.time_updated,
@@ -126,7 +126,6 @@ class OpenCodeSQLiteSource:
                 SELECT session_id, COUNT(*) AS cnt, MAX(time_updated) AS upd
                 FROM part GROUP BY session_id
             ) p ON p.session_id = s.id
-            {workspace_join}
             WHERE s.parent_id IS NULL
             ORDER BY s.id
             """
@@ -144,8 +143,10 @@ class OpenCodeSQLiteSource:
         if opened is None:
             return None
         db_path, conn = opened
-        names = _table_names(conn)
-        if "workspace" in names:
+        if (
+            {"id", "branch"} <= _table_columns(conn, "workspace")
+            and "workspace_id" in _table_columns(conn, "session")
+        ):
             row = conn.execute(
                 """
                 SELECT s.id, s.parent_id, s.directory, s.time_created, s.time_updated, w.branch
