@@ -63,6 +63,15 @@ def judge_pairs(conn,config,*,limit):
         live=next((p for p in storage.eligible_records(db,config,'character_pairs',doc) if p['id']==pair['id']),None)
         if live is None or live['content_sha256']!=pair['content_sha256']: raise ValueError('pair changed or unavailable')
         parent=check_source_parent(db,config,pair,doc)
+        stored_families={call.get('family') for call in pair.get('generator_calls', [])}
+        if pair.get('moment_id'):
+            stored_families.add(parent.get('extraction', {}).get('family'))
+        if parent and parent.get('expansion_call'):
+            stored_families.add(parent['expansion_call'].get('family'))
+        if not stored_families or not stored_families <= {'openai', 'anthropic'}:
+            raise ValueError('stored generation family is missing or unknown')
+        if family in stored_families and not override:
+            raise ValueError('judge shares a stored extraction or generation family')
         snapshot=session_snapshot(pair,db,parent)
         if pair['id'] in source_snapshots and source_snapshots[pair['id']]!=snapshot: raise ValueError('source session changed')
     for pair in pairs:

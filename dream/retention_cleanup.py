@@ -14,7 +14,13 @@ from retention_policy import empty_notes, excludes_source_sessions, filter_notes
 def apply_retention(conn, memory_root: Path, *, config, apply=False) -> dict:
     from character.retention import collect, preview, apply_snapshot
     character_snapshot = collect(conn, config)
+    from character.safety import is_memory_control_source
+    def guard_control(path):
+        if is_memory_control_source(path, memory_root=memory_root,
+                                    constitution_path=config.data['character']['constitution_path']):
+            raise ValueError("retention target aliases a protected input")
     root = memory_root.resolve()
+    guard_control(root / 'MEMORY.md')
     policy = load_retention_policy(root)
     files = []
     for name in policy.memory_paths:
@@ -22,6 +28,7 @@ def apply_retention(conn, memory_root: Path, *, config, apply=False) -> dict:
         if not path.resolve().is_relative_to(root):
             raise ValueError("excluded memory resolves outside the memory root")
         if path.is_file():
+            guard_control(path)
             files.append(path)
 
     changed = []
@@ -72,6 +79,7 @@ def apply_retention(conn, memory_root: Path, *, config, apply=False) -> dict:
         if not path.exists() or path.read_text(encoding="utf-8") != snapshots[name]:
             deferred_files.append(name)
             continue
+        guard_control(path)
         path.unlink()
     if "MEMORY.md" in snapshots:
         lines = snapshots["MEMORY.md"].splitlines(keepends=True)
@@ -81,6 +89,7 @@ def apply_retention(conn, memory_root: Path, *, config, apply=False) -> dict:
             if not index.exists() or index.read_text(encoding="utf-8") != snapshots["MEMORY.md"]:
                 deferred_files.append("MEMORY.md")
             else:
+                guard_control(index)
                 index.write_text(kept, encoding="utf-8")
     with conn:
         for sid, old_notes, old_summary, notes, summary in changed:

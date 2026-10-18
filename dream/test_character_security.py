@@ -95,7 +95,7 @@ def _accepted_with_parent(env,monkeypatch,parent_kind):
     from character import storage,review,render,export
     j,r,c,db,p=env
     table='character_moments' if parent_kind=='moment' else 'character_seeds'
-    parent=storage.insert_record(db,table,{'id':'moment-parent','revision':1,'constitution_sha256':'abc','disposition':'completed','prompt_messages':[]})
+    parent=storage.insert_record(db,table,{'id':'moment-parent','revision':1,'constitution_sha256':'abc','disposition':'completed','prompt_messages':[],'extraction':{'family':'openai'}})
     p=storage.update_record(db,'character_pairs',dict(p,revision=2,**{parent_kind+'_id':parent['id']},provenance={'source_content_sha256':parent['content_sha256']}),expected_sha=p['content_sha256']); db.commit()
     judged((j,r,c,db,p),monkeypatch)
     accepted=r.review_pair(db,c,'p','accept',expected_sha=p['content_sha256'],reason='Checked source')

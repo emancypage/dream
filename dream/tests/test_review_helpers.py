@@ -92,7 +92,7 @@ def test_prune_orphaned_index_lines_drops_missing_target():
             "- [A](a.md) — hook a\n- [B](b.md) — hook b\n- [C](c.md) — hook c\n",
             encoding="utf-8",
         )
-        changed = _prune_orphaned_index_lines(root)
+        changed = _prune_orphaned_index_lines(root, constitution_path=None)
         assert changed is True
         result = (root / "MEMORY.md").read_text(encoding="utf-8")
         assert "(a.md)" in result
@@ -106,7 +106,7 @@ def test_prune_orphaned_index_lines_noop_when_all_targets_exist():
         (root / "a.md").write_text("x", encoding="utf-8")
         original = "- [A](a.md) — hook a\n"
         (root / "MEMORY.md").write_text(original, encoding="utf-8")
-        changed = _prune_orphaned_index_lines(root)
+        changed = _prune_orphaned_index_lines(root, constitution_path=None)
         assert changed is False
         assert (root / "MEMORY.md").read_text(encoding="utf-8") == original
 
@@ -118,7 +118,7 @@ def test_prune_orphaned_index_lines_preserves_non_link_lines():
             "## Header\n\n- [Gone](gone.md) — orphaned\n\nsome prose\n",
             encoding="utf-8",
         )
-        _prune_orphaned_index_lines(root)
+        _prune_orphaned_index_lines(root, constitution_path=None)
         result = (root / "MEMORY.md").read_text(encoding="utf-8")
         assert "## Header" in result
         assert "some prose" in result
@@ -128,7 +128,7 @@ def test_prune_orphaned_index_lines_preserves_non_link_lines():
 def test_prune_orphaned_index_lines_no_memory_md():
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
-        assert _prune_orphaned_index_lines(root) is False
+        assert _prune_orphaned_index_lines(root, constitution_path=None) is False
 
 
 def test_migration_adds_sug_file_to_legacy_db():
@@ -270,7 +270,7 @@ def test_cmd_review_interactive_prunes_orphaned_index_lines(monkeypatch):
         conn.close()
 
         monkeypatch.setattr("builtins.input", lambda _: "r")  # reject the one suggestion
-        args = argparse.Namespace(db=db_path, memory=str(root), yes=False, dry_run=False)
+        args = argparse.Namespace(db=db_path, memory=str(root), yes=False, dry_run=False, config=load_config(Path(d) / 'absent.toml'))
         cmd_review(args)
 
         result = (root / "MEMORY.md").read_text(encoding="utf-8")

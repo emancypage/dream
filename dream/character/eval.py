@@ -154,7 +154,7 @@ def evaluate(conn, config, *, fixtures, limit):
                 storage.insert_record(writer,'character_eval_results',record)
 
     for probe in allowed_probes[:limit]:
-        base={'run_id':run_id,'probe_id':probe['id'],'category':probe['category'],'constitution_sha256':document.sha256,'constitution_version':document.version,'prompt_version':prompt_version,'created_at':_now(),'revision':1}
+        base={'probe_input':probe,'run_id':run_id,'probe_id':probe['id'],'category':probe['category'],'constitution_sha256':document.sha256,'constitution_version':document.version,'prompt_version':prompt_version,'created_at':_now(),'revision':1}
         supported=all(t in document.traits and content_hash(document.traits[t]) == probe['trait_sha256'][t] for t in probe['trait_ids'])
         if not supported:
             reason='unsupported'
@@ -283,7 +283,7 @@ def report_run(conn, config, run_id):
         failed=sum(any(r['state'] in ('generation_failed','score_failed','generated') for r in g.values()) for g in groups.values())
         categories.append(dict(category=category,dimensions=dimensions,total=len(probes),valid=len(common),baseline=baseline,A=treated,delta=treated-baseline if common else None,
                                failed=failed,omitted=len(probes)-len(common),**counts))
-    manifest=dict(run['manifest'],run_id=run_id,identities=run['identities'])
+    manifest=dict(run['manifest'],run_id=run_id,identities=run['identities'],result_ids=[row['id'] for row in rows])
     lines=['| Category | Valid / total | Baseline | A | Delta | Inconsistent | Unsupported | Skipped | Failed |',
            '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
     def number(value): return 'n/a' if value is None else f'{value:.2f}'

@@ -36,6 +36,14 @@ def is_constitution_source(source_path, *, memory_root=None, constitution_path):
     return _same(source, Path(constitution_path).expanduser())
 
 
+def is_memory_control_source(source_path, *, memory_root, constitution_path):
+    source = Path(source_path).expanduser()
+    if not source.is_absolute():
+        source = Path(memory_root) / source
+    return (is_constitution_source(source, constitution_path=constitution_path)
+            or _same(source, Path(memory_root) / POLICY_FILE))
+
+
 def _check_artifact_inputs(config, manifest):
     from character.constitution import load_constitution
     from character.review import accepted_pairs

@@ -279,7 +279,7 @@ def _merge_index(existing: str, proposed: str) -> str:
     return body + "\n" + "\n".join(additions) + "\n"
 
 
-def _prune_orphaned_index_lines(memory_root: Path) -> bool:
+def _prune_orphaned_index_lines(memory_root: Path, *, constitution_path) -> bool:
     """Drop MEMORY.md link lines whose target file no longer exists on disk.
 
     Deterministic and LLM-independent: runs after every suggestion batch (whether or
@@ -291,6 +291,9 @@ def _prune_orphaned_index_lines(memory_root: Path) -> bool:
     index_path = memory_root / "MEMORY.md"
     if not index_path.exists():
         return False
+    from character.safety import is_memory_control_source
+    if is_memory_control_source(index_path, memory_root=memory_root, constitution_path=constitution_path):
+        raise ValueError("memory index aliases a protected input")
     lines = index_path.read_text(encoding="utf-8").splitlines(keepends=True)
     kept = [
         line for line in lines
@@ -298,6 +301,8 @@ def _prune_orphaned_index_lines(memory_root: Path) -> bool:
     ]
     if kept == lines:
         return False
+    if is_memory_control_source(index_path, memory_root=memory_root, constitution_path=constitution_path):
+        raise ValueError("memory index aliases a protected input")
     index_path.write_text("".join(kept), encoding="utf-8")
     return True
 
@@ -489,9 +494,9 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
     resolved_root = memory_root.resolve()
     resolved_target = tgt.resolve()
     contained = resolved_target.is_relative_to(resolved_root)
-    from character.safety import is_constitution_source
+    from character.safety import is_memory_control_source
     protected = kind == "remove" and resolved_target == resolved_root / "MEMORY.md"
-    if is_constitution_source(tgt, constitution_path=constitution_path):
+    if is_memory_control_source(tgt, memory_root=memory_root, constitution_path=constitution_path):
         _reject_suggestion(conn, sug_dir, sug_id, sug_file)
         print(f"  rejected #{sug_id}: the constitution is human-controlled")
         return False
@@ -753,7 +758,7 @@ def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions, *, const
     if applied:
         if backup is None:
             backup = _backup_memory(memory_root)
-        if _prune_orphaned_index_lines(memory_root):
+        if _prune_orphaned_index_lines(memory_root, constitution_path=constitution_path):
             _sync_recall_documents(conn, memory_root, constitution_path=constitution_path)
             print("pruned orphaned MEMORY.md links")
     print(f"applied IDs: {applied}")
@@ -883,7 +888,7 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
             new_content = _resolved_body(kind, old, body)
             if not _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target, new_content, preview, constitution_path=args.config.data['character']['constitution_path']):
                 conflicts += 1
-        if _prune_orphaned_index_lines(memory_root):
+        if _prune_orphaned_index_lines(memory_root, constitution_path=args.config.data['character']['constitution_path']):
             print("pruned orphaned MEMORY.md links")
         return 3 if conflicts else 0
 
@@ -953,7 +958,7 @@ def cmd_review(args: argparse.Namespace) -> int:
             print(f"  [{kind:<6}] {target_path}  (#{sug_id}) — {tag}")
             if not dry:
                 _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target_path, new_content, sug_file, constitution_path=args.config.data['character']['constitution_path'])
-        if not dry and _prune_orphaned_index_lines(memory_root):
+        if not dry and _prune_orphaned_index_lines(memory_root, constitution_path=args.config.data['character']['constitution_path']):
             print("  pruned orphaned MEMORY.md links")
         return 0
 
@@ -1017,7 +1022,7 @@ def cmd_review(args: argparse.Namespace) -> int:
             print(_color("  rejected.", "red"))
         else:
             print(_color("  skipped.", "grey"))
-    if _prune_orphaned_index_lines(memory_root):
+    if _prune_orphaned_index_lines(memory_root, constitution_path=args.config.data['character']['constitution_path']):
         print(_color("  pruned orphaned MEMORY.md links", "grey"))
     return 0
 

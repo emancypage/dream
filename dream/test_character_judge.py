@@ -12,7 +12,7 @@ def env(tmp_path, monkeypatch):
     doc=SimpleNamespace(text='Rules',sha256='abc',version='1',traits={'brief':'Be brief'})
     for mod in (judge,review): monkeypatch.setattr(mod,'load_constitution',lambda *a,**k:doc)
     conn=sqlite3.connect(cfg.db_path); conn.executescript((Path(__file__).parent/'schema.sql').read_text())
-    pair=storage.insert_record(conn,'character_pairs',dict(id='p',revision=1,constitution_sha256='abc',prompt_messages=[{'role':'user','content':'Task'}],chosen='Short',rejected='Long',trait_ids=['brief'],conflict=False,status='pending',provenance={'historical_family':'anthropic'},generator_calls=[])); conn.commit()
+    pair=storage.insert_record(conn,'character_pairs',dict(id='p',revision=1,constitution_sha256='abc',prompt_messages=[{'role':'user','content':'Task'}],chosen='Short',rejected='Long',trait_ids=['brief'],conflict=False,status='pending',provenance={'historical_family':'anthropic'},generator_calls=[{'family':'openai','stage':'character_generate'}])); conn.commit()
     return judge,review,cfg,conn,pair
 
 def verdict(winner='A',a='supports',b='violates'):
@@ -107,7 +107,7 @@ def test_pair_race_discards_both_calls(env,monkeypatch):
 def test_source_parent_race_discards(env,monkeypatch,when):
     from contextlib import contextmanager
     j,r,c,db,p=env
-    parent=storage.insert_record(db,'character_moments',dict(id='moment',revision=1,constitution_sha256='abc',user_correction='Shorter',rationale='Too long'))
+    parent=storage.insert_record(db,'character_moments',dict(id='moment',revision=1,constitution_sha256='abc',user_correction='Shorter',rationale='Too long',extraction={'family':'openai'}))
     p=storage.update_record(db,'character_pairs',dict(p,revision=2,moment_id=parent['id'],provenance={'source_content_sha256':parent['content_sha256']}),expected_sha=p['content_sha256']); db.commit()
     def change():
         storage.update_record(db,'character_moments',dict(parent,revision=2,rationale='Changed'),expected_sha=parent['content_sha256']); db.commit()
@@ -139,3 +139,29 @@ def test_session_message_race_discards(env,monkeypatch):
     monkeypatch.setattr(j.backend,'generate',fake)
     assert j.judge_pairs(db,c,limit=1)['failures']
     assert not storage.records(db,'character_judgments')
+
+
+def test_judge_checks_recorded_candidate_family_after_route_change(env, monkeypatch):
+    j, r, c, db, pair = env
+    storage.update_record(db, 'character_pairs', dict(pair, revision=2, generator_calls=[{'family': 'anthropic', 'stage': 'character_generate'}]), expected_sha=pair['content_sha256']); db.commit()
+    monkeypatch.setattr(j.backend, 'generate', lambda *a, **k: pytest.fail('same-family candidate reached judge'))
+    assert j.judge_pairs(db, c, limit=1)['failures']
+    assert storage.records(db, 'character_judgments') == []
+
+
+def test_judge_checks_recorded_extraction_family(env, monkeypatch):
+    j, r, c, db, pair = env
+    parent = storage.insert_record(db, 'character_moments', {'id': 'old-extraction', 'constitution_sha256': 'abc', 'extraction': {'family': 'anthropic'}})
+    storage.update_record(db, 'character_pairs', dict(pair, revision=2, moment_id=parent['id'], provenance={**pair['provenance'], 'source_content_sha256': parent['content_sha256']}), expected_sha=pair['content_sha256']); db.commit()
+    monkeypatch.setattr(j.backend, 'generate', lambda *a, **k: pytest.fail('same-family extraction reached judge'))
+    assert j.judge_pairs(db, c, limit=1)['failures']
+
+
+def test_stored_family_override_is_explicit_and_recorded(env, monkeypatch):
+    j, r, c, db, pair = env
+    c.data['character']['allow_same_family_judge'] = True
+    storage.update_record(db, 'character_pairs', dict(pair, revision=2, generator_calls=[{'family': 'anthropic', 'stage': 'character_generate'}]), expected_sha=pair['content_sha256']); db.commit()
+    answers = iter([verdict(), verdict('B', 'violates', 'supports')])
+    monkeypatch.setattr(j.backend, 'generate', lambda *a, **k: SimpleNamespace(output=next(answers)))
+    assert j.judge_pairs(db, c, limit=1)['judged'] == 1
+    assert storage.records(db, 'character_judgments')[0]['same_family_override'] is True

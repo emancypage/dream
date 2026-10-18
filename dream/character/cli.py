@@ -61,6 +61,24 @@ def _save(config, result, outputs, manifest_name):
     return {'files': list(outputs), 'manifest': manifest_name}
 
 
+def _initialize_for_mutation(config):
+    """Perform the approved host schema migration before selecting model work."""
+    from character.constitution import load_constitution
+    from character.storage import open_writer
+    ready = False
+    if config.db_path.exists():
+        reader = open_db_readonly(config.db_path)
+        try:
+            migrations = reader.execute("SELECT 1 FROM sqlite_master WHERE name='schema_migrations'").fetchone()
+            ready = bool(migrations and reader.execute('SELECT COALESCE(MAX(version),0) FROM schema_migrations').fetchone()[0] >= 3)
+        finally:
+            reader.close()
+    if not ready:
+        load_constitution(config)
+        with open_writer(config):
+            pass
+
+
 def run(args):
     cfg = args.config
     cfg = replace(cfg, data={**cfg.data, 'storage': {**cfg.data['storage'], 'db_path': str(args.db)}})
@@ -71,6 +89,11 @@ def run(args):
     conn = None
     try:
         guard_path(cfg.db_path, cfg)
+        mutation = (action in ('generate', 'judge', 'accept', 'reject', 'defer', 'edit')
+                    or action in ('render', 'export') and not args.preview
+                    or action == 'eval' and not args.report)
+        if mutation:
+            _initialize_for_mutation(cfg)
         conn = open_db_readonly(cfg.db_path)
         if action in ('estimate', 'generate'):
             from character.generate import estimate, generate_pairs

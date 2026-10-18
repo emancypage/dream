@@ -178,3 +178,29 @@ def test_response_bound_rejects_fake_output(env,monkeypatch):
     run=ev.evaluate(db,c,fixtures=f,limit=1)
     assert run['failures']
     assert all(not r.get('responses') for r in report(ev,c,run['run_id'])['results'])
+
+
+@pytest.mark.parametrize('mode', ['scored', 'unsupported', 'failed'])
+def test_late_policy_hides_probe_rubric_dependencies(env, monkeypatch, mode):
+    ev, cfg, db, fixture, probe = env
+    probe['rubric']['usefulness']['0'] = 'private-topic-marker'
+    if mode == 'unsupported': probe['trait_sha256']['brief'] = 'wrong'
+    fixture.write_text(json.dumps({'version': 'v1', 'probes': [probe]}))
+    def fake(stage, *a, **k):
+        if mode == 'failed': raise RuntimeError('provider unavailable')
+        return SimpleNamespace(output=fake_scores() if stage == 'character_judge' else {'response': 'Answer'})
+    monkeypatch.setattr(ev.backend, 'generate', fake)
+    result = ev.evaluate(db, cfg, fixtures=fixture, limit=1)
+    cfg.memory_root.mkdir()
+    (cfg.memory_root / '.dream-retention.json').write_text(json.dumps({'text_markers': ['private-topic-marker']}))
+    summary = report(ev, cfg, result['run_id'])
+    assert summary['categories'][0]['valid'] == 0
+    assert summary['results'] == []
+
+
+def test_report_manifest_carries_probe_result_lineage(env, monkeypatch):
+    ev, cfg, db, fixture, probe = env
+    monkeypatch.setattr(ev.backend, 'generate', lambda stage, *a, **k: SimpleNamespace(output=fake_scores() if stage == 'character_judge' else {'response': 'Answer'}))
+    result = ev.evaluate(db, cfg, fixtures=fixture, limit=1)
+    summary = report(ev, cfg, result['run_id'])
+    assert set(summary['manifest']['result_ids']) == {row['id'] for row in summary['results']}

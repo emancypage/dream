@@ -44,3 +44,30 @@ def test_eval_report_reopens_snapshot_after_writing_results(tmp_path, monkeypatc
     monkeypatch.setitem(sys.modules, 'character.eval', SimpleNamespace(evaluate=evaluate, report_run=report))
     monkeypatch.setattr(cli, '_save', lambda *a: None)
     assert dream.main(['--config', str(cfg_path), 'character', 'eval', '--fixtures', str(tmp_path / 'fixture.json'), '--limit', '1']) == 0
+
+
+def test_enabled_writer_migrates_v2_but_readers_do_not(tmp_path, monkeypatch, capsys):
+    import hashlib
+    import sqlite3
+    from character import storage
+    from character import generate
+    from test_character_constitution import TEXT
+    db = tmp_path / 'dream.db'
+    conn = dream.open_db(db)
+    for table in storage.TABLES: conn.execute('DROP TABLE ' + table)
+    conn.execute('DELETE FROM schema_migrations WHERE version=3'); conn.commit(); conn.close()
+    constitution = tmp_path / 'rules.md'; constitution.write_text(TEXT)
+    cfg = tmp_path / 'config.toml'
+    cfg.write_text('[storage]\ndb_path="' + str(db) + '"\n[character]\nenabled=true\nconstitution_path="' + str(constitution) + '"\nstate_root="' + str(tmp_path / 'state') + '"\n')
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
+    assert dream.main(['--config', str(cfg), 'character', 'list']) == 1
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+    assert not list(tmp_path.glob('dream.db.bak-*'))
+    def fake(conn, config, **kwargs):
+        assert conn.execute('SELECT count(*) FROM character_pairs').fetchone()[0] == 0
+        return {'generated': 0, 'failures': []}
+    monkeypatch.setattr(generate, 'generate_pairs', fake)
+    assert dream.main(['--config', str(cfg), 'character', 'generate', '--limit', '1']) == 0
+    assert list(tmp_path.glob('dream.db.bak-*'))
+    with sqlite3.connect(db) as check:
+        assert check.execute('SELECT max(version) FROM schema_migrations').fetchone()[0] == 3
