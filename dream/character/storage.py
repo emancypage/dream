@@ -127,3 +127,10 @@ def open_writer(config):
             yield conn
     finally:
         conn.close()
+
+
+def mark_stale(conn, document):
+    """Mark old unreviewed pairs in the caller's mutation transaction."""
+    for pair in records(conn, 'character_pairs'):
+        if pair.get('constitution_sha256') != document.sha256 and pair.get('status') in ('pending', 'deferred', 'edited'):
+            update_record(conn, 'character_pairs', dict(pair, revision=pair['revision'] + 1, status='stale'), expected_sha=pair['content_sha256'])

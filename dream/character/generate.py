@@ -115,12 +115,12 @@ def estimate(conn, config, *, source, limit, refresh=False, expand_seeds=False):
 def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=False):
     if not config.data['character']['enabled']: return {'generated':0,'failures':[],'skipped':{'disabled':1}}
     doc,policy,items,skipped=_select(conn,config,source,limit,refresh,expand_seeds)
-    fingerprint=policy_fingerprint(policy)
+    fingerprint=policy_fingerprint(policy); version=prompt_version()
     result={'generated':0,'source_items':len(items),'failures':[],'skipped':skipped}
     expansion_budget=config.data['character']['max_seed_expansions'] if expand_seeds else 0
     def check(item, writer=None):
         current=policy_for(config)
-        if policy_fingerprint(current)!=fingerprint or load_constitution(config).sha256!=doc.sha256:
+        if policy_fingerprint(current)!=fingerprint or load_constitution(config).sha256!=doc.sha256 or prompt_version()!=version:
             raise ValueError('inputs changed')
         check_constitution(doc,current)
         if item['kind']=='correction' and content_hash(_source(writer or conn,item['identity']['session_id']))!=item['source_hash']:
@@ -166,8 +166,12 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
                 old=next((r for r in storage.records(writer,table) if r.get('work_key')==record['work_key']),None)
                 if old:
                     record=dict(record,id=old['id'],revision=old['revision']+1)
-                    return storage.update_record(writer,table,record,expected_sha=old['content_sha256'])
-            return storage.insert_record(writer,table,record)
+                    stored_record=storage.update_record(writer,table,record,expected_sha=old['content_sha256'])
+                    storage.mark_stale(writer,doc)
+                    return stored_record
+            stored_record=storage.insert_record(writer,table,record)
+            storage.mark_stale(writer,doc)
+            return stored_record
     def schedule_expansion(item, parent_id):
         nonlocal expansion_budget
         if item['kind']!='synthetic' or item.get('origin') or expansion_budget<=0:

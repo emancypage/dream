@@ -246,3 +246,25 @@ def test_refresh_estimate_has_attempt_and_supersedes(env,monkeypatch):
     pair=storage.records(conn,'character_pairs')[0]
     work=g.estimate(conn,cfg,source='corrections',limit=1,refresh=True)['work_items'][0]
     assert work['generation_attempt']==2 and work['supersedes_id']==pair['id']
+
+
+def test_successful_generation_persists_stale_old_pairs(env, monkeypatch):
+    g, cfg, conn = env
+    storage.insert_record(conn, 'character_pairs', {'id': 'old-pair', 'status': 'pending', 'constitution_sha256': 'old'})
+    conn.commit()
+    monkeypatch.setattr(g.backend, 'generate', lambda stage, *a, **k: SimpleNamespace(output=extraction() if stage == 'character_extract' else {'response': 'A fresh short answer'}))
+    assert g.generate_pairs(conn, cfg, source='corrections', limit=1)['generated'] == 1
+    assert storage.get_record(conn, 'character_pairs', 'old-pair')['status'] == 'stale'
+
+
+def test_prompt_template_change_discards_provider_output(env, monkeypatch):
+    g, cfg, conn = env
+    version = g.prompt_version()
+    changed = []
+    monkeypatch.setattr(g, 'prompt_version', lambda: 'changed-template' if changed else version)
+    def fake(*args, **kwargs):
+        changed.append(True)
+        return SimpleNamespace(output=extraction())
+    monkeypatch.setattr(g.backend, 'generate', fake)
+    assert g.generate_pairs(conn, cfg, source='corrections', limit=1)['failures']
+    assert storage.records(conn, 'character_moments') == []
