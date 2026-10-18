@@ -12,6 +12,12 @@ from recall_types import RecallCandidate, RecallDocument, RecallQuery
 
 _JIRA = re.compile(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]+-\d+)(?![A-Za-z0-9])")
 _WORD = re.compile(r"[\w]+", re.UNICODE)
+_STOP_WORDS = frozenset(
+    "a an and are as at be been but by can could do does for from had has have how "
+    "i if in into is it its me my of on or our please should that the their them "
+    "there these they this those to us was we were what when where which who why "
+    "will with would you your home tmp users user current status next step".split()
+)
 _COMMANDS = frozenset(
     {
         "git", "gh", "codex", "dream", "pytest", "python", "python3", "pip", "uv",
@@ -46,12 +52,17 @@ def extract_structured_terms(text: str) -> tuple[str, ...]:
     return tuple(terms)
 
 
+def query_terms(text: str) -> tuple[str, ...]:
+    ignored = _STOP_WORDS | set(normalize_path_text(str(Path.home())).split())
+    return tuple(dict.fromkeys(word for word in _WORD.findall(normalize_query_text(text)) if len(word) > 1 and word not in ignored))
+
+
 def build_safe_fts_match(text: str) -> str | None:
     """Create a quoted FTS expression; user syntax never reaches MATCH."""
-    words = _WORD.findall(normalize_query_text(text))
+    words = query_terms(text)
     if not words:
         return None
-    return " ".join('"' + word.replace('"', '""') + '"' for word in words[:32])
+    return " OR ".join('"' + word.replace('"', '""') + '"' for word in words[:32])
 
 
 def _parse_time(value: str | None) -> float:
@@ -90,9 +101,9 @@ def _load_documents(conn, ids: list[str] | None = None) -> list[RecallDocument]:
 
 
 def rank_lexical(conn, query: RecallQuery) -> list[RecallCandidate]:
-    """Rank four independent lexical signals and fuse them with reciprocal rank."""
-    normalized = normalize_query_text(query.query_text)
+    """Rank prompt topics by FTS; use fused project signals for session starts."""
     structured = extract_structured_terms(query.query_text)
+    is_prompt = not query.hook_event.startswith("session-start")
     allowed = "d.source_kind != 'raw_transcript'" if not query.allow_raw_transcript else "1=1"
     excluded = set(query.excluded_source_ids)
     all_docs = [d for d in _load_documents(conn) if d.id not in excluded and (query.allow_raw_transcript or d.source_kind != "raw_transcript")]
@@ -111,6 +122,10 @@ def rank_lexical(conn, query: RecallQuery) -> list[RecallCandidate]:
         except Exception:
             lists["fts"] = []
 
+    if is_prompt:
+        topic_ids = set(lists.get("fts", ()))
+        all_docs = [doc for doc in all_docs if doc.id in topic_ids]
+
     if structured:
         matches = []
         for doc in all_docs:
@@ -123,7 +138,7 @@ def rank_lexical(conn, query: RecallQuery) -> list[RecallCandidate]:
 
     path_query = normalize_path_text(" ".join((query.cwd or "", *query.repository_roots)))
     if path_query:
-        path_tokens = [token for token in path_query.split() if token not in {"home", "tmp", "users", "user"}]
+        path_tokens = query_terms(path_query)
         matches = []
         for doc in all_docs:
             haystack = normalize_path_text(" ".join((doc.project_slug or "", doc.source_path, doc.text)))
@@ -163,6 +178,7 @@ def rank_lexical(conn, query: RecallQuery) -> list[RecallCandidate]:
         result.append(RecallCandidate(doc, excerpt, dict(components), score, best))
     result.sort(
         key=lambda candidate: (
+            candidate.component_ranks.get("fts", float("inf")) if is_prompt else 0,
             -candidate.score,
             trust_order.get(candidate.document.trust_level, 99),
             candidate.best_component_rank,

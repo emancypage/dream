@@ -20,6 +20,37 @@ def test_memory_file_reaches_context_with_provenance(tmp_path):
     assert "approved_memory" in result.rendered_context
 
 
+def test_prompt_renders_matching_passage_beyond_long_memory_introduction(tmp_path):
+    from dream import open_db
+
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / "api.md").write_text("General background. " * 250 + "\nPostgres migration uses a transaction.", encoding="utf-8")
+    conn = open_db(tmp_path / "dream.db")
+    synchronize_recall_documents(conn, memory, include_raw_transcripts=False)
+    settings = RecallSettings(True, False, False, True, 6000, 4000, 1800, 1200, "", "", AdapterSettings(False, "none", False), AdapterSettings(False, "none", False))
+    query = RecallQuery("Postgres migration", "s1", "prompt", str(memory), (), 1200, frozenset(), False)
+    result = run_context(conn, query, settings)
+    assert "Postgres migration uses a transaction." in result.rendered_context
+    assert len(result.rendered_context) <= 1200
+
+
+def test_prompt_renders_matching_item_in_compact_json_summary(tmp_path):
+    import json
+    from dream import open_db
+
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    text = json.dumps({"open_threads": ["Other project work remains pending."] * 50 + ["API migration uses a transaction."]})
+    (memory / "summary.md").write_text(text, encoding="utf-8")
+    conn = open_db(tmp_path / "dream.db")
+    synchronize_recall_documents(conn, memory, include_raw_transcripts=False)
+    settings = RecallSettings(True, False, False, True, 6000, 4000, 1800, 1200, "", "", AdapterSettings(False, "none", False), AdapterSettings(False, "none", False))
+    query = RecallQuery("API migration", "s1", "prompt", str(memory), (), 1200, frozenset(), False)
+    result = run_context(conn, query, settings)
+    assert "API migration uses a transaction." in result.rendered_context
+
+
 def test_prompt_hook_reads_database_without_writing_to_it(tmp_path, monkeypatch, capsys):
     import json
     from types import SimpleNamespace

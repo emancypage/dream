@@ -118,6 +118,25 @@ The pipeline stages are:
 
 Consolidation uses an explicit ledger of consumed distillation identities. It does not use session timestamps as its progress cursor and does not silently consume truncated batches.
 
+Ingestion isolates source initialization, discovery, and session parsing errors.
+Healthy sources and sessions still enter the index. Failed items keep their old
+revision, if any, so a later run can retry them. The CLI logs each source error and
+exits with status 1 after processing the other sources. Dream database write
+errors remain fatal to ingestion.
+
+The nightly service runs each stage through `dream-stage --continue-on-error`.
+If a source or model provider fails, later stages can process previously stored
+transcripts, successful distillations, and pending suggestions. Failed model
+calls do not create validated results or advance their consolidation ledger.
+The service completes its remaining commands, but run metrics retain every
+failed stage and report failed health rather than a clean success. Direct CLI
+commands and `dream-stage` without that flag retain their nonzero exit status.
+Interruptions and terminated stage processes still stop the service.
+
+The OpenCode adapter supports the legacy workspace `branch` column and the
+new workspace schema that omits it. Missing branch metadata becomes `null`;
+transcript text continues to enter the index.
+
 ## Layout
 
 - `dream/` — the Python runtime: CLI, tests, configuration defaults, prompts, and systemd units.
@@ -149,6 +168,36 @@ dream hooks install
 dream hooks uninstall
 dream recall-eval --fixtures dream/fixtures/recall/public.json
 ```
+
+### Excluding a topic from local memory
+
+Create `.dream-retention.json` inside the configured memory root. This hidden,
+user-controlled file is excluded from automatic recall and cannot be changed by
+generated memory suggestions. For example:
+
+```json
+{
+  "instructions": "Do not retain the retired project, including paraphrases from old sessions.",
+  "memory_paths": ["project_retired.md"],
+  "project_slugs": ["retired-project"],
+  "text_markers": ["unique-retired-project-marker"]
+}
+```
+
+Dream passes the instructions to distillation, consolidation, and curation.
+Project exclusions prevent distillation. Exact file and project matches, plus
+case-insensitive text markers, also filter generated facts, proposals, writes,
+index synchronization, and recall. The prose instruction handles semantic scope;
+the deterministic checks do not recognize every possible paraphrase.
+
+Run `dream retention` to preview removal of existing generated memories, then
+`dream retention --apply` to apply it. The command backs up affected records
+outside the memory root, removes listed topic files and their index entries,
+clears excluded generated facts, rejects matching pending proposals, and refreshes
+the recall index. Source transcripts and existing chat messages remain unchanged.
+Pending proposals also retain their source-project exclusions. Cleanup defers
+files and distilled records changed after its snapshot and reports them for retry.
+Policies are local to the configured memory root and do not affect another machine.
 
 ## Memory ownership and Codex Memories
 

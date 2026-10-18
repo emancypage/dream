@@ -81,7 +81,7 @@ class DashboardPatchTest(unittest.TestCase):
         )
         mappings = panel["fieldConfig"]["defaults"]["mappings"][0]["options"]
         self.assertEqual(mappings["3"]["text"], "OK")
-        self.assertEqual(mappings["0"]["text"], "BŁĄD")
+        self.assertEqual(mappings["0"]["text"], "ERROR")
         self.assertEqual(mappings["-1"]["text"], "BRAK DANYCH")
 
     def test_dashboard_queries_expose_age_stage_and_history(self):

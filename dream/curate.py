@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from model_types import validate_output
+from retention_policy import load_retention_policy
 
 
 # These limits are character counts and deliberately fail closed before provider use.
@@ -164,6 +165,7 @@ Every decision must include a string body. For accept, reject, and defer, return
 Pending suggestion snapshots:
 {payload}
 """
+    prompt += load_retention_policy(Path(memory_root)).context()
     if len(prompt) > MAX_CURATION_PROMPT_CHARS:
         raise ValueError(
             f"curation prompt limit exceeded: {len(prompt)} > "

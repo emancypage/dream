@@ -18,6 +18,7 @@ from recall_query import rank_lexical
 from recall_select import select_recall_candidates
 from recall_types import RecallDiagnostics, RecallQuery, RecallResult
 from storage import open_db_readonly
+from retention_policy import load_retention_policy
 
 
 def parse_hook_payload(event_name: str, payload: dict) -> RecallQuery:
@@ -47,14 +48,21 @@ def _load_calibrations(conn):
     }
 
 
-def run_context(conn, query: RecallQuery, settings, explain: bool = False, *, embedder=None, reranker=None, allow_cache_writes: bool = True) -> RecallResult:
+def run_context(conn, query: RecallQuery, settings, explain: bool = False, *, embedder=None, reranker=None, allow_cache_writes: bool = True, memory_root=None) -> RecallResult:
     started = time.perf_counter()
+    policy = load_retention_policy(memory_root)
     candidates = rank_lexical(conn, query)
+    candidates = [candidate for candidate in candidates if not (
+        policy.excludes(source_path=candidate.document.source_path,
+                        project_slug=candidate.document.project_slug, text=candidate.document.text)
+        or (candidate.document.source_kind == "approved_memory" and memory_root is not None
+            and policy.excludes_memory_path(memory_root, candidate.document.source_path))
+    )]
     candidates, mode, fallback = apply_optional_adapters(
         conn, query, candidates, settings, embedder=embedder, reranker=reranker, allow_cache_writes=allow_cache_writes,
     )
     selected = select_recall_candidates(candidates, query, settings, _load_calibrations(conn))
-    rendered = render_context(selected, query.requested_codepoint_budget)
+    rendered = render_context(selected, query.requested_codepoint_budget, query.query_text)
     elapsed = int((time.perf_counter() - started) * 1000)
     diagnostics = RecallDiagnostics(len(candidates), len(selected), fallback, len(rendered), elapsed, None)
     return RecallResult(tuple(selected), rendered, mode, None, diagnostics)

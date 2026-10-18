@@ -14,21 +14,21 @@ from claude_cli import _consume_stream, _tool_label  # noqa: E402
 
 
 def test_tool_label_builtin_tools():
-    assert _tool_label("WebSearch") == "🔍 szukam w necie…"
-    assert _tool_label("Bash") == "⚙️ odpalam komendę…"
-    assert _tool_label("Read") == "📄 czytam pliki…"
+    assert _tool_label("WebSearch") == "🔍 searching the web…"
+    assert _tool_label("Bash") == "⚙️ running a command…"
+    assert _tool_label("Read") == "📄 reading files…"
 
 
 def test_tool_label_mcp_parses_server_segment():
     # The exact shape an MCP-backed tool name takes: mcp__<server>__<tool>.
-    assert _tool_label("mcp__claude_ai_Gmail__search_threads") == "📧 sprawdzam mail…"
-    assert _tool_label("mcp__claude_ai_Google_Calendar__list_events") == "📅 zerkam w kalendarz…"
-    assert _tool_label("mcp__claude_ai_Google_Drive__read_file_content") == "📁 grzebię w Drive…"
+    assert _tool_label("mcp__claude_ai_Gmail__search_threads") == "📧 checking email…"
+    assert _tool_label("mcp__claude_ai_Google_Calendar__list_events") == "📅 checking the calendar…"
+    assert _tool_label("mcp__claude_ai_Google_Drive__read_file_content") == "📁 searching Drive…"
 
 
 def test_tool_label_unknown_degrades_gracefully():
-    assert _tool_label("SomeFutureTool") == "🛠️ używam narzędzia…"
-    assert _tool_label("mcp__unknown_server__do_thing") == "🛠️ używam integracji…"
+    assert _tool_label("SomeFutureTool") == "🛠️ using a tool…"
+    assert _tool_label("mcp__unknown_server__do_thing") == "🛠️ using an integration…"
 
 
 def _line(obj):
@@ -52,7 +52,7 @@ def test_consume_stream_fires_labels_and_returns_result():
     ]
     result = _consume_stream(iter(lines), labels.append)
 
-    assert labels == ["🔍 szukam w necie…", "📧 sprawdzam mail…"]
+    assert labels == ["🔍 searching the web…", "📧 checking email…"]
     assert result is not None
     assert result["result"] == "gotowe"
     assert result["usage"]["output_tokens"] == 7
@@ -68,7 +68,7 @@ def test_consume_stream_dedups_consecutive_identical_labels():
         _line({"type": "result", "result": "ok"}),
     ]
     _consume_stream(iter(lines), labels.append)
-    assert labels == ["🔎 przeszukuję pliki…"]   # identical consecutive label → fired once
+    assert labels == ["🔎 searching files…"]   # identical consecutive label → fired once
 
 
 def test_consume_stream_swallows_callback_errors():

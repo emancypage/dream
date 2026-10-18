@@ -16,11 +16,12 @@ Categorise findings into these buckets. Each finding is a short, self-contained 
 # Hard rules
 
 1. **Only durable knowledge.** Skip: tool output recaps, error traces, code snippets, anything trivially recoverable by reading the repo or running `git log`.
-2. **Skip injected-memory facts.** If the assistant clearly read a fact from AGENTS.md, CLAUDE.md, or a system reminder, don't re-extract it.
-3. **Quote sparingly.** Paraphrase. Quote only when the exact wording carries the meaning (e.g. a feedback rule).
-4. **Convert relative dates.** "Thursday" → ISO date using the session's start timestamp as anchor (provided below).
-5. **Never invent.** If a fact is implied but unclear, leave it out.
-6. **No meta-commentary.** Don't say "the user discussed X". Say what X is.
+2. **English output.** Write every summary, finding, and extracted note in English. Preserve code, paths, identifiers, hashes, dates, issue keys, product names, and quoted user wording when they carry meaning.
+3. **Skip injected-memory facts.** If the assistant clearly read a fact from AGENTS.md, CLAUDE.md, or a system reminder, don't re-extract it.
+4. **Quote sparingly.** Paraphrase. Quote only when the exact wording carries the meaning (e.g. a feedback rule).
+5. **Convert relative dates.** "Thursday" → ISO date using the session's start timestamp as anchor (provided below).
+6. **Never invent.** If a fact is implied but unclear, leave it out.
+7. **No meta-commentary.** Don't say "the user discussed X". Say what X is.
 
 # Output format
 

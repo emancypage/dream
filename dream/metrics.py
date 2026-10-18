@@ -114,6 +114,7 @@ def finish_stage(
     success: bool,
     now: float | None = None,
     error_code: str | None = None,
+    continue_on_error: bool = False,
 ) -> dict[str, object]:
     if stage not in STAGES:
         raise ValueError(f"unknown Dream stage: {stage}")
@@ -131,10 +132,16 @@ def finish_stage(
         state.pop("error_code", None)
         return _write_state(path, state)
 
-    state["status"] = "failed"
-    state["finished_at"] = timestamp
-    state["duration_seconds"] = _duration(state, timestamp)
     state["error_code"] = _safe_label(error_code or "stage_failed")
+    failures = state.get("failed_stages", [])
+    if not isinstance(failures, list):
+        failures = []
+    failures.append({"stage": stage, "error_code": state["error_code"]})
+    state["failed_stages"] = failures
+    state["status"] = "running" if continue_on_error else "failed"
+    if not continue_on_error:
+        state["finished_at"] = timestamp
+        state["duration_seconds"] = _duration(state, timestamp)
     return _write_state(path, state)
 
 
@@ -149,7 +156,12 @@ def finish_run(
     state = _read_state(path)
     state["finished_at"] = timestamp
     state["duration_seconds"] = _duration(state, timestamp)
-    if success:
+    failures = state.get("failed_stages", [])
+    if success and failures:
+        state["status"] = "failed"
+        state["stage"] = failures[0]["stage"]
+        state["error_code"] = failures[0]["error_code"]
+    elif success:
         state["status"] = "success"
         state["stage"] = "curation"
         state["completed_stages"] = list(STAGES)

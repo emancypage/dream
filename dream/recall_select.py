@@ -21,7 +21,7 @@ def _threshold(calibrations, mode: str) -> float | None:
 
 
 def select_recall_candidates(candidates, query, settings, calibrations) -> tuple[RecallCandidate, ...]:
-    """Apply threshold, provenance, deduplication, diversity, and source caps."""
+    """Apply threshold, provenance, deduplication, and source caps in rank order."""
     mode = "lexical"
     threshold = None if query.hook_event.startswith("session-start") else _threshold(calibrations, mode)
     filtered = []
@@ -44,19 +44,4 @@ def select_recall_candidates(candidates, query, settings, calibrations) -> tuple
         source_counts[source] = source_counts.get(source, 0) + 1
         filtered.append(candidate)
 
-    # Round-robin source kinds/projects so a single source cannot dominate the budget.
-    selected: list[RecallCandidate] = []
-    remaining = list(filtered)
-    groups: dict[tuple[str, str | None], list[RecallCandidate]] = {}
-    for candidate in remaining:
-        key = (candidate.document.source_kind, candidate.document.project_slug)
-        groups.setdefault(key, []).append(candidate)
-    while groups:
-        for key in sorted(groups):
-            bucket = groups.get(key)
-            if not bucket:
-                continue
-            selected.append(bucket.pop(0))
-            if not bucket:
-                groups.pop(key, None)
-    return tuple(selected)
+    return tuple(filtered)
