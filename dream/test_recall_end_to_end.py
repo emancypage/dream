@@ -11,11 +11,11 @@ def test_memory_file_reaches_context_with_provenance(tmp_path):
     memory.mkdir()
     (memory / "api.md").write_text("Postgres migration decision.", encoding="utf-8")
     conn = open_db(tmp_path / "dream.db")
-    report = synchronize_recall_documents(conn, memory, include_raw_transcripts=False)
+    report = synchronize_recall_documents(conn, memory, include_raw_transcripts=False, constitution_path=None)
     assert report.inserted == 1
     settings = RecallSettings(True, False, False, True, 6000, 4000, 1800, 1200, "", "", AdapterSettings(False, "none", False), AdapterSettings(False, "none", False))
     query = RecallQuery("Postgres migration", "s1", "session-start:startup", str(memory), (str(memory),), 6000, frozenset(), False)
-    result = run_context(conn, query, settings)
+    result = run_context(conn, query, settings, constitution_path=None)
     assert "Dream recall" in result.rendered_context
     assert "approved_memory" in result.rendered_context
 
@@ -27,10 +27,10 @@ def test_prompt_renders_matching_passage_beyond_long_memory_introduction(tmp_pat
     memory.mkdir()
     (memory / "api.md").write_text("General background. " * 250 + "\nPostgres migration uses a transaction.", encoding="utf-8")
     conn = open_db(tmp_path / "dream.db")
-    synchronize_recall_documents(conn, memory, include_raw_transcripts=False)
+    synchronize_recall_documents(conn, memory, include_raw_transcripts=False, constitution_path=None)
     settings = RecallSettings(True, False, False, True, 6000, 4000, 1800, 1200, "", "", AdapterSettings(False, "none", False), AdapterSettings(False, "none", False))
     query = RecallQuery("Postgres migration", "s1", "prompt", str(memory), (), 1200, frozenset(), False)
-    result = run_context(conn, query, settings)
+    result = run_context(conn, query, settings, constitution_path=None)
     assert "Postgres migration uses a transaction." in result.rendered_context
     assert len(result.rendered_context) <= 1200
 
@@ -44,10 +44,10 @@ def test_prompt_renders_matching_item_in_compact_json_summary(tmp_path):
     text = json.dumps({"open_threads": ["Other project work remains pending."] * 50 + ["API migration uses a transaction."]})
     (memory / "summary.md").write_text(text, encoding="utf-8")
     conn = open_db(tmp_path / "dream.db")
-    synchronize_recall_documents(conn, memory, include_raw_transcripts=False)
+    synchronize_recall_documents(conn, memory, include_raw_transcripts=False, constitution_path=None)
     settings = RecallSettings(True, False, False, True, 6000, 4000, 1800, 1200, "", "", AdapterSettings(False, "none", False), AdapterSettings(False, "none", False))
     query = RecallQuery("API migration", "s1", "prompt", str(memory), (), 1200, frozenset(), False)
-    result = run_context(conn, query, settings)
+    result = run_context(conn, query, settings, constitution_path=None)
     assert "API migration uses a transaction." in result.rendered_context
 
 
@@ -65,7 +65,7 @@ def test_prompt_hook_reads_database_without_writing_to_it(tmp_path, monkeypatch,
     db_dir.mkdir()
     db_path = db_dir / "dream.db"
     conn = open_db(db_path)
-    synchronize_recall_documents(conn, memory, include_raw_transcripts=False)
+    synchronize_recall_documents(conn, memory, include_raw_transcripts=False, constitution_path=None)
     conn.close()
 
     state = tmp_path / "hook-state"

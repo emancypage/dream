@@ -27,6 +27,38 @@ def _same(a, b):
         return False
 
 
+def is_constitution_source(source_path, *, memory_root=None, constitution_path):
+    if constitution_path is None:
+        return False
+    source = Path(source_path).expanduser()
+    if not source.is_absolute() and memory_root is not None:
+        source = Path(memory_root) / source
+    return _same(source, Path(constitution_path).expanduser())
+
+
+def _check_artifact_inputs(config, manifest):
+    from character.constitution import load_constitution
+    from character.review import accepted_pairs
+    from storage import open_db_readonly
+    document = load_constitution(config)
+    policy = policy_for(config)
+    check_constitution(document, policy)
+    if (manifest.get('constitution_sha256') != document.sha256
+            or manifest.get('policy_fingerprint') != policy_fingerprint(policy)):
+        raise ValueError('artifact inputs changed; render again')
+    if manifest.get('pair_ids'):
+        conn = open_db_readonly(config.db_path)
+        try:
+            current = {p['id']:p for p in accepted_pairs(conn, config, document)}
+            for identity in manifest['pair_ids']:
+                pair = current.get(identity)
+                if (pair is None or pair['revision'] != manifest['pair_revisions'].get(identity)
+                        or pair['content_sha256'] != manifest['pair_hashes'].get(identity)):
+                    raise ValueError('accepted pair changed; render again')
+        finally:
+            conn.close()
+
+
 def protected_paths(config, candidate=None):
     root = config.memory_root.expanduser()
     result = [Path(config.data['character']['constitution_path']).expanduser(), root / POLICY_FILE]
@@ -70,6 +102,7 @@ def policy_fingerprint(policy):
 
 
 def write_artifacts(config, files, manifest):
+    _check_artifact_inputs(config, manifest)
     root = Path(config.data['character']['state_root']).expanduser()
     guard_path(root, config)
     targets = {}
@@ -102,7 +135,9 @@ def write_artifacts(config, files, manifest):
             staged.append((target, temp))
         if initial != policy_fingerprint(policy_for(config)):
             raise ValueError('retention policy changed; retry')
+        _check_artifact_inputs(config, manifest)
         for target, temp in staged:
+            _check_artifact_inputs(config, manifest)
             guard_path(target, config, output_root=root)
             if target.exists():
                 backup_dir = root / 'backups'
@@ -114,6 +149,9 @@ def write_artifacts(config, files, manifest):
                 guard_path(backup, config, output_root=root)
                 shutil.copyfile(target, backup)
                 backup.chmod(0o600)
+            _check_artifact_inputs(config, manifest)
+            guard_path(target, config, output_root=root)
+            guard_path(temp, config, output_root=root)
             os.replace(temp, target)
     finally:
         for _, temp in staged:

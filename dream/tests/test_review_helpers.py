@@ -14,6 +14,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from config import load_config
 from dream import _index_target, _merge_index, _prune_orphaned_index_lines, open_db  # noqa: E402
 
 
@@ -240,7 +241,7 @@ def test_cmd_review_auto_apply_prunes_orphaned_index_lines():
         conn.commit()
         conn.close()
 
-        args = argparse.Namespace(db=db_path, memory=str(root), yes=True, dry_run=False)
+        args = argparse.Namespace(db=db_path, memory=str(root), yes=True, dry_run=False, config=load_config(Path(d) / 'absent.toml'))
         cmd_review(args)
 
         result = (root / "MEMORY.md").read_text(encoding="utf-8")
@@ -292,7 +293,7 @@ def test_apply_suggestion_remove_deletes_file_and_marks_accepted():
         sug_id = cur.lastrowid
         conn.commit()
 
-        _apply_suggestion(conn, root, root / ".suggestions", sug_id, "remove", "dead.md", "", None)
+        _apply_suggestion(conn, root, root / ".suggestions", sug_id, "remove", "dead.md", "", None, constitution_path=None)
 
         assert not (root / "dead.md").exists()
         row = conn.execute("SELECT status FROM suggestions WHERE id=?", (sug_id,)).fetchone()
@@ -316,7 +317,7 @@ def test_apply_suggestion_remove_refuses_path_escape():
         sug_id = cur.lastrowid
         conn.commit()
 
-        _apply_suggestion(conn, root, root / ".suggestions", sug_id, "remove", "../outside.md", "", None)
+        _apply_suggestion(conn, root, root / ".suggestions", sug_id, "remove", "../outside.md", "", None, constitution_path=None)
 
         assert outside.exists()  # untouched
         row = conn.execute("SELECT status FROM suggestions WHERE id=?", (sug_id,)).fetchone()
@@ -341,7 +342,7 @@ def test_apply_suggestion_remove_refuses_memory_md_aliases(target_path):
         sug_id = cur.lastrowid
         conn.commit()
 
-        _apply_suggestion(conn, root, root / ".suggestions", sug_id, "remove", target_path, "", None)
+        _apply_suggestion(conn, root, root / ".suggestions", sug_id, "remove", target_path, "", None, constitution_path=None)
 
         assert (root / "MEMORY.md").exists()
         row = conn.execute("SELECT status FROM suggestions WHERE id=?", (sug_id,)).fetchone()
@@ -372,7 +373,7 @@ def test_apply_suggestion_refuses_changed_target():
 
         applied = _apply_suggestion(
             conn, root, root / ".suggestions", sug_id, "update", "topic.md", "proposed", None
-        )
+        , constitution_path=None)
 
         assert applied is False
         assert target.read_text(encoding="utf-8") == "manual newer edit\n"

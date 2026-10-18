@@ -11,7 +11,9 @@ from recall_documents import synchronize_recall_documents
 from retention_policy import empty_notes, excludes_source_sessions, filter_notes, load_retention_policy
 
 
-def apply_retention(conn, memory_root: Path, *, apply=False) -> dict:
+def apply_retention(conn, memory_root: Path, *, config, apply=False) -> dict:
+    from character.retention import collect, preview, apply_snapshot
+    character_snapshot = collect(conn, config)
     root = memory_root.resolve()
     policy = load_retention_policy(root)
     files = []
@@ -39,7 +41,7 @@ def apply_retention(conn, memory_root: Path, *, apply=False) -> dict:
           or policy.excludes_memory_path(root, row[1])
           or excludes_source_sessions(conn, policy, row[5]))]
     result = {"memory_files": [str(p.relative_to(root)) for p in files],
-              "distilled_records": len(changed), "pending_suggestions": len(pending), "applied": apply}
+              "distilled_records": len(changed), "pending_suggestions": len(pending), "applied": apply, "character": preview(character_snapshot)}
     if not apply:
         return result
 
@@ -58,7 +60,9 @@ def apply_retention(conn, memory_root: Path, *, apply=False) -> dict:
     with backup_file.open("x", encoding="utf-8") as handle:
         backup_file.chmod(0o600)
         json.dump({"files": snapshots, "distilled": [row[:3] for row in changed],
-                   "pending_suggestions": pending}, handle, ensure_ascii=False, indent=2)
+                   "pending_suggestions": pending, "character": character_snapshot}, handle, ensure_ascii=False, indent=2)
+
+    result["character"] = apply_snapshot(conn, config, character_snapshot)
 
     # Repeatable cleanup. The active policy already prevents recall if interrupted.
     deferred_files = []
@@ -95,7 +99,7 @@ def apply_retention(conn, memory_root: Path, *, apply=False) -> dict:
             if not preview.resolve().is_relative_to(root / ".suggestions"):
                 raise ValueError("suggestion preview resolves outside its directory")
             preview.unlink(missing_ok=True)
-    report = synchronize_recall_documents(conn, root, include_raw_transcripts=False)
+    report = synchronize_recall_documents(conn, root, include_raw_transcripts=False, constitution_path=config.data['character']['constitution_path'])
     result.update(backup=str(backup), recall_deleted=report.deleted,
                   deferred_files=deferred_files, deferred_sessions=deferred_sessions)
     return result

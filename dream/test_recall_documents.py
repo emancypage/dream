@@ -180,7 +180,7 @@ def test_approved_memory_source_fields_and_sha256(tmp_path):
 
     report = synchronize_recall_documents(
         conn, root, include_raw_transcripts=True, now=NOW
-    )
+    , constitution_path=None)
 
     rows = _memory_rows(conn)
     doc_id = stable_document_id("approved_memory", "memory:notes/api.md")
@@ -215,7 +215,7 @@ def test_memory_collection_skips_hidden_transient_and_special_directories(tmp_pa
         "memory-backups/old.md": "backup copy",
     })
 
-    report = synchronize_recall_documents(conn, root, include_raw_transcripts=False)
+    report = synchronize_recall_documents(conn, root, include_raw_transcripts=False, constitution_path=None)
 
     rows = _memory_rows(conn)
     ids = {
@@ -235,7 +235,7 @@ def test_memory_collection_tolerates_missing_root(tmp_path):
     conn = _db(tmp_path)
     report = synchronize_recall_documents(
         conn, tmp_path / "absent", include_raw_transcripts=False, now=NOW
-    )
+    , constitution_path=None)
     assert report == SyncReport(0, 0, 0, 0, 0, 0)
     assert conn.execute("SELECT COUNT(*) FROM recall_documents").fetchone()[0] == 0
     conn.close()
@@ -257,7 +257,7 @@ def test_distilled_source_fields(tmp_path):
     )
 
     report = synchronize_recall_documents(conn, _memory_root(tmp_path),
-                                          include_raw_transcripts=False, now=NOW)
+                                          include_raw_transcripts=False, now=NOW, constitution_path=None)
 
     doc_id = stable_document_id("distilled_summary", "distilled:key-1")
     row = conn.execute(
@@ -286,7 +286,7 @@ def test_distilled_text_falls_back_to_summary_when_notes_json_is_empty(tmp_path)
     _add_distilled(conn, session_id="codex:tx-1", key="key-2",
                    notes={}, summary="fallback prose")
     synchronize_recall_documents(conn, _memory_root(tmp_path),
-                                 include_raw_transcripts=False, now=NOW)
+                                 include_raw_transcripts=False, now=NOW, constitution_path=None)
     doc_id = stable_document_id("distilled_summary", "distilled:key-2")
     text = conn.execute(
         "SELECT text FROM recall_documents WHERE id=?", (doc_id,)
@@ -303,7 +303,7 @@ def test_raw_transcript_source_fields(tmp_path):
     _add_transcript(conn)
 
     report = synchronize_recall_documents(conn, _memory_root(tmp_path),
-                                          include_raw_transcripts=True, now=NOW)
+                                          include_raw_transcripts=True, now=NOW, constitution_path=None)
 
     doc_id = stable_document_id("raw_transcript", "transcript:codex:tx-1")
     row = conn.execute(
@@ -342,7 +342,7 @@ def test_raw_transcript_messages_are_ordered_by_sequence(tmp_path):
         ],
     )
     synchronize_recall_documents(conn, _memory_root(tmp_path),
-                                 include_raw_transcripts=True, now=NOW)
+                                 include_raw_transcripts=True, now=NOW, constitution_path=None)
     doc_id = stable_document_id("raw_transcript", "transcript:codex:tx-1")
     text = conn.execute(
         "SELECT text FROM recall_documents WHERE id=?", (doc_id,)
@@ -356,7 +356,7 @@ def test_disabled_raw_transcript_collection_inserts_nothing_and_reports_zero(tmp
     _add_transcript(conn)
 
     report = synchronize_recall_documents(conn, _memory_root(tmp_path),
-                                          include_raw_transcripts=False, now=NOW)
+                                          include_raw_transcripts=False, now=NOW, constitution_path=None)
 
     assert report.raw_included == 0
     assert report.inserted == 0
@@ -374,7 +374,7 @@ def test_resync_updates_changed_content_deletes_stale_and_counts_skipped(tmp_pat
         "notes/gone.md": "will be deleted",
     })
     first = synchronize_recall_documents(conn, root,
-                                         include_raw_transcripts=False, now=NOW)
+                                         include_raw_transcripts=False, now=NOW, constitution_path=None)
     assert first.inserted == 2 and first.updated == 0 and first.deleted == 0
 
     root.joinpath("notes/gone.md").unlink()
@@ -382,7 +382,7 @@ def test_resync_updates_changed_content_deletes_stale_and_counts_skipped(tmp_pat
     root.joinpath("notes/new.md").write_text("brand new content", encoding="utf-8")
 
     second = synchronize_recall_documents(conn, root,
-                                          include_raw_transcripts=False, now=NOW)
+                                          include_raw_transcripts=False, now=NOW, constitution_path=None)
 
     assert second.inserted == 1
     assert second.updated == 1
@@ -403,7 +403,7 @@ def test_resync_updates_changed_content_deletes_stale_and_counts_skipped(tmp_pat
     ).fetchone()[0] == 1
 
     third = synchronize_recall_documents(conn, root,
-                                         include_raw_transcripts=False, now=NOW)
+                                         include_raw_transcripts=False, now=NOW, constitution_path=None)
     assert third.inserted == 0 and third.updated == 0 and third.deleted == 0
     assert third.skipped == 2
     conn.close()
@@ -414,7 +414,7 @@ def test_stale_rows_are_never_deleted_when_a_source_kind_collection_fails(tmp_pa
     conn = _db(tmp_path)
     root = _memory_root(tmp_path, {"notes/api.md": "original content"})
     _add_transcript(conn, revision="rev-1")
-    synchronize_recall_documents(conn, root, include_raw_transcripts=True, now=NOW)
+    synchronize_recall_documents(conn, root, include_raw_transcripts=True, now=NOW, constitution_path=None)
     transcript_id = stable_document_id("raw_transcript", "transcript:codex:tx-1")
     api_id = stable_document_id("approved_memory", "memory:notes/api.md")
     assert conn.execute(
@@ -424,7 +424,7 @@ def test_stale_rows_are_never_deleted_when_a_source_kind_collection_fails(tmp_pa
 
     called_with = {}
 
-    def _boom(conn, memory_root, *, include_raw_transcripts=False):
+    def _boom(conn, memory_root, *, include_raw_transcripts=False, constitution_path):
         called_with["root"] = memory_root
         raise OSError("transcript collection exploded")
 
@@ -462,7 +462,7 @@ def test_collection_failure_rolls_back_and_preserves_previous_state(tmp_path):
     conn = _db(tmp_path)
     root = _memory_root(tmp_path, {"notes/api.md": "original content"})
     synchronize_recall_documents(conn, root,
-                                 include_raw_transcripts=False, now=NOW)
+                                 include_raw_transcripts=False, now=NOW, constitution_path=None)
     before = conn.execute("SELECT * FROM recall_documents ORDER BY id").fetchall()
 
     class _BoomPath:
@@ -489,7 +489,7 @@ def test_collection_failure_rolls_back_and_preserves_previous_state(tmp_path):
             conn,
             _BoomPath(root),  # type: ignore[arg-type]
             include_raw_transcripts=False, now=NOW,
-        )
+         constitution_path=None)
     after = conn.execute("SELECT * FROM recall_documents ORDER BY id").fetchall()
     assert after == before
     conn.close()
@@ -499,7 +499,7 @@ def test_write_failure_rolls_back_a_fully_prepared_update(tmp_path, monkeypatch)
     conn = _db(tmp_path)
     root = _memory_root(tmp_path, {"notes/api.md": "original content"})
     first = synchronize_recall_documents(conn, root,
-                                         include_raw_transcripts=False, now=NOW)
+                                         include_raw_transcripts=False, now=NOW, constitution_path=None)
     assert first.inserted == 1
     before = conn.execute("SELECT * FROM recall_documents ORDER BY id").fetchall()
 
@@ -511,7 +511,7 @@ def test_write_failure_rolls_back_a_fully_prepared_update(tmp_path, monkeypatch)
     monkeypatch.setattr(recall_documents, "_upsert_document", _explode_upsert)
     with pytest.raises(sqlite3.OperationalError):
         synchronize_recall_documents(conn, root,
-                                     include_raw_transcripts=False, now=NOW)
+                                     include_raw_transcripts=False, now=NOW, constitution_path=None)
     after = conn.execute("SELECT * FROM recall_documents ORDER BY id").fetchall()
     assert after == before
     conn.close()
@@ -521,7 +521,7 @@ def test_fts_failure_rolls_back_a_fully_prepared_write(tmp_path, monkeypatch):
     conn = _db(tmp_path)
     root = _memory_root(tmp_path, {"notes/api.md": "original content"})
     first = synchronize_recall_documents(conn, root,
-                                         include_raw_transcripts=False, now=NOW)
+                                         include_raw_transcripts=False, now=NOW, constitution_path=None)
     assert first.inserted == 1
     before = conn.execute("SELECT * FROM recall_documents ORDER BY id").fetchall()
     root.joinpath("notes/api.md").write_text("updated content", encoding="utf-8")
@@ -532,7 +532,7 @@ def test_fts_failure_rolls_back_a_fully_prepared_write(tmp_path, monkeypatch):
     monkeypatch.setattr(dream_cli, "rebuild_recall_fts", _explode_rebuild)
     with pytest.raises(sqlite3.OperationalError):
         synchronize_recall_documents(conn, root,
-                                     include_raw_transcripts=False, now=NOW)
+                                     include_raw_transcripts=False, now=NOW, constitution_path=None)
     after = conn.execute("SELECT * FROM recall_documents ORDER BY id").fetchall()
     assert after == before
     conn.close()
@@ -541,7 +541,7 @@ def test_fts_failure_rolls_back_a_fully_prepared_write(tmp_path, monkeypatch):
 def test_missing_fts_index_is_rebuilt_inside_synchronization(tmp_path):
     conn = _db(tmp_path)
     root = _memory_root(tmp_path, {"notes/api.md": "recall fts marker text"})
-    synchronize_recall_documents(conn, root, include_raw_transcripts=False, now=NOW)
+    synchronize_recall_documents(conn, root, include_raw_transcripts=False, now=NOW, constitution_path=None)
     conn.execute("DELETE FROM recall_documents_fts")
     conn.commit()
     assert conn.execute(
@@ -551,7 +551,7 @@ def test_missing_fts_index_is_rebuilt_inside_synchronization(tmp_path):
 
     root.joinpath("notes/api.md").write_text("recall fts marker text again",
                                               encoding="utf-8")
-    synchronize_recall_documents(conn, root, include_raw_transcripts=False, now=NOW)
+    synchronize_recall_documents(conn, root, include_raw_transcripts=False, now=NOW, constitution_path=None)
     hits = conn.execute(
         "SELECT COUNT(*) FROM recall_documents_fts "
         "WHERE recall_documents_fts MATCH 'marker'"
@@ -563,7 +563,7 @@ def test_missing_fts_index_is_rebuilt_inside_synchronization(tmp_path):
 def test_corrupt_fts_shadow_data_is_repaired_inside_synchronization(tmp_path):
     conn = _db(tmp_path)
     root = _memory_root(tmp_path, {"notes/api.md": "first recall words"})
-    synchronize_recall_documents(conn, root, include_raw_transcripts=False, now=NOW)
+    synchronize_recall_documents(conn, root, include_raw_transcripts=False, now=NOW, constitution_path=None)
     # Simulate lost/corrupt shadow data: keep the FTS5 table registered but empty.
     conn.execute("DELETE FROM recall_documents_fts")
     conn.commit()
@@ -573,7 +573,7 @@ def test_corrupt_fts_shadow_data_is_repaired_inside_synchronization(tmp_path):
     ).fetchone()[0] == 0
 
     root.joinpath("notes/api.md").write_text("second recall words", encoding="utf-8")
-    synchronize_recall_documents(conn, root, include_raw_transcripts=False, now=NOW)
+    synchronize_recall_documents(conn, root, include_raw_transcripts=False, now=NOW, constitution_path=None)
     assert conn.execute(
         "SELECT COUNT(*) FROM recall_documents_fts "
         "WHERE recall_documents_fts MATCH 'second'"
@@ -588,8 +588,8 @@ def test_synchronization_never_prints_to_stdout(tmp_path, capsys):
     conn = _db(tmp_path)
     root = _memory_root(tmp_path, {"notes/api.md": "silent sync content"})
     _add_transcript(conn)
-    synchronize_recall_documents(conn, root, include_raw_transcripts=True, now=NOW)
-    synchronize_recall_documents(conn, root, include_raw_transcripts=False, now=NOW)
+    synchronize_recall_documents(conn, root, include_raw_transcripts=True, now=NOW, constitution_path=None)
+    synchronize_recall_documents(conn, root, include_raw_transcripts=False, now=NOW, constitution_path=None)
     captured = capsys.readouterr()
     assert captured.out == ""
     conn.close()

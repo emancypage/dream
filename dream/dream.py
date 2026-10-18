@@ -53,7 +53,7 @@ from retention_policy import POLICY_FILE, excludes_source_sessions, load_retenti
 
 
 def _sync_recall_documents(conn: sqlite3.Connection, memory_root,
-                           *, include_raw_transcripts: bool = False) -> None:
+                           *, include_raw_transcripts: bool = False, constitution_path) -> None:
     """Keep the recall store current after a successful mutation.
 
     Synchronization is quiet on success and non-fatal: any error (missing
@@ -66,6 +66,7 @@ def _sync_recall_documents(conn: sqlite3.Connection, memory_root,
             conn,
             memory_root,
             include_raw_transcripts=include_raw_transcripts,
+            constitution_path=constitution_path,
         )
     except Exception as e:
         print(f"recall sync skipped: {type(e).__name__}: {e}", file=sys.stderr)
@@ -322,7 +323,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     for name, seen, ingested, messages in results:
         print(f"{name}: scanned {seen}, ingested {ingested}, {messages} messages stored.")
     print(f"DB: {args.db}")
-    _sync_recall_documents(conn, args.config.memory_root)
+    _sync_recall_documents(conn, args.config.memory_root, constitution_path=args.config.data['character']['constitution_path'])
     failures = getattr(results, "failures", [])
     if failures:
         print(f"Ingestion completed with {len(failures)} source/session errors. Failed items remain eligible for retry.",
@@ -476,7 +477,7 @@ def _file_sha256(path: Path) -> str | None:
 
 def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
                       sug_id, kind, target_path, new_content, sug_file,
-                      sync_recall: bool = True) -> bool:
+                      sync_recall: bool = True, *, constitution_path) -> bool:
     """Accept one suggestion: write/merge/delete the target, mark accepted, drop the preview.
 
     Refuses (marks 'rejected' instead of touching the filesystem) if target_path would
@@ -488,7 +489,12 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
     resolved_root = memory_root.resolve()
     resolved_target = tgt.resolve()
     contained = resolved_target.is_relative_to(resolved_root)
+    from character.safety import is_constitution_source
     protected = kind == "remove" and resolved_target == resolved_root / "MEMORY.md"
+    if is_constitution_source(tgt, constitution_path=constitution_path):
+        _reject_suggestion(conn, sug_dir, sug_id, sug_file)
+        print(f"  rejected #{sug_id}: the constitution is human-controlled")
+        return False
     if resolved_target == (resolved_root / POLICY_FILE).resolve():
         _reject_suggestion(conn, sug_dir, sug_id, sug_file)
         print(f"  rejected #{sug_id}: the local retention policy is user-controlled")
@@ -532,7 +538,7 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
         if f.exists():
             f.unlink()
     if sync_recall and status == "accepted":
-        _sync_recall_documents(conn, memory_root)
+        _sync_recall_documents(conn, memory_root, constitution_path=constitution_path)
     return status == "accepted"
 
 
@@ -629,7 +635,7 @@ def _curation_recheck(memory_root: Path, snapshot: dict[str, Any]) -> tuple[Path
     return target, body, sha, exists
 
 
-def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions) -> int:
+def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions, *, constitution_path) -> int:
     by_id = {snapshot["id"]: snapshot for snapshot in snapshots}
     expected_by_target: dict[str, dict[str, Any]] = {}
     for snapshot in snapshots:
@@ -724,7 +730,8 @@ def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions) -> int:
                 target_path,
                 new_content,
                 sug_file,
-            )
+                constitution_path=constitution_path,
+        )
         except Exception as exc:
             print(
                 f"unsafe application #{sug_id} ({target_path}): "
@@ -747,7 +754,7 @@ def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions) -> int:
         if backup is None:
             backup = _backup_memory(memory_root)
         if _prune_orphaned_index_lines(memory_root):
-            _sync_recall_documents(conn, memory_root)
+            _sync_recall_documents(conn, memory_root, constitution_path=constitution_path)
             print("pruned orphaned MEMORY.md links")
     print(f"applied IDs: {applied}")
     print(f"rejected IDs: {rejected}")
@@ -805,7 +812,7 @@ def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, ro
         return 0
     write_conn = open_db(args.db)
     try:
-        return _apply_curated_batch(write_conn, memory_root, snapshots, decisions)
+        return _apply_curated_batch(write_conn, memory_root, snapshots, decisions, constitution_path=args.config.data['character']['constitution_path'])
     finally:
         write_conn.close()
 
@@ -874,7 +881,7 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
             path = memory_root / target
             old = path.read_text(encoding="utf-8") if path.exists() else ""
             new_content = _resolved_body(kind, old, body)
-            if not _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target, new_content, preview):
+            if not _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target, new_content, preview, constitution_path=args.config.data['character']['constitution_path']):
                 conflicts += 1
         if _prune_orphaned_index_lines(memory_root):
             print("pruned orphaned MEMORY.md links")
@@ -910,7 +917,7 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
     print(f"Backup: {backup}")
     return 0 if _apply_suggestion(
         conn, memory_root, sug_dir, sug_id, kind, target, new_content, preview
-    ) else 3
+    , constitution_path=args.config.data['character']['constitution_path']) else 3
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -945,7 +952,7 @@ def cmd_review(args: argparse.Namespace) -> int:
             tag = "no-op" if noop else ("would apply" if dry else "applied")
             print(f"  [{kind:<6}] {target_path}  (#{sug_id}) — {tag}")
             if not dry:
-                _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target_path, new_content, sug_file)
+                _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target_path, new_content, sug_file, constitution_path=args.config.data['character']['constitution_path'])
         if not dry and _prune_orphaned_index_lines(memory_root):
             print("  pruned orphaned MEMORY.md links")
         return 0
@@ -1001,7 +1008,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         if choice == "q":
             break
         if choice == "a":
-            _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target_path, new_content, sug_file)
+            _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target_path, new_content, sug_file, constitution_path=args.config.data['character']['constitution_path'])
             print(_color("  accepted.", "green"))
         elif choice == "r":
             conn.execute("UPDATE suggestions SET status='rejected', reviewed_at=CURRENT_TIMESTAMP WHERE id=?", (sug_id,))
@@ -1078,11 +1085,19 @@ def cmd_recall_calibrate(args: argparse.Namespace) -> int:
 
 
 def cmd_retention(args: argparse.Namespace) -> int:
+    from dataclasses import replace
     from retention_cleanup import apply_retention
+    from character.safety import guard_path
+    config = replace(args.config, data={**args.config.data, "storage": {
+        **args.config.data["storage"], "db_path": str(args.db), "memory_root": str(args.memory)}})
+    guard_path(args.db, config)
     conn = open_db(args.db) if args.apply else open_db_readonly(args.db)
     try:
-        result = apply_retention(conn, Path(args.memory), apply=args.apply)
+        result = apply_retention(conn, Path(args.memory), config=config, apply=args.apply)
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        if result["character"]["rerun_required"]:
+            print("Character cleanup changed after backup. Rerun dream retention --apply.", file=sys.stderr)
+            return 1
         return 0
     finally:
         conn.close()
@@ -1141,19 +1156,38 @@ def cmd_context(args: argparse.Namespace) -> int:
                 print(json.dumps({"candidate_count": 0, "selected_count": 0, "fallback_reason": "duplicate-or-running"}, separators=(",", ":")))
             return 0
         result = run_context(conn, query, settings, explain=explain, allow_cache_writes=False,
-                             memory_root=args.config.memory_root)
+                             memory_root=args.config.memory_root,
+                             constitution_path=args.config.data["character"]["constitution_path"])
+        character_text = ""
+        character_diagnostic = None
+        character_settings = args.config.data["character"]
+        if (event_name == "SessionStart" and character_settings["enabled"]
+                and character_settings["hook_injection"]):
+            try:
+                from character.render import render_block
+                character_text = render_block(conn, args.config)["text"]
+            except Exception as character_error:
+                character_diagnostic = "character-unavailable:" + type(character_error).__name__
+        from recall_context import compose_hook_context
+        combined_context, budget_diagnostic = compose_hook_context(
+            result.rendered_context, character_text, query.requested_codepoint_budget,
+            settings.session_start_additional_context_limit if event_name == "SessionStart"
+            else settings.prompt_additional_context_limit,
+        )
+        character_diagnostic = character_diagnostic or budget_diagnostic
         if attempt_token is not None:
             finish_hook_event(query.session_id, query.hook_event, succeeded=True, selected_ids=[candidate.document.id for candidate in result.selected], attempt_token=attempt_token)
         if explain:
             print(json.dumps({
                 "candidate_ids": [candidate.document.id for candidate in result.selected],
-                "selected_codepoints": len(result.rendered_context),
+                "selected_codepoints": len(combined_context),
+                "character_diagnostic": character_diagnostic,
                 "elapsed_ms": result.diagnostics.elapsed_ms,
                 "calibration_version": result.calibration_version,
                 "fallback_reason": result.diagnostics.fallback_reason,
             }, ensure_ascii=False, separators=(",", ":")))
         else:
-            print(hook_success_json(event_name, result.rendered_context))
+            print(hook_success_json(event_name, combined_context))
         return 0
     except Exception as exc:
         if attempt_token is not None:
@@ -1270,6 +1304,9 @@ def main(argv: list[str] | None = None) -> int:
         hp = hsub.add_parser(hooks_cmd)
         hp.add_argument("--path", default=os.environ.get("DREAM_CODEX_HOOKS_PATH", str(Path.home() / ".codex" / "hooks.json")))
         hp.set_defaults(func=cmd_hooks)
+
+    from character.cli import register as register_character
+    register_character(sub)
 
     args = p.parse_args(argv)
     try:

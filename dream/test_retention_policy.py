@@ -30,36 +30,37 @@ def setup(tmp_path):
     (root / "private.md").write_text("retired-marker private detail")
     (root / "ordinary.md").write_text("ordinary useful preference")
     (root / "MEMORY.md").write_text("- [Private](private.md)\n- [Ordinary](ordinary.md)\n")
-    synchronize_recall_documents(conn, root, include_raw_transcripts=False)
+    synchronize_recall_documents(conn, root, include_raw_transcripts=False, constitution_path=None)
     (root / POLICY_FILE).write_text(json.dumps({
         "instructions": "Do not retain the retired project, including paraphrases.",
         "memory_paths": ["private.md"], "project_slugs": ["private-project"],
         "text_markers": ["retired-marker"],
     }))
-    yield conn, root, tmp_path
+    cfg = load_config(tmp_path / 'absent.toml', {'storage': {'memory_root': str(root), 'db_path': str(tmp_path / 'dream.db')}, 'character': {'state_root': str(tmp_path / 'state')}})
+    yield conn, root, cfg
     conn.close()
 
 
 def test_existing_rows_are_not_recalled_before_cleanup(setup):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     cfg = load_config()
     for event in ("session-start:startup", "prompt"):
         query = RecallQuery("retired-marker", "test", event, str(root), (), 6000, frozenset(), False)
-        result = run_context(conn, query, cfg.recall_settings(), memory_root=root)
+        result = run_context(conn, query, cfg.recall_settings(), memory_root=root, constitution_path=None)
         assert "retired-marker" not in result.rendered_context
         query = RecallQuery("ordinary", "test", event, str(root), (), 6000, frozenset(), False)
-        result = run_context(conn, query, cfg.recall_settings(), memory_root=root)
+        result = run_context(conn, query, cfg.recall_settings(), memory_root=root, constitution_path=None)
         assert "ordinary useful preference" in result.rendered_context
 
 
 def test_cleanup_and_reindex_preserve_unrelated_memories(setup):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     before = (root / "ordinary.md").read_bytes()
-    preview = apply_retention(conn, root)
+    preview = apply_retention(conn, root, config=cfg)
     assert preview["memory_files"] == ["private.md"]
     assert preview["distilled_records"] == 1
     assert (root / "private.md").exists()
-    result = apply_retention(conn, root, apply=True)
+    result = apply_retention(conn, root, config=cfg, apply=True)
     assert (Path(result["backup"]) / "affected-records.json").exists()
     assert not (root / "private.md").exists()
     assert "private.md" not in (root / "MEMORY.md").read_text()
@@ -67,12 +68,12 @@ def test_cleanup_and_reindex_preserve_unrelated_memories(setup):
     assert "retired-marker" not in conn.execute("SELECT notes_json FROM distilled").fetchone()[0]
     assert conn.execute("SELECT count(*) FROM recall_documents WHERE text LIKE '%retired-marker%'").fetchone()[0] == 0
     (root / "private.md").write_text("retired-marker recreated")
-    synchronize_recall_documents(conn, root, include_raw_transcripts=False)
+    synchronize_recall_documents(conn, root, include_raw_transcripts=False, constitution_path=None)
     assert conn.execute("SELECT count(*) FROM recall_documents WHERE text LIKE '%retired-marker%'").fetchone()[0] == 0
 
 
 def test_excluded_project_never_calls_distillation_provider(setup, monkeypatch):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     conn.execute("INSERT INTO messages(session_id,seq,role,text) VALUES ('private-session',0,'user','project detail')")
     conn.commit()
     monkeypatch.setattr(distill, "generate", lambda *a, **kw: pytest.fail("excluded project reached provider"))
@@ -80,7 +81,7 @@ def test_excluded_project_never_calls_distillation_provider(setup, monkeypatch):
 
 
 def test_consolidation_context_and_write_filter(setup, monkeypatch):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     def generate(stage, prompt, schema, **kwargs):
         assert "Do not retain the retired project, including paraphrases." in prompt
         assert "private detail" not in prompt
@@ -97,12 +98,12 @@ def test_consolidation_context_and_write_filter(setup, monkeypatch):
 
 
 def test_pending_suggestion_cannot_restore_excluded_memory(setup):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     conn.execute("INSERT INTO suggestions(kind,target_path,body) VALUES ('new','private.md','new words')")
     sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()
     (root / "private.md").unlink()
-    assert not dream._apply_suggestion(conn, root, root / ".suggestions", sid, "new", "private.md", "new words", None)
+    assert not dream._apply_suggestion(conn, root, root / ".suggestions", sid, "new", "private.md", "new words", None, constitution_path=None)
     assert not (root / "private.md").exists()
     assert conn.execute("SELECT status FROM suggestions WHERE id=?", (sid,)).fetchone()[0] == "rejected"
 
@@ -115,17 +116,17 @@ def test_invalid_policy_does_not_silently_allow_recall(setup):
 
 
 def test_model_cannot_replace_retention_policy(setup):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     before = (root / POLICY_FILE).read_bytes()
     conn.execute("INSERT INTO suggestions(kind,target_path,body) VALUES ('update',?,'{}')", (POLICY_FILE,))
     sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()
-    assert not dream._apply_suggestion(conn, root, root / ".suggestions", sid, "update", POLICY_FILE, "{}", None)
+    assert not dream._apply_suggestion(conn, root, root / ".suggestions", sid, "update", POLICY_FILE, "{}", None, constitution_path=None)
     assert (root / POLICY_FILE).read_bytes() == before
 
 
 def test_distillation_receives_policy_and_drops_excluded_facts(setup, monkeypatch):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     conn.execute("UPDATE sessions SET project_slug='ordinary-project' WHERE session_id='private-session'")
     conn.execute("INSERT INTO messages(session_id,seq,role,text) VALUES ('private-session',0,'user','mixed topic')")
     conn.commit()
@@ -141,24 +142,24 @@ def test_distillation_receives_policy_and_drops_excluded_facts(setup, monkeypatc
 
 
 def test_cleanup_rejects_pending_suggestion_from_excluded_project(setup):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     conn.execute("INSERT INTO suggestions(kind,target_path,body,source_sessions) "
                  "VALUES ('new','neutral.md','use short dates','private-session')")
     sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()
-    assert apply_retention(conn, root)["pending_suggestions"] == 1
-    apply_retention(conn, root, apply=True)
+    assert apply_retention(conn, root, config=cfg)["pending_suggestions"] == 1
+    apply_retention(conn, root, config=cfg, apply=True)
     assert conn.execute("SELECT status FROM suggestions WHERE id=?", (sid,)).fetchone()[0] == "rejected"
 
 
 def test_apply_rejects_pending_suggestion_from_excluded_project(setup):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     conn.execute("INSERT INTO suggestions(kind,target_path,body,source_sessions) "
                  "VALUES ('new','neutral.md','use short dates','other-session,private-session')")
     sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()
     assert not dream._apply_suggestion(conn, root, root / ".suggestions", sid,
-                                       "new", "neutral.md", "use short dates", None)
+                                       "new", "neutral.md", "use short dates", None, constitution_path=None)
     assert not (root / "neutral.md").exists()
     assert conn.execute("SELECT status FROM suggestions WHERE id=?", (sid,)).fetchone()[0] == "rejected"
 
@@ -167,27 +168,27 @@ def test_apply_rejects_pending_suggestion_from_excluded_project(setup):
     ("./private.md", "private.md"), ("private.md", "./private.md"),
 ])
 def test_equivalent_paths_cannot_restore_excluded_memory(setup, policy_path, target_path):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     (root / POLICY_FILE).write_text(json.dumps({"memory_paths": [policy_path]}))
     before = (root / "private.md").read_bytes()
     conn.execute("INSERT INTO suggestions(kind,target_path,body) VALUES ('update',?,'new words')", (target_path,))
     sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()
     assert not dream._apply_suggestion(conn, root, root / ".suggestions", sid,
-                                       "update", target_path, "new words", None)
+                                       "update", target_path, "new words", None, constitution_path=None)
     assert (root / "private.md").read_bytes() == before
 
 
 def test_cleanup_normalizes_policy_paths_for_index_removal(setup):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     (root / POLICY_FILE).write_text(json.dumps({"memory_paths": ["./private.md"]}))
-    apply_retention(conn, root, apply=True)
+    apply_retention(conn, root, config=cfg, apply=True)
     assert "private.md" not in (root / "MEMORY.md").read_text()
 
 
 @pytest.mark.parametrize("alias", ["absolute", "parent", "symlink"])
 def test_resolved_paths_cannot_restore_excluded_memory(setup, alias):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     (root / "sub").mkdir()
     (root / "alias.md").symlink_to(root / "private.md")
     target = {"absolute": str(root / "private.md"), "parent": "sub/../private.md", "symlink": "alias.md"}[alias]
@@ -196,19 +197,19 @@ def test_resolved_paths_cannot_restore_excluded_memory(setup, alias):
     sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()
     assert not dream._apply_suggestion(conn, root, root / ".suggestions", sid,
-                                       "update", target, "new words", None)
+                                       "update", target, "new words", None, constitution_path=None)
     assert (root / "private.md").read_bytes() == before
 
 
 def test_cleanup_rejects_pending_suggestion_for_resolved_excluded_path(setup):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     conn.execute("INSERT INTO suggestions(kind,target_path,body) VALUES ('update',?,'new words')", (str(root / "private.md"),))
     conn.commit()
-    assert apply_retention(conn, root)["pending_suggestions"] == 1
+    assert apply_retention(conn, root, config=cfg)["pending_suggestions"] == 1
 
 
 def test_consolidation_filters_resolved_excluded_paths(setup, monkeypatch):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     monkeypatch.setattr(consolidate, "generate", lambda *a, **kw: SimpleNamespace(
         provider="fixture", model="fixture", output={"suggestions": [{
             "kind": "update", "target_path": str(root / "private.md"), "body": "new words",
@@ -219,25 +220,25 @@ def test_consolidation_filters_resolved_excluded_paths(setup, monkeypatch):
 
 @pytest.mark.parametrize("stage", ["recall", "index", "consolidation-context"])
 def test_excluded_memory_symlink_is_not_read(setup, stage):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     (root / "alias.md").symlink_to(root / "private.md")
     (root / POLICY_FILE).write_text("{}")
-    synchronize_recall_documents(conn, root, include_raw_transcripts=False)
+    synchronize_recall_documents(conn, root, include_raw_transcripts=False, constitution_path=None)
     (root / POLICY_FILE).write_text(json.dumps({"memory_paths": ["private.md"]}))
     if stage == "recall":
         query = RecallQuery("retired-marker", "test", "prompt", str(root), (), 6000, frozenset(), False)
-        result = run_context(conn, query, load_config().recall_settings(), memory_root=root)
+        result = run_context(conn, query, load_config().recall_settings(), memory_root=root, constitution_path=None)
         assert not any(c.document.source_path == "alias.md" for c in result.selected)
     elif stage == "index":
-        synchronize_recall_documents(conn, root, include_raw_transcripts=False)
+        synchronize_recall_documents(conn, root, include_raw_transcripts=False, constitution_path=None)
         assert conn.execute("SELECT count(*) FROM recall_documents WHERE source_path='alias.md'").fetchone()[0] == 0
     else:
-        assert "retired-marker private detail" not in consolidate.read_current_memory(root)
+        assert "retired-marker private detail" not in consolidate.read_current_memory(root, constitution_path=None)
 
 
 @pytest.mark.parametrize("resource", ["index", "topic", "distilled"])
 def test_cleanup_preserves_changes_made_after_snapshot(setup, monkeypatch, resource):
-    conn, root, _ = setup
+    conn, root, cfg = setup
     conn.execute("UPDATE sessions SET project_slug='ordinary-project'")
     conn.commit()
     real_dump = json.dump
@@ -255,7 +256,7 @@ def test_cleanup_preserves_changes_made_after_snapshot(setup, monkeypatch, resou
             conn.commit()
 
     monkeypatch.setattr("retention_cleanup.json.dump", write_backup_then_edit)
-    result = apply_retention(conn, root, apply=True)
+    result = apply_retention(conn, root, config=cfg, apply=True)
     if resource == "index":
         assert "[New](new.md)" in (root / "MEMORY.md").read_text()
         assert result["deferred_files"] == ["MEMORY.md"]

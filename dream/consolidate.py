@@ -103,12 +103,15 @@ def _load_prompt() -> str:
     return PROMPT_PATH.read_text(encoding="utf-8")
 
 
-def read_current_memory(memory_root: Path) -> str:
+def read_current_memory(memory_root: Path, *, constitution_path) -> str:
     if not memory_root.exists():
         return "(memory root is empty — no files yet)"
     chunks = []
     policy = load_retention_policy(memory_root)
+    from character.safety import is_constitution_source
     for f in sorted(memory_root.glob("*.md")):
+        if is_constitution_source(f, constitution_path=constitution_path):
+            continue
         if f.name.startswith("."):
             continue
         body = f.read_text(encoding='utf-8')
@@ -216,7 +219,7 @@ def consolidate(
         return []
 
     base_state = _memory_state(memory_root)
-    current_memory = read_current_memory(memory_root)
+    current_memory = read_current_memory(memory_root, constitution_path=cfg.data["character"]["constitution_path"])
     prompt = (
         _load_prompt()
         .replace("{{today}}", dt.date.today().isoformat())

@@ -201,6 +201,7 @@ def distill_session(
                 conn,
                 memory_root,
                 include_raw_transcripts=False,
+                constitution_path=cfg.data["character"]["constitution_path"],
             )
         except Exception:
             # Synchronization is maintenance, never fatal to a successful

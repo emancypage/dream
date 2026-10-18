@@ -1,5 +1,5 @@
 [Unit]
-Description=dream nightly — ingest + distill + consolidate + Codex curation
+Description=Dream nightly memory and character pipeline
 After=network-online.target
 Wants=network-online.target
 
@@ -13,5 +13,7 @@ ExecStart=%h/.local/bin/dream-stage --continue-on-error ingest -- %h/.local/bin/
 ExecStart=%h/.local/bin/dream-stage --continue-on-error distill -- %h/.local/bin/dream distill --yes --limit 50
 ExecStart=%h/.local/bin/dream-stage --continue-on-error consolidate -- %h/.local/bin/dream consolidate
 ExecStart=%h/.local/bin/dream-stage --continue-on-error curation -- %h/.local/bin/dream suggestions curate-configured
+ExecStart=%h/.local/bin/dream-stage --continue-on-error character_generate -- %h/.local/bin/dream character generate --source all --limit 10
+ExecStart=%h/.local/bin/dream-stage --continue-on-error character_judge -- %h/.local/bin/dream character judge --limit 10
 ExecStartPost=%h/.local/bin/dream-metrics success
 ExecStopPost=%h/.local/bin/dream-metrics finalize ${SERVICE_RESULT} ${EXIT_STATUS}

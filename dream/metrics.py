@@ -21,7 +21,7 @@ from typing import Callable, Mapping, Sequence
 
 DEFAULT_STATE_PATH = Path.home() / ".local" / "state" / "dream" / "run.json"
 DEFAULT_STALE_AFTER = 36 * 60 * 60
-STAGES = ("ingest", "distill", "consolidate", "curation")
+STAGES = ("ingest", "distill", "consolidate", "curation", "character_generate", "character_judge")
 STATUS_VALUES = ("never", "running", "success", "failed", "stale")
 SAFE_LABEL = re.compile(r"^[a-zA-Z0-9_.:-]+$")
 
@@ -163,7 +163,7 @@ def finish_run(
         state["error_code"] = failures[0]["error_code"]
     elif success:
         state["status"] = "success"
-        state["stage"] = "curation"
+        state["stage"] = STAGES[-1]
         state["completed_stages"] = list(STAGES)
         state.pop("error_code", None)
     else:
@@ -189,7 +189,7 @@ def seed_success(
         {
             "schema_version": 1,
             "status": "success",
-            "stage": "curation",
+            "stage": STAGES[-1],
             "source": _safe_label(source),
             "started_at": started,
             "finished_at": finished,

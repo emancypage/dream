@@ -41,7 +41,7 @@ def test_missing_hook_fields_fail_open_parser():
 def test_context_explain_has_bounded_diagnostics(tmp_path):
     from dream import open_db
     conn = open_db(tmp_path / "dream.db")
-    result = run_context(conn, parse_hook_payload("UserPromptSubmit", {"session_id": "s", "prompt": "missing", "cwd": "/tmp"}), _settings(), explain=True)
+    result = run_context(conn, parse_hook_payload("UserPromptSubmit", {"session_id": "s", "prompt": "missing", "cwd": "/tmp"}), _settings(), explain=True, constitution_path=None)
     assert result.diagnostics.selected_count == 0
 
 

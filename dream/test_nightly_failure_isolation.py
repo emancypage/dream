@@ -19,7 +19,7 @@ def test_scheduled_commands_attempt_every_stage_and_report_failure(tmp_path, fai
     command.write_text("""
 import os, sys
 from pathlib import Path
-stage = 'curation' if sys.argv[1] == 'suggestions' else sys.argv[1]
+stage = ('character_' + sys.argv[2]) if sys.argv[1] == 'character' else ('curation' if sys.argv[1] == 'suggestions' else sys.argv[1])
 with Path(os.environ['DREAM_TEST_RECORD']).open('a') as record:
     record.write(stage + '\\n')
 raise SystemExit(1 if stage == os.environ['DREAM_TEST_FAILURE'] else 0)

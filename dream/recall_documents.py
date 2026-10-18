@@ -266,6 +266,7 @@ def synchronize_recall_documents(
     *,
     include_raw_transcripts: bool,
     now: dt.datetime | None = None,
+    constitution_path,
 ) -> SyncReport:
     """Synchronize recall_documents from every configured source.
 
@@ -300,7 +301,10 @@ def synchronize_recall_documents(
 
     policy = load_retention_policy(memory_root)
     def retained(row):
+        from character.safety import is_constitution_source
         return not (
+            is_constitution_source(row["source_path"], memory_root=memory_root, constitution_path=constitution_path)
+            or
             policy.excludes(source_path=row["source_path"], project_slug=row["project_slug"], text=row["text"])
             or (row["source_kind"] == "approved_memory" and memory_root is not None
                 and policy.excludes_memory_path(memory_root, row["source_path"]))
