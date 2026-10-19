@@ -4,7 +4,7 @@
 
 Transcript sources and model providers are independent. The packaged profile reads Codex JSONL and Open Code SQLite sessions and runs both model stages through `codex exec`; Claude JSONL and Claude CLI remain optional adapters.
 
-For a visual walkthrough of one nightly run, open [`docs/how-dream-works.html`](docs/how-dream-works.html) in a browser. It is a single self-contained page that steps through each stage on a sleep hypnogram.
+For a visual walkthrough of one nightly run, see [How Dream works](https://emancypage.github.io/dream/how-dream-works.html). The page steps through each stage on a sleep hypnogram. Its source is [`docs/how-dream-works.html`](docs/how-dream-works.html).
 
 ## Requirements
 
