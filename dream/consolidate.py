@@ -21,6 +21,7 @@ from backend import generate
 from config import ConsolidateSettings, DreamConfig, load_config
 from recall_query import query_terms, rank_lexical
 from recall_types import RecallQuery
+from recall_usage import memory_annotations, observation_window
 from retention_policy import POLICY_FILE, load_retention_policy, filter_notes, empty_notes
 
 DEFAULT_MODEL = None
@@ -641,8 +642,9 @@ def _consolidate_subset(
         conn, memory_root, batch, settings, constitution_path=constitution_path, embedder=embedder)
     # Only files read above are shown, so every shown body matches its base SHA.
     shown = [path.name for path in selected if path.name in bodies]
+    usage = memory_annotations(conn, shown)
     current_memory = _bounded_memory_blob(
-        [render_memory_file(name, bodies[name]) for name in shown], "memory subset")
+        [render_memory_file(name, bodies[name], annotation=usage[name]) for name in shown], "memory subset")
     prompt = (
         SUBSET_PROMPT_PATH.read_text(encoding="utf-8")
         .replace("{{today}}", dt.date.today().isoformat())
@@ -650,6 +652,7 @@ def _consolidate_subset(
         .replace("{{session_count}}", str(len(batch)))
         .replace("{{store_count}}", str(len(files)))
         .replace("{{shown_count}}", str(len(shown)))
+        .replace("{{usage_since}}", observation_window(conn))
         .replace("{{other_memory}}", _other_memory_lines(files, shown))
         .replace("{{current_memory}}", current_memory)
         .replace("{{distilled_batch}}", _serialize_batch(batch))
@@ -710,6 +713,10 @@ def run_audit(
     index_body = next((entry.body for entry in files if entry.path.name == INDEX_FILE), "(MEMORY.md does not exist)")
     policy = load_retention_policy(memory_root)
     chunks = audit_chunks(topics, MAX_CURRENT_MEMORY_CHARS // 4)
+    # Usage is evidence the model may cite, never a reason to remove on its own;
+    # _drop_fresh_removals and the review gate apply exactly as without it.
+    usage = memory_annotations(conn, [entry.path.name for entry in topics])
+    usage_since = observation_window(conn)
     template = AUDIT_PROMPT_PATH.read_text(encoding="utf-8")
     suggestions: list[Suggestion] = []
     provider = used_model = None
@@ -722,9 +729,11 @@ def run_audit(
             .replace("{{chunk_count}}", str(len(chunks)))
             .replace("{{chunk_file_count}}", str(len(chunk)))
             .replace("{{file_count}}", str(len(topics)))
+            .replace("{{usage_since}}", usage_since)
             .replace("{{memory_index}}", index_body)
-            .replace("{{current_memory}}",
-                     "\n---\n".join(render_memory_file(entry.path.name, entry.body) for entry in chunk))
+            .replace("{{current_memory}}", "\n---\n".join(
+                render_memory_file(entry.path.name, entry.body, annotation=usage[entry.path.name])
+                for entry in chunk))
         )
         prompt += policy.context()
         res = generate("audit", prompt, CONSOLIDATE_PATCH_SCHEMA, model=model, config=cfg)

@@ -18,6 +18,7 @@ Your job: propose specific, targeted edits to the memory store so future session
 - **Prefer updating to adding.** Before proposing a new topic file, check MEMORY.md and the list of other memory files below. When a topic already has a file, change that file under its exact filename instead of creating a new one.
 - **Convert all dates to ISO format** (YYYY-MM-DD). Today's date is provided below.
 - **Drop noisy findings.** If a finding repeats something already in MEMORY.md verbatim, skip it. If a "preference" is just rephrasing existing feedback, skip it.
+- **Recall usage is evidence, not a verdict.** Each file shown in full carries a `last recalled: <date or never>; recalls: <n>` line under its header: how often automatic recall selected that file for a session since the observation start given below. It may tell you which file a finding belongs to, but it is never a reason on its own to change, shorten or merge a file. Many durable files are rarely recalled and still matter.
 
 # What earns a suggestion
 
@@ -83,6 +84,7 @@ If the batch yields nothing worth proposing, return `{"suggestions": []}`. That 
 - Today's date: {{today}}
 - Memory root: {{memory_root}}
 - Sessions in batch: {{session_count}}
+- Recall usage observed since: {{usage_since}}
 
 ## Current memory store (subset)
 

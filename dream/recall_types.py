@@ -41,6 +41,8 @@ class RecallSettings:
     calibration_path: str
     embedder: AdapterSettings
     reranker: AdapterSettings
+    # Recall usage breaks exact ranking ties only when true (off until calibrated).
+    usage_tie_break: bool = False
 
 
 @dataclass(frozen=True)

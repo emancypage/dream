@@ -100,7 +100,8 @@ def _load_documents(conn, ids: list[str] | None = None) -> list[RecallDocument]:
     return [_row_document(row) for row in conn.execute(sql, params).fetchall()]
 
 
-def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | None = None) -> list[RecallCandidate]:
+def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | None = None,
+                 usage=None) -> list[RecallCandidate]:
     """Rank prompt topics by FTS; use fused project signals for session starts.
 
     ``dense`` is an optional pre-computed ``[(document_id, cosine)]`` list in
@@ -109,6 +110,10 @@ def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | N
     FTS matches as topic candidates and the order becomes fused score first,
     because an FTS-first key would rank every dense-only candidate below every
     lexical hit. With no eligible dense IDs the result is exactly lexical.
+
+    ``usage`` (``recall_usage.usage_map``, passed only with
+    ``recall.usage_tie_break``) never adds or removes a candidate: a higher
+    select count only breaks exact ties after trust, before best component rank.
     """
     structured = extract_structured_terms(query.query_text)
     is_prompt = not query.hook_event.startswith("session-start")
@@ -195,6 +200,7 @@ def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | N
             candidate.component_ranks.get("fts", float("inf")) if fts_first else 0,
             -candidate.score,
             trust_order.get(candidate.document.trust_level, 99),
+            -usage.get(candidate.document.id, (0,))[0] if usage else 0,
             candidate.best_component_rank,
             -_parse_time(candidate.document.source_updated_at),
             candidate.document.id,

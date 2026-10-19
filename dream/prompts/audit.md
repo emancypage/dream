@@ -32,6 +32,12 @@ resolved, dead, or superseded. A single closed fact inside a live file earns a
 - Do NOT use file age, or how long ago something was last mentioned, as a signal —
   you are not shown file timestamps, and age is checked separately, in code, after
   you respond.
+- Each file carries a `last recalled: <date or never>; recalls: <n>` line under its
+  header: how often automatic recall selected it for a session since the observation
+  start given below. You may cite it next to closure language quoted from the file,
+  but it is never a reason on its own to remove or patch anything: rarely recalled
+  `feedback`, `user` and `reference` entries are durable by design, and a file can
+  matter without being recalled.
 - Weight this by `metadata.type` in each file's frontmatter: `project` entries are
   the primary candidates (they have a natural lifecycle — started, then resolved or
   dead). `feedback`, `user`, and `reference` entries are durable by design; propose
@@ -67,6 +73,7 @@ If nothing in this chunk is stale, return `{"suggestions": []}`. That is a valid
 
 - Today's date: {{today}}
 - Memory root: {{memory_root}}
+- Recall usage observed since: {{usage_since}}
 - This is chunk {{chunk_number}} of {{chunk_count}}: {{chunk_file_count}} of the {{file_count}} topic files in the store.
 
 ## Memory index (context only, never a target)

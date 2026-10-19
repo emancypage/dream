@@ -86,6 +86,9 @@ session_start_additional_context_limit = 18000
 prompt_additional_context_limit = 1200
 diagnostic_path = "~/.cache/dream/recall-diagnostics.jsonl"
 calibration_path = "~/.config/dream/recall-calibration.json"
+# Harvested recall usage breaks exact ranking ties. Off until a calibrated eval
+# shows no regression; harvesting and audit annotations do not depend on it.
+usage_tie_break = false
 
 [recall.embedder]
 enabled = false

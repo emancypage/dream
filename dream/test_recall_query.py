@@ -122,3 +122,122 @@ def test_dense_ids_obey_exclusions_and_the_raw_transcript_rule(tmp_path):
     query = RecallQuery("pottery", "s1", "prompt", None, (), 4000, frozenset({"a"}), False)
     results = rank_lexical(conn, query, dense=[("a", 0.9), ("raw", 0.8), ("b", 0.7)])
     assert [candidate.document.id for candidate in results] == ["b"]
+
+
+# ------------------------------------------------------------ usage tie-break
+
+
+def _tie_db(tmp_path):
+    """Two approved documents whose fused scores tie exactly at session start.
+
+    x: paths rank 1, recency rank 2; y: paths rank 2, recency rank 1. Their
+    scores are the same two terms summed, trust is equal, and today the newer
+    y wins the tie. z is unrelated to the working directory.
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from dream import open_db
+    conn = open_db(tmp_path / "dream.db")
+    rows = [
+        ("x", "-proj-api-web", "x.md", "deployment notes", "2026-08-20T10:00:00Z"),
+        ("y", "-proj-api", "y.md", "release checklist", "2026-08-21T10:00:00Z"),
+        ("z", "-other-thing", "z.md", "pottery glazing", "2026-08-22T10:00:00Z"),
+    ]
+    for doc_id, project, path, text, updated in rows:
+        conn.execute(
+            "INSERT INTO recall_documents(id, content_sha256, source_kind, trust_level, project_slug, source_path, "
+            "source_updated_at, indexed_at, source_version, text) VALUES (?, ?, 'approved_memory', 'user_approved', "
+            "?, ?, ?, '2026-08-20T10:00:00Z', 'v1', ?)",
+            (doc_id, doc_id, project, path, updated, text),
+        )
+    conn.commit()
+    return conn
+
+
+def _session_start(cwd="/home/proj/api/web"):
+    return RecallQuery(cwd, "s1", "session-start:startup", cwd, (), 6000, frozenset(), False)
+
+
+def test_usage_breaks_an_exact_tie_after_trust(tmp_path):
+    conn = _tie_db(tmp_path)
+    baseline = rank_lexical(conn, _session_start())
+    assert [c.document.id for c in baseline] == ["y", "x"]
+    assert baseline[0].score == baseline[1].score  # the premise: an exact tie
+    assert baseline[0].best_component_rank == baseline[1].best_component_rank == 1
+
+    used = rank_lexical(conn, _session_start(), usage={"x": (5, "2026-10-01T00:00:00Z"), "y": (2, "2026-10-01T00:00:00Z")})
+    assert [c.document.id for c in used] == ["x", "y"]
+    assert [c.score for c in used] == [c.score for c in reversed(baseline)]
+
+
+def test_usage_never_adds_a_candidate_or_changes_order_without_a_tie(tmp_path):
+    conn = _tie_db(tmp_path)
+    heavy = {"z": (1000, "2026-10-19T00:00:00Z")}
+    assert "z" not in {c.document.id for c in rank_lexical(conn, _session_start(), usage=heavy)}
+    prompt = RecallQuery("deployment release", "s1", "prompt", "/home/proj/api/web", (), 4000, frozenset(), False)
+    off = [c.document.id for c in rank_lexical(conn, prompt)]
+    on = [c.document.id for c in rank_lexical(conn, prompt, usage={"y": (1000, "x"), "z": (1000, "x")})]
+    assert on == off and "z" not in on
+
+
+def test_rankings_without_usage_are_unchanged(tmp_path):
+    conn = _tie_db(tmp_path)
+    for query in (_session_start(), RecallQuery("deployment", "s1", "prompt", None, (), 4000, frozenset(), False)):
+        plain = rank_lexical(conn, query)
+        assert rank_lexical(conn, query, usage=None) == plain
+        assert rank_lexical(conn, query, usage={}) == plain
+
+
+def test_usage_only_reorders_within_exact_ties(tmp_path):
+    """On a random store, usage permutes candidates only inside groups whose
+    ranking evidence before the tie-break (FTS rank on prompts, score, trust) is identical."""
+    import random
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from dream import open_db
+    rng = random.Random(20261020)
+    tokens = ["api", "web", "proj", "core", "docs", "infra", "mobile"]
+    trusts = [("approved_memory", "user_approved"), ("distilled_summary", "model_distilled")]
+    conn = open_db(tmp_path / "dream.db")
+    for i in range(40):
+        kind, trust = rng.choice(trusts)
+        slug = "-" + "-".join(rng.sample(tokens, rng.randint(1, 3)))
+        text = " ".join(rng.sample(["deploy", "release", "migration", "runbook", "notes", "alpha"], 2))
+        conn.execute(
+            "INSERT INTO recall_documents(id, content_sha256, source_kind, trust_level, project_slug, source_path, "
+            "source_updated_at, indexed_at, source_version, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'v1', ?)",
+            (f"d{i:02d}", f"d{i:02d}", kind, trust, slug, f"f{i:02d}.md",
+             f"2026-08-{rng.randint(1, 3):02d}T10:00:00Z", "2026-08-20T10:00:00Z", text),
+        )
+    # Same path evidence with timestamps rising by ID: the paths order is the
+    # reverse of the recency order, so the k-th and (n+1-k)-th documents tie.
+    for i in range(20):
+        kind, trust = rng.choice(trusts)
+        conn.execute(
+            "INSERT INTO recall_documents(id, content_sha256, source_kind, trust_level, project_slug, source_path, "
+            "source_updated_at, indexed_at, source_version, text) VALUES (?, ?, ?, ?, '-tiezone', ?, ?, "
+            "'2026-08-20T10:00:00Z', 'v1', 'shared notes')",
+            (f"t{i:02d}", f"t{i:02d}", kind, trust, f"t{i:02d}.md", f"2026-08-05T10:00:{i:02d}Z"),
+        )
+    conn.commit()
+    usage = {f"{prefix}{i:02d}": (rng.randint(0, 50), "2026-10-01T00:00:00Z") for prefix in "dt" for i in range(40)}
+    trust_order = {"user_approved": 0, "model_distilled": 1}
+    queries = [_session_start("/home/proj/api/web"), _session_start("/srv/core/docs/infra"), _session_start("/srv/tiezone"),
+               RecallQuery("deploy release notes", "s1", "prompt", "/home/proj/api", (), 4000, frozenset(), False)]
+    tied_groups = 0
+    for query in queries:
+        is_prompt = query.hook_event == "prompt"
+
+        def evidence(candidate):
+            return (candidate.component_ranks.get("fts", 0) if is_prompt else 0, -candidate.score,
+                    trust_order[candidate.document.trust_level])
+
+        off = rank_lexical(conn, query)
+        on = rank_lexical(conn, query, usage=usage)
+        assert off and {c.document.id for c in on} == {c.document.id for c in off}
+        assert [evidence(c) for c in on] == [evidence(c) for c in off]
+        for i in range(1, len(on)):
+            if evidence(on[i - 1]) == evidence(on[i]):
+                tied_groups += 1
+                assert usage[on[i - 1].document.id][0] >= usage[on[i].document.id][0]
+    assert tied_groups  # the store really has ties for the switch to act on

@@ -37,8 +37,9 @@ _RECALL_KEYS = {
     "calibration_path",
     "embedder",
     "reranker",
+    "usage_tie_break",
 }
-_RECALL_BOOL_KEYS = {"enabled", "install_hooks", "allow_raw_transcript_prompt", "first_prompt_only"}
+_RECALL_BOOL_KEYS = {"enabled", "install_hooks", "allow_raw_transcript_prompt", "first_prompt_only", "usage_tie_break"}
 _RECALL_BUDGET_KEYS = {
     "session_start_budget_codepoints",
     "prompt_budget_codepoints",
@@ -63,6 +64,7 @@ _RECALL_DEFAULTS: dict[str, Any] = {
     "prompt_additional_context_limit": 1200,
     "diagnostic_path": "~/.cache/dream/recall-diagnostics.jsonl",
     "calibration_path": "~/.config/dream/recall-calibration.json",
+    "usage_tie_break": False,
 }
 _DEFAULT_ADAPTER = AdapterSettings(enabled=False, type="none", remote_data_egress=False)
 _CONSOLIDATE_KEYS = {"mode", "subset_files"}

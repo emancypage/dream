@@ -229,6 +229,19 @@ CREATE TRIGGER IF NOT EXISTS recall_documents_ad AFTER DELETE ON recall_document
             old.source_updated_at, old.indexed_at, old.source_version);
 END;
 
+-- How often automatic recall selected each document, harvested by `dream ingest`
+-- from the hook lifecycle markers (hooks are read-only and never write here).
+-- Keyed by the stable recall document ID, so usage survives edits to a file.
+-- Evidence only: it breaks exact ranking ties (recall.usage_tie_break), annotates
+-- the subset and audit prompts and feeds `dream status --usage`; it never deletes.
+-- meta.recall_usage_since holds the start of the observation window.
+CREATE TABLE IF NOT EXISTS recall_usage (
+    document_id       TEXT PRIMARY KEY,
+    first_selected_at TEXT NOT NULL,     -- UTC, YYYY-MM-DDTHH:MM:SSZ
+    last_selected_at  TEXT NOT NULL,     -- UTC, YYYY-MM-DDTHH:MM:SSZ
+    select_count      INTEGER NOT NULL CHECK (select_count > 0)
+);
+
 CREATE TABLE IF NOT EXISTS character_constitutions (
  id TEXT PRIMARY KEY,
  work_key TEXT UNIQUE,

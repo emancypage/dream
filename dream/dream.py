@@ -38,7 +38,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from ingest import discover_jsonl, home_project_slug, ingest_file, ingest_configured_sources  # noqa: E402
+from ingest import discover_jsonl, harvest_recall_usage, home_project_slug, ingest_file, ingest_configured_sources  # noqa: E402
 from distill import distill_session, sessions_needing_distill  # noqa: E402
 from consolidate import consolidate as run_consolidate  # noqa: E402
 from consolidate import PatchError, patch_text, run_audit, states_deletion  # noqa: E402
@@ -144,6 +144,7 @@ def _backup_before_schema_migration(conn: sqlite3.Connection, path: Path) -> Pat
         or "base_sha256" not in _table_columns(conn, "suggestions")
         or "find_text" not in _table_columns(conn, "suggestions")
         or "vector_blob" not in _table_columns(conn, "recall_embeddings")
+        or not _table_columns(conn, "recall_usage")
     )
     migrations = _table_columns(conn, "schema_migrations")
     version = conn.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0] if migrations else 0
@@ -350,6 +351,9 @@ def _prune_orphaned_index_lines(memory_root: Path, *, constitution_path) -> bool
 
 def cmd_ingest(args: argparse.Namespace) -> int:
     conn = open_db(args.db)
+    harvested = harvest_recall_usage(conn)
+    if harvested:
+        print(f"recall usage: counted {harvested} hook marker{'' if harvested == 1 else 's'}.")
     if args.projects:
         seen = ingested = msgs = 0
         for path in discover_jsonl(Path(args.projects)):
@@ -1216,7 +1220,50 @@ def cmd_status(args: argparse.Namespace) -> int:
     consolidate_route = args.config.stage("consolidate")
     print(f"Distill route:      {distill_route['provider']} / {distill_route.get('model') or '(provider default)'}")
     print(f"Consolidate route:  {consolidate_route['provider']} / {consolidate_route.get('model') or '(provider default)'}")
+    if getattr(args, "usage", False):
+        _print_usage_report(conn, args.config.memory_root)
     return 0
+
+
+def _memory_index_lines(memory_root: Path) -> dict[str, str]:
+    try:
+        lines = (memory_root / "MEMORY.md").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return {}
+    index: dict[str, str] = {}
+    for line in lines:
+        target = _index_target(line)
+        if target and target not in index:
+            index[target] = line.strip()
+    return index
+
+
+def _print_usage_report(conn: sqlite3.Connection, memory_root: Path) -> None:
+    """Approved memory files automatic recall has not selected lately. Read-only."""
+    import recall_usage
+
+    try:
+        report = recall_usage.usage_report(conn)
+    except sqlite3.Error as exc:
+        print(f"Recall usage:       not available ({type(exc).__name__}: recall tables unreadable)")
+        return
+    if report.state == "unavailable":
+        print("Recall usage:       not available (database not migrated yet; the next `dream ingest` adds it)")
+        return
+    if report.state == "not-observed":
+        print("Recall usage:       not observed yet (no recall hook markers harvested by `dream ingest`)")
+        return
+    days = recall_usage.UNUSED_DAYS
+    print(f"Recall usage:       observed since {report.since} (harvested from recall hook markers)")
+    print(f"  {len(report.unused)} of {report.approved_count} approved memory files not recalled in the last "
+          f"{days} days (report only; nothing is deleted)")
+    if report.window_shorter_than_days:
+        print(f"  The observation window is shorter than {days} days, so recent files may not have had a chance.")
+    index = _memory_index_lines(memory_root)
+    usage = recall_usage.usage_map(conn)
+    for entry in report.unused:
+        print(f"  {entry.source_path} ({recall_usage.annotation(usage, entry.document_id)})")
+        print(f"      {index.get(entry.source_path, '(not in MEMORY.md)')}")
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
@@ -1612,6 +1659,8 @@ def main(argv: list[str] | None = None) -> int:
     scurate.set_defaults(func=cmd_suggestions)
 
     pst = sub.add_parser("status", help="Show DB stats")
+    pst.add_argument("--usage", action="store_true",
+                     help="List approved memory files not recalled in the last 90 days (read-only)")
     pst.set_defaults(func=cmd_status)
 
     pret = sub.add_parser("retention", help="Preview or apply local memory exclusions")

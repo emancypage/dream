@@ -27,6 +27,11 @@ def _root() -> Path:
     return Path(tempfile.gettempdir()) / f"dream-recall-{os.getuid()}"
 
 
+def marker_root() -> Path:
+    """The directory hooks keep their markers in; ``dream ingest`` harvests it."""
+    return _root()
+
+
 def _bounded(value: object) -> str:
     return str(value)[:_MAX_ID_FIELD]
 

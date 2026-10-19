@@ -18,6 +18,7 @@ from recall_render import render_context
 from recall_query import rank_lexical
 from recall_select import calibration_for, embedder_calibration_version, select_recall_candidates
 from recall_types import RecallCandidate, RecallDiagnostics, RecallQuery, RecallResult
+from recall_usage import usage_map
 from storage import open_db_readonly
 from retention_policy import load_retention_policy
 
@@ -142,7 +143,10 @@ def retrieve(conn, query: RecallQuery, settings, calibrations, *, embedder=None,
         if query_vector is None:
             # Nothing dense contributes: no second embedder call, lexical scores stay.
             adapter_settings = with_adapters(settings, embedder=False)
-    candidates = rank_lexical(conn, query, dense=dense)
+    # Usage only reorders exact ties, and only once switched on; an unmigrated
+    # or read-only database without recall_usage simply yields no usage.
+    usage = usage_map(conn) if getattr(settings, "usage_tie_break", False) else None
+    candidates = rank_lexical(conn, query, dense=dense, usage=usage)
     if keep is not None:
         candidates = [candidate for candidate in candidates if keep(candidate)]
     candidates, mode, adapter_fallback = apply_optional_adapters(
