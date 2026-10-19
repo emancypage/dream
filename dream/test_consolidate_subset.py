@@ -372,6 +372,126 @@ def test_dense_hook_is_off_without_an_embedder_and_fails_open(tmp_path):
     assert _topic_name(3) in _names(selected)
 
 
+class _MeaningEmbedder:
+    """Deterministic vectors by topic: database words in English or Polish share an axis."""
+
+    fingerprint = "meaning-v1"
+    remote_data_egress = False
+
+    def __init__(self):
+        self.calls = []
+
+    def embed(self, texts):
+        self.calls.append(list(texts))
+        return [[1.0, 0.0, 0.0] if any(word in text.casefold() for word in ("postgresql", "baza", "danych"))
+                else [0.0, 1.0, 0.0] for text in texts]
+
+
+_DATABASE_FILE = "project_database.md"
+_DATABASE_BODY = ("---\nname: project-database\ndescription: storage\nmetadata:\n  type: project\n---\n\n"
+                  "The service keeps its records in PostgreSQL.\n")
+
+
+def _meaning_store(tmp_path):
+    from recall_documents import embed_recall_documents
+    root, conn = _store(tmp_path, extra={_DATABASE_FILE: _DATABASE_BODY})
+    embedder = _MeaningEmbedder()
+    assert embed_recall_documents(conn, embedder, include_raw_transcripts=False).error is None
+    embedder.calls.clear()
+    return root, conn, embedder
+
+
+def test_dense_candidates_bring_a_file_reachable_only_by_meaning_into_the_subset(tmp_path):
+    root, conn, embedder = _meaning_store(tmp_path)
+    batch = _batch("baza danych przeniesiona na nowy serwer")
+    settings = ConsolidateSettings(mode="subset", subset_files=2)
+    assert _names(_select(conn, root, batch, settings)) == ["MEMORY.md"]
+    selected = _names(_select(conn, root, batch, settings, embedder=embedder))
+    assert selected[:2] == ["MEMORY.md", _DATABASE_FILE]
+    assert embedder.calls == [["baza danych przeniesiona na nowy serwer"]]
+
+
+def test_failing_embedder_keeps_the_lexical_subset_and_is_tried_once(tmp_path, capsys):
+    root, conn, _embedder = _meaning_store(tmp_path)
+
+    class Down(_MeaningEmbedder):
+        def embed(self, texts):
+            self.calls.append(list(texts))
+            from recall_adapters import EmbedderUnavailable
+            raise EmbedderUnavailable("refused")
+
+    findings = [" ".join(f"kw{i:02d}" for i in range(start, start + 20)) for start in (0, 20, 40)]
+    settings = ConsolidateSettings(mode="subset", subset_files=5)
+    lexical = _names(_select(conn, root, _batch(*findings), settings))
+    capsys.readouterr()
+    down = Down()
+    assert _names(_select(conn, root, _batch(*findings), settings, embedder=down)) == lexical
+    assert len(down.calls) == 1
+    err = [line for line in capsys.readouterr().err.splitlines() if line]
+    assert len(err) == 1 and "dense candidates unavailable" in err[0]
+
+
+def _subset_cli(tmp_path, monkeypatch, config_lines):
+    import test_recall_embedder_http as http
+    root, conn = _store(tmp_path, extra={_DATABASE_FILE: _DATABASE_BODY})
+    conn.close()
+    db_path = tmp_path / "dream.db"
+    write = dream.open_db(db_path)
+    synchronize_recall_documents(write, root, include_raw_transcripts=False, constitution_path=None)
+    _distill(write, "s-1", {"projects": ["baza danych przeniesiona"]})
+    write.close()
+    path = tmp_path / "config.toml"
+    path.write_text("\n".join(config_lines) + "\n", encoding="utf-8")
+    config = load_config(path, overrides={"storage": {"db_path": str(db_path), "memory_root": str(root)}})
+    prompts = []
+    monkeypatch.setattr(C, "generate", lambda stage, prompt, schema, **kw: prompts.append(prompt) or SimpleNamespace(
+        output={"suggestions": []}, provider="fake", model="fake"))
+    args = argparse.Namespace(db=db_path, memory=str(root), since=None, model=None, max_sessions=200, config=config)
+    return args, prompts, http
+
+
+def _embedder_lines(url):
+    from test_recall_embedder_http import DIMENSION, MODEL
+    return ["[recall.embedder]", "enabled = true", 'type = "openai-compatible"', f'base_url = "{url}"',
+            f'model = "{MODEL}"', f"dimension = {DIMENSION}"]
+
+
+def test_nightly_subset_consolidation_uses_the_configured_embedder(tmp_path, monkeypatch, capsys):
+    from test_recall_embedder_http import FakeEmbeddingServer, make_embedder
+    from recall_documents import embed_recall_documents
+    server = FakeEmbeddingServer().start()
+    try:
+        args, prompts, _http = _subset_cli(tmp_path, monkeypatch, _embedder_lines(server.url) + ["[consolidate]", 'mode = "subset"', "subset_files = 1"])
+        write = dream.open_db(args.db)
+        embed_recall_documents(write, make_embedder(server.url), include_raw_transcripts=False)
+        write.close()
+        server.requests.clear()
+        assert dream.cmd_consolidate(args) == 0
+        assert server.posted_inputs() == ["baza danych przeniesiona"]
+        assert "The service keeps its records in PostgreSQL." in prompts[0]
+    finally:
+        server.stop()
+
+
+def test_nightly_subset_consolidation_with_a_misconfigured_embedder_ranks_lexically(tmp_path, monkeypatch, capsys):
+    args, prompts, _http = _subset_cli(tmp_path, monkeypatch, _embedder_lines("http://192.0.2.10:8081") + ["[consolidate]", 'mode = "subset"'])
+    assert dream.cmd_consolidate(args) == 0
+    err = [line for line in capsys.readouterr().err.splitlines() if "embedder" in line]
+    assert len(err) == 1 and "remote_data_egress" in err[0]
+    assert len(prompts) == 1
+
+
+def test_full_mode_consolidation_never_builds_the_embedder(tmp_path, monkeypatch, capsys):
+    from test_recall_embedder_http import FakeEmbeddingServer
+    server = FakeEmbeddingServer().start()
+    try:
+        args, prompts, _http = _subset_cli(tmp_path, monkeypatch, _embedder_lines(server.url))
+        assert dream.cmd_consolidate(args) == 0
+        assert server.requests == []
+    finally:
+        server.stop()
+
+
 # ------------------------------------------------------------ subset consolidation
 
 

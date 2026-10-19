@@ -375,7 +375,15 @@ def test_build_embedder_from_settings():
 # --- recall through the fake server ----------------------------------------
 
 
-def _memory_store(tmp_path, files):
+def calibrate_embedder_mode(conn, threshold=0.0, version="emb-test"):
+    """Hook and agent paths use the dense list only once the embedder mode is calibrated."""
+    conn.execute(
+        "INSERT OR REPLACE INTO recall_calibrations(mode, calibration_version, threshold, fixture_sha256) "
+        "VALUES ('lexical_plus_embedder', ?, ?, 'fixture')", (version, threshold))
+    conn.commit()
+
+
+def _memory_store(tmp_path, files, *, calibrated=True):
     from dream import open_db
     memory = tmp_path / "memory"
     memory.mkdir()
@@ -383,6 +391,8 @@ def _memory_store(tmp_path, files):
         (memory / name).write_text(text, encoding="utf-8")
     conn = open_db(tmp_path / "dream.db")
     synchronize_recall_documents(conn, memory, include_raw_transcripts=False, constitution_path=None)
+    if calibrated:
+        calibrate_embedder_mode(conn)
     return conn, memory
 
 
@@ -489,7 +499,7 @@ def test_vectors_under_another_fingerprint_are_never_compared(tmp_path, embeddin
 
 
 def test_uncalibrated_embedder_mode_drops_dense_list_without_contacting_server(tmp_path, embedding_server):
-    conn, _memory = _memory_store(tmp_path, _ENGLISH)
+    conn, _memory = _memory_store(tmp_path, _ENGLISH, calibrated=False)
     embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False)
     conn.execute("INSERT INTO recall_calibrations(mode, calibration_version, threshold, fixture_sha256) VALUES ('lexical', 'lex-v1', 0.0, 'f')")
     conn.commit()
@@ -506,7 +516,7 @@ def test_uncalibrated_embedder_mode_drops_dense_list_without_contacting_server(t
 
 
 def test_embedder_mode_uses_its_own_calibration_row(tmp_path, embedding_server):
-    conn, _memory = _memory_store(tmp_path, _ENGLISH)
+    conn, _memory = _memory_store(tmp_path, _ENGLISH, calibrated=False)
     embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False)
     conn.execute("INSERT INTO recall_calibrations(mode, calibration_version, threshold, fixture_sha256) VALUES ('lexical', 'lex-v1', 0.0, 'f')")
     conn.execute("INSERT INTO recall_calibrations(mode, calibration_version, threshold, fixture_sha256) VALUES ('lexical_plus_embedder', 'emb-v1', 0.3, 'f')")
@@ -538,6 +548,7 @@ def test_database_without_vector_blob_column_fails_open(tmp_path, embedding_serv
     for name, text in _ENGLISH.items():
         (memory / name).write_text(text, encoding="utf-8")
     synchronize_recall_documents(conn, memory, include_raw_transcripts=False, constitution_path=None)
+    calibrate_embedder_mode(conn)
     conn.execute("PRAGMA journal_mode = DELETE")
     conn.close()
     readonly = open_db_readonly(db_path)
@@ -695,7 +706,7 @@ def test_embed_command_refuses_a_disabled_or_unreachable_embedder(tmp_path, caps
 # --- the read-only hook path ------------------------------------------------
 
 
-def _hook_store(tmp_path, embedding_server):
+def _hook_store(tmp_path, embedding_server, *, calibrated=True):
     from dream import open_db
     memory = tmp_path / "memory"
     memory.mkdir()
@@ -710,6 +721,8 @@ def _hook_store(tmp_path, embedding_server):
     # One document has no vector yet: the hook must not embed it.
     conn.execute("DELETE FROM recall_embeddings WHERE document_id IN (SELECT id FROM recall_documents WHERE source_path='web.md')")
     conn.commit()
+    if calibrated:
+        calibrate_embedder_mode(conn)
     conn.execute("PRAGMA journal_mode = DELETE")
     conn.close()
     embedding_server.requests.clear()
@@ -791,3 +804,127 @@ def test_embedder_mode_calibration_embeds_fixture_documents_with_the_batch_timeo
     record = calibrate_fixture_file(fixture, open_db(tmp_path / "dream.db"), "lexical_plus_embedder", embedder=embedder)
     assert record.mode == "lexical_plus_embedder"
     assert any(request["body"] and len(request["body"]["input"]) == 2 for request in embedding_server.requests)
+
+
+# --- calibration gate and recall-calibrate --apply -----------------------------
+
+
+def test_context_without_an_embedder_calibration_row_never_uses_dense(tmp_path, embedding_server):
+    conn, _memory = _memory_store(tmp_path, _ENGLISH, calibrated=False)
+    embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False)
+    embedding_server.requests.clear()
+    assert conn.execute("SELECT COUNT(*) FROM recall_calibrations").fetchone()[0] == 0
+    for query in (_prompt("jaka baza danych"), _prompt("postgresql migrations release"),
+                  RecallQuery("/nonexistent/project", "s1", "session-start:startup", "/nonexistent/project", (), 6000, frozenset(), False)):
+        lexical = run_context(conn, query, recall_settings(), constitution_path=None)
+        result = run_context(conn, query, recall_settings(embedder_settings()), embedder=make_embedder(embedding_server.url),
+                             allow_cache_writes=False, constitution_path=None)
+        assert result.diagnostics.fallback_reason == "embedder-uncalibrated"
+        assert result.mode == "lexical" and result.calibration_version is None
+        assert result.rendered_context == lexical.rendered_context
+    assert embedding_server.requests == []
+
+
+def test_prompt_hook_without_an_embedder_calibration_row_stays_lexical(tmp_path, embedding_server, monkeypatch, capsys):
+    memory, _db_dir, db_path = _hook_store(tmp_path, embedding_server, calibrated=False)
+    monkeypatch.setenv("DREAM_RECALL_STATE_ROOT", str(tmp_path / "hook-state"))
+    rc, out = _run_hook(monkeypatch, capsys, _cli_config(tmp_path, embedding_server.url), db_path, memory, "jaka baza danych", explain=True)
+    assert rc == 0
+    explained = json.loads(out)
+    assert explained["fallback_reason"] == "embedder-uncalibrated"
+    assert explained["candidate_ids"] == []
+    assert embedding_server.requests == []
+
+
+def _private_fixture(tmp_path, queries=None):
+    fixture = tmp_path / "heldout.json"
+    fixture.write_text(json.dumps({
+        "documents": [
+            {"id": "doc-api", "source_kind": "approved_memory", "trust_level": "user_approved", "project_slug": None,
+             "source_path": "api.md", "source_updated_at": "2026-01-01T00:00:00Z", "source_version": "v1",
+             "text": _ENGLISH["api.md"]},
+            {"id": "doc-web", "source_kind": "approved_memory", "trust_level": "user_approved", "project_slug": None,
+             "source_path": "web.md", "source_updated_at": "2026-01-01T00:00:00Z", "source_version": "v1",
+             "text": _ENGLISH["web.md"]},
+        ],
+        "queries": queries if queries is not None else [
+            {"id": "q-pl", "event": "prompt", "query": "jaka baza danych", "language": "pl", "relevant": ["doc-api"]},
+            {"id": "q-en", "event": "prompt", "query": "npm deployment checklist", "language": "en", "relevant": ["doc-web"]},
+        ],
+    }), encoding="utf-8")
+    return fixture
+
+
+def _calibrate_cli(tmp_path, config, fixture, db, mode="lexical_plus_embedder", apply=True):
+    import argparse
+    from dream import cmd_recall_calibrate
+    return cmd_recall_calibrate(argparse.Namespace(fixtures=fixture, db=db, mode=mode, output=None, config=config, apply=apply))
+
+
+def test_recall_calibrate_apply_writes_one_row_that_the_next_context_run_uses(tmp_path, embedding_server, capsys):
+    conn, _memory = _memory_store(tmp_path, _ENGLISH, calibrated=False)
+    embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False)
+    conn.close()
+    config = _cli_config(tmp_path, embedding_server.url)
+    assert _calibrate_cli(tmp_path, config, _private_fixture(tmp_path), tmp_path / "dream.db") == 0
+    captured = capsys.readouterr()
+    written = json.loads(captured.out)
+    assert written["applied_to"] == str(tmp_path / "dream.db")
+    assert "recall_calibrations" in captured.err and written["calibration_version"] in captured.err
+    from dream import open_db
+    live = open_db(tmp_path / "dream.db")
+    rows = live.execute("SELECT mode, calibration_version, threshold, fixture_sha256, created_at FROM recall_calibrations").fetchall()
+    assert rows == [("lexical_plus_embedder", written["calibration_version"], written["threshold"],
+                     written["fixture_sha256"], written["created_at"])]
+    result = run_context(live, _prompt("jaka baza danych"), config.recall_settings(), embedder=make_embedder(embedding_server.url),
+                         allow_cache_writes=False, constitution_path=None)
+    assert result.diagnostics.fallback_reason is None
+    assert result.mode == "lexical_plus_embedder"
+    assert result.calibration_version == written["calibration_version"]
+    assert result.selected[0].document.source_path == "api.md"
+    assert all(candidate.score >= written["threshold"] for candidate in result.selected)
+    # Applying again replaces the row instead of adding one.
+    assert _calibrate_cli(tmp_path, config, _private_fixture(tmp_path), tmp_path / "dream.db") == 0
+    assert live.execute("SELECT COUNT(*) FROM recall_calibrations").fetchone()[0] == 1
+
+
+def test_recall_calibrate_without_apply_leaves_the_live_database_untouched(tmp_path, embedding_server, capsys):
+    import hashlib as _hashlib
+    conn, _memory = _memory_store(tmp_path, _ENGLISH, calibrated=False)
+    conn.execute("PRAGMA journal_mode = DELETE")
+    conn.close()
+    db = tmp_path / "dream.db"
+    before = _hashlib.sha256(db.read_bytes()).hexdigest()
+    config = _cli_config(tmp_path, embedding_server.url)
+    for mode in ("lexical", "lexical_plus_embedder"):
+        assert _calibrate_cli(tmp_path, config, _private_fixture(tmp_path), db, mode=mode, apply=False) == 0
+        assert "applied_to" not in json.loads(capsys.readouterr().out)
+    assert _hashlib.sha256(db.read_bytes()).hexdigest() == before
+    assert sorted(path.name for path in tmp_path.glob("dream.db*")) == ["dream.db"]
+
+
+def test_recall_calibrate_apply_refuses_public_and_degenerate_fixtures(tmp_path, capsys):
+    from config import load_config
+    config = load_config(tmp_path / "missing.toml")
+    db = tmp_path / "live.db"
+    public = Path(__file__).parent / "fixtures/recall/public.json"
+    assert _calibrate_cli(tmp_path, config, public, db, mode="lexical") == 2
+    assert "public" in capsys.readouterr().err
+    unanswerable = _private_fixture(tmp_path, queries=[
+        {"id": "q", "event": "prompt", "query": "pottery glaze", "language": "en", "relevant": ["doc-api"]}])
+    assert _calibrate_cli(tmp_path, config, unanswerable, db, mode="lexical") == 2
+    assert "refusing --apply" in capsys.readouterr().err
+    no_relevant = _private_fixture(tmp_path, queries=[{"id": "q", "event": "prompt", "query": "npm", "relevant": []}])
+    assert _calibrate_cli(tmp_path, config, no_relevant, db, mode="lexical") == 2
+    assert "refusing --apply" in capsys.readouterr().err
+    assert not db.exists()
+
+
+def test_query_text_is_scrubbed_before_it_reaches_the_embedder(tmp_path, embedding_server):
+    conn, _memory = _memory_store(tmp_path, _ENGLISH)
+    embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False)
+    embedding_server.requests.clear()
+    run_context(conn, _prompt("postgres OPENAI_API_KEY=sk-live-query-secret"), recall_settings(embedder_settings()),
+                embedder=make_embedder(embedding_server.url), allow_cache_writes=False, constitution_path=None)
+    (sent,) = embedding_server.posted_inputs()
+    assert "sk-live-query-secret" not in sent and "postgres" in sent

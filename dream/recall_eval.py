@@ -136,7 +136,8 @@ def _run_queries(data: dict, conn, settings: RecallSettings, calibration: dict, 
             raise ValueError(f"fixture query language {ALL_LANGUAGES!r} is reserved for the aggregate slice")
         query = _query(item, settings)
         started = time.perf_counter()
-        outcome = retrieve(conn, query, settings, calibration, embedder=embedder, allow_cache_writes=False)
+        outcome = retrieve(conn, query, settings, calibration, embedder=embedder, allow_cache_writes=False,
+                           require_calibration=False)
         fallback = outcome.fallback_reason
         selected = outcome.selected
         rendered = render_context(selected, query.requested_codepoint_budget, query.query_text)
@@ -285,12 +286,15 @@ class _QueryMemo:
         return (getattr(self._embedder, "embed_documents", None) or self._embedder.embed)(texts)
 
 
-def calibrate_fixture_file(path, conn, mode: str, *, embedder=None) -> CalibrationRecord:
+def calibrate_fixture_file(path, conn, mode: str, *, embedder=None, require_usable: bool = False) -> CalibrationRecord:
     """Choose the best observed score threshold from a held-out fixture.
 
     ``lexical_plus_embedder`` evaluates in that mode, sweeping the fused and
     rescored scores, and needs the configured embedder; its version also
     covers the embedder fingerprint, because a threshold belongs to a model.
+    ``require_usable`` (``recall-calibrate --apply``) refuses a degenerate
+    result: no query with relevant documents, forbidden results at every
+    threshold, or no relevant document retrieved at any threshold.
     """
     fixture_path = Path(path)
     if _is_public_fixture(fixture_path):
@@ -298,6 +302,8 @@ def calibrate_fixture_file(path, conn, mode: str, *, embedder=None) -> Calibrati
     if mode == EMBEDDER_MODE and embedder is None:
         raise ValueError(f"calibrating {EMBEDDER_MODE} needs the configured embedder")
     data = _fixture(fixture_path)
+    if require_usable and not any(_relevant(item) for item in data["queries"]):
+        raise ValueError("refusing --apply: the fixture has no query with relevant documents")
     settings = _default_settings()
     _ensure_documents(conn, data["documents"])
     scores = {0.0}
@@ -307,7 +313,8 @@ def calibrate_fixture_file(path, conn, mode: str, *, embedder=None) -> Calibrati
         if report is None or report.error:
             raise ValueError(f"could not embed the fixture documents: {report.error if report else 'embedder failed'}")
         for item in data["queries"]:
-            outcome = retrieve(conn, _query(item, settings), _embedder_settings(settings), {}, embedder=embedder)
+            outcome = retrieve(conn, _query(item, settings), _embedder_settings(settings), {}, embedder=embedder,
+                               require_calibration=False)
             if outcome.fallback_reason:
                 raise ValueError(f"embedder mode fell back during calibration: {outcome.fallback_reason}")
             scores.update(candidate.score for candidate in outcome.candidates)
@@ -321,6 +328,11 @@ def calibrate_fixture_file(path, conn, mode: str, *, embedder=None) -> Calibrati
         key = (report.mrr if report.forbidden_count == 0 else -1.0, report.recall_at_3 if report.forbidden_count == 0 else -1.0, -threshold)
         if best is None or key > best[0]:
             best = (key, threshold, report)
+    if require_usable and best is not None:
+        if best[0][0] < 0:
+            raise ValueError("refusing --apply: every threshold returns a forbidden result")
+        if best[2].mrr <= 0:
+            raise ValueError("refusing --apply: no relevant document was retrieved at any threshold")
     canonical_hash = hashlib.sha256(_canonical(data)).hexdigest()
     label = f"{mode}:{embedder.fingerprint}" if embedder is not None else mode
     version = hashlib.sha256(f"{canonical_hash}:{label}:calibration-v1".encode("utf-8")).hexdigest()

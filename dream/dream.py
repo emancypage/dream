@@ -458,18 +458,35 @@ def cmd_distill(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def _subset_embedder(config):
+    """The configured embedder for subset selection, or None to rank lexically.
+
+    Building it contacts nothing; an unusable configuration prints one line.
+    """
+    try:
+        embedder, problem = configured_embedder(config)
+    except Exception as e:
+        embedder, problem = None, f"{type(e).__name__}: {e}"
+    if problem:
+        print(f"subset selection: embedder misconfigured ({problem}); ranking lexically", file=sys.stderr)
+    return embedder
+
+
 def cmd_consolidate(args: argparse.Namespace) -> int:
     conn = open_db(args.db)
     memory_root = Path(args.memory)
     memory_root.mkdir(parents=True, exist_ok=True)
     print(f"Consolidating into suggestions for {memory_root}")
+    mode = getattr(args, "mode", None)
+    embedder = _subset_embedder(args.config) if (mode or args.config.consolidate_settings().mode) == "subset" else None
     suggestions = run_consolidate(
         conn, memory_root,
         since_iso=args.since,
         model=args.model,
         max_sessions=args.max_sessions,
         config=args.config,
-        mode=getattr(args, "mode", None),
+        mode=mode,
+        embedder=embedder,
     )
     return _print_suggestions(memory_root, suggestions)
 
@@ -1311,11 +1328,17 @@ def cmd_recall_calibrate(args: argparse.Namespace) -> int:
             print(f"recall-calibrate: {EMBEDDER_MODE} needs the configured embedder: {problem or 'the embedder is disabled'}",
                   file=sys.stderr)
             return 2
+    apply = bool(getattr(args, "apply", False))
     # Calibrate on an in-memory copy of the fixture: a stale or now-excluded
     # fixture row must never be re-inserted into the live recall index.
     conn = _open_ephemeral_eval_db()
     try:
-        record = calibrate_fixture_file(args.fixtures, conn, args.mode, embedder=embedder)
+        record = calibrate_fixture_file(args.fixtures, conn, args.mode, embedder=embedder, require_usable=apply)
+    except ValueError as exc:
+        if not apply:
+            raise
+        print(f"recall-calibrate: {exc}", file=sys.stderr)
+        return 2
     finally:
         conn.close()
     result = {
@@ -1325,6 +1348,24 @@ def cmd_recall_calibrate(args: argparse.Namespace) -> int:
         "fixture_sha256": record.fixture_sha256,
         "created_at": record.created_at,
     }
+    if apply:
+        # The only writer of recall_calibrations: one row for the requested
+        # mode, through the normal writer, after the evaluation succeeded.
+        live = open_db(args.db)
+        try:
+            with live:
+                live.execute(
+                    "INSERT INTO recall_calibrations(mode, calibration_version, threshold, fixture_sha256, created_at) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(mode) DO UPDATE SET "
+                    "calibration_version=excluded.calibration_version, threshold=excluded.threshold, "
+                    "fixture_sha256=excluded.fixture_sha256, created_at=excluded.created_at",
+                    (record.mode, record.calibration_version, record.threshold, record.fixture_sha256, record.created_at),
+                )
+        finally:
+            live.close()
+        result["applied_to"] = str(args.db)
+        print(f"recall-calibrate: wrote recall_calibrations row mode={record.mode} threshold={record.threshold} "
+              f"calibration_version={record.calibration_version} to {args.db}", file=sys.stderr)
     if args.output:
         output = Path(args.output).expanduser()
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1609,6 +1650,8 @@ def main(argv: list[str] | None = None) -> int:
     pcal.add_argument("--fixtures", required=True)
     pcal.add_argument("--mode", required=True)
     pcal.add_argument("--output")
+    pcal.add_argument("--apply", action="store_true",
+                      help="Write the calibration for --mode to the live database (recall_calibrations)")
     pcal.set_defaults(func=cmd_recall_calibrate)
 
     phooks = sub.add_parser("hooks", help="Install or remove Codex recall hooks")

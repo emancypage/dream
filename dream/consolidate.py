@@ -385,21 +385,24 @@ def _query_groups(findings: list[str]) -> list[str]:
     return groups
 
 
-def _dense_for_subset(conn: sqlite3.Connection, query_text: str, embedder):
+def _dense_for_subset(conn: sqlite3.Connection, query_text: str, embedder, *, limit: int = 200):
     """Return the dense candidate list for one subset query, or None.
 
-    The dense list is passed to rank_lexical when an embedder is configured.
-    Without one (the packaged default), or on any embedder or vector-store
-    failure, subset selection stays lexical.
+    The dense list (approved memory under the embedder's current fingerprint)
+    is passed to rank_lexical when an embedder is configured. Without one (the
+    packaged default), or on any embedder or vector-store failure, subset
+    selection stays lexical. Subset selection has no score threshold, so it
+    needs no calibration row.
     """
     if embedder is None:
         return None
     try:
-        from recall_embeddings import dense_candidates
+        from recall_adapters import embed_query
+        from recall_embeddings import dense_candidates, embedding_text
         fingerprint = embedder.fingerprint
         fingerprint = fingerprint() if callable(fingerprint) else fingerprint
-        vector = embedder.embed([query_text])[0]
-        return dense_candidates(conn, vector, fingerprint, ("approved_memory",))
+        vector = embed_query(embedder, embedding_text(query_text))
+        return dense_candidates(conn, vector, str(fingerprint), ("approved_memory",), limit=limit)
     except Exception as exc:
         print(f"subset selection: dense candidates unavailable ({type(exc).__name__}); ranking lexically",
               file=sys.stderr)
@@ -416,7 +419,12 @@ def _ranked_memory_files(conn, groups: list[str], eligible: set[str], limit: int
     scores: dict[str, float] = {}
     for text in groups:
         query = RecallQuery(text, None, "consolidate-subset", None, (), 0, frozenset(), False)
-        dense = _dense_for_subset(conn, text, embedder)
+        # Only the files closest in meaning count as dense evidence, so a long
+        # tail of weak matches cannot crowd out lexical ones.
+        dense = _dense_for_subset(conn, text, embedder, limit=2 * limit)
+        if dense is None:
+            # Off, or failed: one failure is reported once, not once per group.
+            embedder = None
         candidates = rank_lexical(conn, query) if dense is None else rank_lexical(conn, query, dense=dense)
         rank = 0
         for candidate in candidates:

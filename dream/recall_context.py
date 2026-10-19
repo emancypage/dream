@@ -13,7 +13,7 @@ from pathlib import Path
 
 from recall_events import POLICY_VERSION
 from recall_adapters import AdapterError, EmbedderUnavailable, apply_optional_adapters, build_embedder, embed_query, embedder_fallback_reason
-from recall_embeddings import dense_candidates
+from recall_embeddings import dense_candidates, embedding_text
 from recall_render import render_context
 from recall_query import rank_lexical
 from recall_select import calibration_for, select_recall_candidates
@@ -68,23 +68,25 @@ def _without_embedder(settings):
     return replace(settings, embedder=replace(settings.embedder, enabled=False))
 
 
-def _dense_list(conn, query: RecallQuery, settings, embedder, calibrations):
+def _dense_list(conn, query: RecallQuery, settings, embedder, calibrations, *, require_calibration: bool):
     """Return ``(dense, query_vector, fallback_reason)`` for an enabled embedder.
 
-    The query text is embedded at most once. The dense list is dropped
-    before any network call when ``lexical`` is calibrated but the embedder
-    mode is not, because fused scores are on another scale than the lexical
-    threshold. Every failure leaves ``dense`` None, so ranking stays lexical.
+    The query text is embedded at most once. Unless the embedder mode has
+    its own calibration row, the dense list is dropped before any network
+    call: fused scores are on another scale than the lexical threshold, and
+    without a threshold every prompt would inject up to its budget. Every
+    failure leaves ``dense`` None, so ranking stays lexical.
     """
     if embedder is None:
         return None, None, "embedder-unavailable"
-    if "lexical" in calibrations and EMBEDDER_MODE not in calibrations:
+    if require_calibration and EMBEDDER_MODE not in calibrations:
         return None, None, "embedder-uncalibrated"
     if not query.query_text.strip():
         return None, None, None
     try:
         fingerprint = str(embedder.fingerprint)
-        query_vector = embed_query(embedder, query.query_text)
+        # Scrubbed like the stored documents: not even a loopback server sees a credential.
+        query_vector = embed_query(embedder, embedding_text(query.query_text))
         kinds = ("approved_memory", "distilled_summary") + (("raw_transcript",) if query.allow_raw_transcript else ())
         dense = dense_candidates(conn, query_vector, fingerprint, kinds, limit=settings.embedder.dense_candidates)
     except Exception as exc:
@@ -95,17 +97,20 @@ def _dense_list(conn, query: RecallQuery, settings, embedder, calibrations):
 
 
 def retrieve(conn, query: RecallQuery, settings, calibrations, *, embedder=None, reranker=None,
-             allow_cache_writes: bool = False, keep=None) -> Retrieval:
+             allow_cache_writes: bool = False, keep=None, require_calibration: bool = True) -> Retrieval:
     """Rank, fuse the optional dense list, rescore and select with the active mode's calibration.
 
     ``keep`` filters ranked candidates (retention policy, constitution) before
     adapters and selection. The recall hooks and the evaluator share this
-    pipeline, so a fixture measures exactly what a session receives.
+    pipeline, so a fixture measures exactly what a session receives. Only the
+    evaluator and calibration, which compute the embedder mode's threshold,
+    pass ``require_calibration=False``.
     """
     dense = query_vector = fallback = None
     adapter_settings = settings
     if settings.embedder.enabled:
-        dense, query_vector, fallback = _dense_list(conn, query, settings, embedder, calibrations)
+        dense, query_vector, fallback = _dense_list(conn, query, settings, embedder, calibrations,
+                                                    require_calibration=require_calibration)
         if query_vector is None:
             # Nothing dense contributes: no second embedder call, lexical scores stay.
             adapter_settings = _without_embedder(settings)

@@ -116,7 +116,7 @@ def stored_vector(conn, document_id: str, content_sha256: str, fingerprint: str,
 
 
 def dense_candidates(conn, query_vector, fingerprint: str, allowed_kinds, limit: int = 200) -> list[tuple[str, float]]:
-    """Scan current-revision vectors of one fingerprint; return ``(document_id, cosine)`` descending.
+    """Scan current-revision vectors of one fingerprint; return positive ``(document_id, cosine)`` descending.
 
     Only rows whose ``(document_id, content_sha256)`` matches a current
     recall document of an allowed kind are read, so orphaned or stale vectors
@@ -146,7 +146,8 @@ def dense_candidates(conn, query_vector, fingerprint: str, allowed_kinds, limit:
                 continue
         # math.sumprod is 3.12+; the runtime supports 3.11.
         cosine = sum(map(mul, query, vector))
-        if math.isfinite(cosine):
+        # A vector orthogonal to or pointing away from the query is no evidence.
+        if math.isfinite(cosine) and cosine > 0:
             scored.append((document_id, cosine))
     scored.sort(key=lambda item: (-item[1], item[0]))
     return scored[:limit]

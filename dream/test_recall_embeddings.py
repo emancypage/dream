@@ -95,7 +95,8 @@ def test_dense_candidates_rank_current_documents_by_cosine(tmp_path):
     store_vector(conn, "s", "sha-s", FINGERPRINT, [0.9, 0.1, 0.0])
     conn.commit()
     results = dense_candidates(conn, [2.0, 0.0, 0.0], FINGERPRINT, KINDS)
-    assert [doc_id for doc_id, _ in results] == ["a", "s", "b", "c", "d"]
+    # d is orthogonal to the query: no evidence, no candidate.
+    assert [doc_id for doc_id, _ in results] == ["a", "s", "b", "c"]
     assert results[0][1] == pytest.approx(1.0)
     assert results[2][1] == pytest.approx(0.6)
     assert dense_candidates(conn, [1.0, 0.0, 0.0], FINGERPRINT, KINDS, limit=2) == results[:2]
