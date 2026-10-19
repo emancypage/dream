@@ -10,6 +10,29 @@ def _settings():
     return RecallSettings(True, False, False, True, 6000, 4000, 1800, 1200, "", "", AdapterSettings(False, "none", False), AdapterSettings(False, "none", False))
 
 
+def test_packaged_session_budget_keeps_character_and_recalled_memory(tmp_path):
+    from config import load_config
+    from recall_context import compose_hook_context
+    from recall_hooks import install_hooks
+
+    settings = load_config(tmp_path / "config.toml").recall_settings()
+    character = "# Trusted character\n" + "x" * 11980
+    memory = "[Dream recall]\n" + "m" * 6000
+    combined, reason = compose_hook_context(
+        memory, character, settings.session_start_budget_codepoints,
+        settings.session_start_additional_context_limit,
+    )
+    assert reason is None
+    assert combined.startswith(character)
+    assert "[Dream recall]" in combined
+    assert len(combined.encode("utf-8")) <= 18000
+
+    hooks_path = tmp_path / "hooks.json"
+    install_hooks(hooks_path)
+    hook = json.loads(hooks_path.read_text())["hooks"]["SessionStart"][0]["hooks"][0]
+    assert len(combined.encode("utf-8")) <= hook["additionalContextLimit"]
+
+
 def test_parse_hook_payload_and_exact_success_json():
     query = parse_hook_payload("UserPromptSubmit", {"session_id": "s", "prompt": "hello", "cwd": "/tmp", "repository_roots": ["/tmp"]})
     assert query.hook_event == "prompt"

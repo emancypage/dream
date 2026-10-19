@@ -458,6 +458,17 @@ context limit can be smaller than the file-rendering budget. A character block
 which cannot fit is omitted with a diagnostic; the constitution is never cut.
 The flag defaults to false. Review any changed hook definition before trusting it.
 
+Session-start context defaults to an 18,000-byte budget when character injection
+is enabled. This budget holds the complete character block and recalled memory.
+The default character rendering budget is 12,000 codepoints. Plain English
+character blocks of that size leave about 6,000 bytes for recall; other scripts
+can require more bytes. A character block that exceeds the combined budget is
+omitted in full. Both `recall.session_start_budget_codepoints` and
+`recall.session_start_additional_context_limit` default to `18000`, and generated
+Codex session-start hooks use `additionalContextLimit = 18000`. Explicit local
+configuration overrides the packaged defaults. Prompt-recall budgets are
+unchanged.
+
 Character data flow is explicit. Extraction sends a bounded visible task window,
 the original assistant response, the following correction, and the constitution
 to the extraction provider. Regeneration sends the bounded original task window
