@@ -140,6 +140,16 @@ def test_embedder_failure_is_counted_not_hidden(tmp_path):
     assert report.breakdown_dict()["lexical_plus_embedder"]["all"]["fallback_count"] == 3
 
 
+def test_reserved_aggregate_language_is_rejected(tmp_path):
+    from dream import open_db
+    fixture = _language_fixture(tmp_path)
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["queries"][0]["language"] = "all"
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="reserved"):
+        evaluate_fixture_file(fixture, open_db(tmp_path / "dream.db"), _settings())
+
+
 def test_untagged_public_queries_are_grouped(tmp_path):
     from dream import open_db
     report = evaluate_fixture_file(Path(__file__).parent / "fixtures/recall/public.json", open_db(tmp_path / "dream.db"), _settings())
@@ -173,6 +183,27 @@ def test_calibration_refuses_any_fixture_under_repository_fixtures(tmp_path):
     link.symlink_to(fixtures / "recall" / "public.json")
     with pytest.raises(ValueError, match="public evaluation fixtures cannot be used for calibration"):
         calibrate_fixture_file(link, conn, "lexical")
+
+
+def test_recall_calibrate_cli_never_opens_the_live_database(tmp_path, capsys):
+    import argparse
+
+    from config import load_config
+    from dream import cmd_recall_calibrate
+
+    db_dir = tmp_path / "store"
+    db_dir.mkdir()
+    db_dir.chmod(0o555)
+    try:
+        rc = cmd_recall_calibrate(argparse.Namespace(
+            fixtures=_language_fixture(tmp_path), db=db_dir / "dream.db", mode="lexical", output=None,
+            config=load_config(tmp_path / "missing.toml"),
+        ))
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out)["mode"] == "lexical"
+        assert list(db_dir.iterdir()) == []
+    finally:
+        db_dir.chmod(0o755)
 
 
 def test_recall_eval_cli_by_language_adds_breakdown_only_on_request(tmp_path, capsys):

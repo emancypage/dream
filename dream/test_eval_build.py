@@ -180,17 +180,73 @@ def test_limit_samples_both_document_kinds_and_keeps_full_corpus(store):
     assert fixture["generator"]["sampled_documents"] == 2
 
 
-def test_provider_failure_skips_only_that_document(store, monkeypatch):
+def test_provider_failure_skips_only_that_document(store, monkeypatch, capsys):
     def flaky(stage, prompt, schema, **kwargs):
         store.calls.append(prompt)
         if len(store.calls) == 1:
-            raise ProviderError("offline")
+            raise ProviderError("offline: The API project uses PostgreSQL")
+        if len(store.calls) == 2:
+            raise TimeoutError("slow")
         return SimpleNamespace(output=_answers(stage, prompt, schema), provider="fake", model="fake-model")
 
     monkeypatch.setattr(eval_build, "generate", flaky)
     fixture = eval_build.build_eval_fixture(store.conn, store.root, config=store.cfg, output=store.tmp / "private.json")
-    assert fixture["generator"]["failed_documents"] == 1
-    assert len({query["relevant"][0] for query in fixture["queries"]}) == 2
+    assert fixture["generator"]["failed_documents"] == 2
+    assert fixture["generator"]["failures"] == {"ProviderError": 1, "TimeoutError": 1}
+    assert len({query["relevant"][0] for query in fixture["queries"]}) == 1
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 2
+    assert "ProviderError" in lines[0] and "TimeoutError" in lines[1]
+    assert not any("offline" in line or "PostgreSQL" in line or "slow" in line for line in lines)
+
+
+def test_successful_run_records_no_failures(store):
+    fixture = eval_build.build_eval_fixture(store.conn, store.root, config=store.cfg, output=store.tmp / "private.json")
+    assert fixture["generator"]["failures"] == {}
+
+
+def test_constitution_source_is_excluded_like_the_indexer_excludes_it(store):
+    constitution = Path(store.cfg.data["character"]["constitution_path"]).expanduser()
+    constitution.parent.mkdir(parents=True)
+    constitution.write_text("Constitution body: speak like a pirate.", encoding="utf-8")
+    (store.root / "persona.md").symlink_to(constitution)
+    synchronize_recall_documents(store.conn, store.root, include_raw_transcripts=False, constitution_path=None)
+    assert store.conn.execute("SELECT COUNT(*) FROM recall_documents WHERE source_path='persona.md'").fetchone()[0] == 1
+    fixture = eval_build.build_eval_fixture(store.conn, store.root, config=store.cfg, output=store.tmp / "private.json")
+    assert "persona.md" not in {document["source_path"] for document in fixture["documents"]}
+    assert not any("pirate" in call.prompt for call in store.calls)
+
+
+def test_unusable_output_directory_is_refused_before_any_call(store):
+    blocker = store.tmp / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(ValueError, match="not a directory"):
+        eval_build.build_eval_fixture(store.conn, store.root, config=store.cfg, output=blocker / "private.json")
+    locked = store.tmp / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        with pytest.raises(ValueError, match="not writable"):
+            eval_build.build_eval_fixture(store.conn, store.root, config=store.cfg, output=locked / "private.json")
+    finally:
+        locked.chmod(0o700)
+    assert not store.calls
+
+
+def test_calibration_never_restores_rows_changed_after_the_build(store):
+    output = store.tmp / "private.json"
+    eval_build.build_eval_fixture(store.conn, store.root, config=store.cfg, output=output)
+    web = stable_document_id("approved_memory", "memory:web.md")
+    api = stable_document_id("approved_memory", "memory:api.md")
+    store.conn.execute("DELETE FROM recall_documents WHERE id=?", (web,))
+    store.conn.execute("UPDATE recall_documents SET text='edited after the build' WHERE id=?", (api,))
+    store.conn.commit()
+    before = store.conn.execute("SELECT * FROM recall_documents ORDER BY id").fetchall()
+    rc = dream.cmd_recall_calibrate(argparse.Namespace(fixtures=str(output), db=store.tmp / "dream.db", mode="lexical",
+                                                       output=None, config=store.cfg))
+    assert rc == 0
+    assert store.conn.execute("SELECT * FROM recall_documents ORDER BY id").fetchall() == before
+    assert store.conn.execute("SELECT COUNT(*) FROM recall_documents WHERE id=?", (web,)).fetchone()[0] == 0
 
 
 def test_fixture_is_written_privately_to_the_default_path(store):
@@ -280,6 +336,29 @@ def test_eval_build_cli_refuses_an_empty_recall_index(store, capsys):
     assert "recall index" in capsys.readouterr().err
     assert not store.calls
     assert not (store.tmp / "cli" / "private.json").exists()
+
+
+def test_eval_build_cli_reports_unusable_output_without_calls(store, capsys):
+    (store.tmp / "blocker").write_text("not a directory", encoding="utf-8")
+    assert dream.cmd_eval_build(_cli_args(store, limit=1, output=str(store.tmp / "blocker" / "private.json"))) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("eval-build: ") and "Traceback" not in err
+    assert not store.calls
+
+
+def test_eval_build_cli_reports_invalid_retention_policy(store, capsys):
+    (store.root / POLICY_FILE).write_text('{"text_markers": [""]}', encoding="utf-8")
+    assert dream.cmd_eval_build(_cli_args(store, limit=1)) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("eval-build: ") and "Traceback" not in err
+    assert not store.calls
+
+
+def test_eval_build_cli_reports_missing_database(store, capsys):
+    missing = store.tmp / "absent" / "dream.db"
+    assert dream.cmd_eval_build(_cli_args(store, limit=1, db=missing)) == 2
+    assert capsys.readouterr().err.startswith("eval-build: ")
+    assert not missing.exists() and not store.calls
 
 
 def test_eval_build_cli_reports_provider_failures(store, monkeypatch):

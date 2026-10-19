@@ -127,6 +127,9 @@ def _run_queries(data: dict, conn, settings: RecallSettings, calibration: dict, 
     """Run every fixture query once and keep per-query evidence for aggregation."""
     outcomes: list[dict] = []
     for item in data["queries"]:
+        language = str(item.get("language") or UNTAGGED_LANGUAGE)
+        if language == ALL_LANGUAGES:
+            raise ValueError(f"fixture query language {ALL_LANGUAGES!r} is reserved for the aggregate slice")
         query = _query(item, settings)
         started = time.perf_counter()
         candidates = rank_lexical(conn, query)
@@ -141,7 +144,7 @@ def _run_queries(data: dict, conn, settings: RecallSettings, calibration: dict, 
         selected_ids = [candidate.document.id for candidate in selected]
         relevant = _relevant(item)
         outcomes.append({
-            "language": str(item.get("language") or UNTAGGED_LANGUAGE),
+            "language": language,
             "latency": latency,
             "selected_ids": selected_ids,
             "relevant": relevant,

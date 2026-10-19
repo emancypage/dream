@@ -1061,11 +1061,17 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
-def cmd_recall_eval(args: argparse.Namespace) -> int:
-    from recall_eval import evaluate_fixture_file
+def _open_ephemeral_eval_db() -> sqlite3.Connection:
+    """In-memory database for fixture runs: fixture rows never reach the live index."""
     conn = sqlite3.connect(":memory:")
     conn.executescript((ROOT / "schema.sql").read_text(encoding="utf-8"))
     _migrate(conn)
+    return conn
+
+
+def cmd_recall_eval(args: argparse.Namespace) -> int:
+    from recall_eval import evaluate_fixture_file
+    conn = _open_ephemeral_eval_db()
     report = evaluate_fixture_file(args.fixtures, conn, args.config.recall_settings())
     conn.close()
     result = report.to_dict()
@@ -1079,9 +1085,10 @@ def cmd_eval_build(args: argparse.Namespace) -> int:
     from eval_build import build_eval_fixture, collect_eval_documents, default_output_path
     output = Path(args.output).expanduser() if args.output else default_output_path()
     memory_root = args.config.memory_root
-    # Read-only, and tolerant of a nightly writer's active WAL.
-    conn = _open_curation_readonly(Path(args.db))
+    conn = None
     try:
+        # Read-only, and tolerant of a nightly writer's active WAL.
+        conn = _open_curation_readonly(Path(args.db))
         _corpus, candidates = collect_eval_documents(conn, memory_root, config=args.config)
         if not candidates:
             print("eval-build: the recall index has no approved memories or distilled summaries to ask about; "
@@ -1091,16 +1098,16 @@ def cmd_eval_build(args: argparse.Namespace) -> int:
             print(f"Would ask the configured distill provider for questions about {len(candidates)} documents "
                   f"(one call each). Pass --limit N to cap, or --yes to proceed.")
             return 2
-        try:
-            fixture = build_eval_fixture(
-                conn, memory_root, config=args.config, questions_per_file=args.questions_per_file,
-                languages=args.languages, limit=args.limit, output=output,
-            )
-        except ValueError as exc:
-            print(f"eval-build: {exc}", file=sys.stderr)
-            return 2
+        fixture = build_eval_fixture(
+            conn, memory_root, config=args.config, questions_per_file=args.questions_per_file,
+            languages=args.languages, limit=args.limit, output=output,
+        )
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        print(f"eval-build: {exc}", file=sys.stderr)
+        return 2
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
     generator = fixture["generator"]
     print(f"Wrote {len(fixture['queries'])} queries for {generator['sampled_documents']} documents "
           f"({len(fixture['documents'])} in the corpus) to {output}")
@@ -1113,7 +1120,13 @@ def cmd_eval_build(args: argparse.Namespace) -> int:
 
 def cmd_recall_calibrate(args: argparse.Namespace) -> int:
     from recall_eval import calibrate_fixture_file
-    record = calibrate_fixture_file(args.fixtures, open_db(args.db), args.mode)
+    # Calibrate on an in-memory copy of the fixture: a stale or now-excluded
+    # fixture row must never be re-inserted into the live recall index.
+    conn = _open_ephemeral_eval_db()
+    try:
+        record = calibrate_fixture_file(args.fixtures, conn, args.mode)
+    finally:
+        conn.close()
     result = {
         "mode": record.mode,
         "calibration_version": record.calibration_version,

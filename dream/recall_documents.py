@@ -40,6 +40,21 @@ class SyncReport:
     raw_included: int = 0
 
 
+def is_retained_document(row: dict, *, policy, memory_root, constitution_path) -> bool:
+    """Return whether retention policy and the constitution guard allow a document row.
+
+    The single predicate for indexing and for the private eval builder, so the
+    two can never disagree about what is excluded.
+    """
+    from character.safety import is_constitution_source
+    return not (
+        is_constitution_source(row["source_path"], memory_root=memory_root, constitution_path=constitution_path)
+        or policy.excludes(source_path=row["source_path"], project_slug=row["project_slug"], text=row["text"])
+        or (row["source_kind"] == "approved_memory" and memory_root is not None
+            and policy.excludes_memory_path(memory_root, row["source_path"]))
+    )
+
+
 def stable_document_id(kind: str, locator: str) -> str:
     """Return the stable UUIDv5 identity for one (kind, locator) pair."""
     return str(uuid.uuid5(_DOCUMENT_NAMESPACE, f"{kind}:{locator}"))
@@ -301,14 +316,7 @@ def synchronize_recall_documents(
 
     policy = load_retention_policy(memory_root)
     def retained(row):
-        from character.safety import is_constitution_source
-        return not (
-            is_constitution_source(row["source_path"], memory_root=memory_root, constitution_path=constitution_path)
-            or
-            policy.excludes(source_path=row["source_path"], project_slug=row["project_slug"], text=row["text"])
-            or (row["source_kind"] == "approved_memory" and memory_root is not None
-                and policy.excludes_memory_path(memory_root, row["source_path"]))
-        )
+        return is_retained_document(row, policy=policy, memory_root=memory_root, constitution_path=constitution_path)
     memory_rows = [row for row in memory_rows if retained(row)]
     distilled_rows = [row for row in distilled_rows if retained(row)]
     transcript_rows = [row for row in transcript_rows if retained(row)]

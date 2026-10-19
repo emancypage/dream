@@ -1,8 +1,9 @@
 """Build a private, held-out recall fixture from the user's own memory store.
 
 The corpus is the current ``approved_memory`` and ``distilled_summary`` rows of
-``recall_documents``, copied verbatim so ``recall-calibrate``'s upsert of the
-fixture documents leaves the live index unchanged. The provider configured for
+``recall_documents``, copied verbatim so the fixture mirrors the live index.
+Evaluation and calibration load it into an in-memory database and never write
+it back to the live one. The provider configured for
 the ``distill`` stage writes natural questions for a sample of those documents
 in each requested language; each question's ``relevant`` list holds the
 document it was written from. Documents the local retention policy excludes
@@ -18,10 +19,12 @@ import itertools
 import json
 import os
 import re
+import sys
 import tempfile
 from pathlib import Path
 
 from backend import generate
+from recall_documents import is_retained_document
 from recall_scrub import scrub_text
 from retention_policy import RetentionPolicy, load_retention_policy
 
@@ -97,16 +100,6 @@ def question_schema(languages: tuple[str, ...]) -> dict:
     }
 
 
-def _retained(row: dict, policy: RetentionPolicy, memory_root: Path, constitution_path) -> bool:
-    # The same predicate synchronize_recall_documents applies before indexing.
-    from character.safety import is_constitution_source
-    return not (
-        is_constitution_source(row["source_path"], memory_root=memory_root, constitution_path=constitution_path)
-        or policy.excludes(source_path=row["source_path"], project_slug=row["project_slug"], text=row["text"])
-        or (row["source_kind"] == "approved_memory" and policy.excludes_memory_path(memory_root, row["source_path"]))
-    )
-
-
 def collect_eval_documents(conn, memory_root, *, config, policy: RetentionPolicy | None = None) -> tuple[list[dict], list[dict]]:
     """Return ``(corpus, candidates)``: every retained document, and the ones to ask about in sampling order.
 
@@ -126,7 +119,8 @@ def collect_eval_documents(conn, memory_root, *, config, policy: RetentionPolicy
             "WHERE source_kind IN ('approved_memory', 'distilled_summary')"
         ).fetchall()
     ]
-    rows = [row for row in rows if _retained(row, policy, memory_root, constitution_path)]
+    rows = [row for row in rows if is_retained_document(
+        row, policy=policy, memory_root=memory_root, constitution_path=constitution_path)]
     corpus = sorted(rows, key=lambda row: (row["source_kind"], row["source_path"], row["id"]))
     by_kind = [
         sorted((row for row in corpus if row["source_kind"] == kind and row["source_path"] != _INDEX_FILE),
@@ -174,19 +168,29 @@ def _fixture_document(row: dict) -> dict:
     return {key: row[key] for key in _DOCUMENT_COLUMNS}
 
 
-def write_private_json(path: Path, data: dict) -> None:
-    """Atomically write ``data`` as a 0600 file; directories this creates are 0700."""
+def prepare_output_directory(path) -> Path:
+    """Create missing parent directories as 0700 and require a writable directory."""
     path = Path(path).expanduser()
     missing = []
     directory = path.parent
     while not directory.exists():
         missing.append(directory)
         directory = directory.parent
+    if not directory.is_dir():
+        raise ValueError(f"output directory is not a directory: {directory}")
     for directory in reversed(missing):
         directory.mkdir(mode=0o700, exist_ok=True)
         directory.chmod(0o700)
     if path == default_output_path():
         path.parent.chmod(0o700)
+    if not os.access(path.parent, os.W_OK | os.X_OK):
+        raise ValueError(f"output directory is not writable: {path.parent}")
+    return path
+
+
+def write_private_json(path: Path, data: dict) -> None:
+    """Atomically write ``data`` as a 0600 file; directories this creates are 0700."""
+    path = prepare_output_directory(path)
     payload = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
@@ -205,8 +209,9 @@ def build_eval_fixture(conn, memory_root, *, config, questions_per_file=3, langu
                        output=None) -> dict:
     """Ask the distill provider for held-out questions and write the private fixture.
 
-    A failed provider call skips that one document and is counted in
-    ``generator.failed_documents``; configuration errors raise before any call.
+    A failed provider call skips that one document; ``generator.failures``
+    counts failures by exception class. Configuration, policy and output-path
+    errors raise before any call.
     """
     languages = validate_languages(languages)
     output = check_output_path(output if output is not None else default_output_path())
@@ -220,15 +225,19 @@ def build_eval_fixture(conn, memory_root, *, config, questions_per_file=3, langu
     policy = load_retention_policy(memory_root)
     corpus, candidates = collect_eval_documents(conn, memory_root, config=config, policy=policy)
     sampled = candidates if limit is None else candidates[:limit]
+    prepare_output_directory(output)
     schema = question_schema(languages)
     queries: list[dict] = []
-    failed = 0
-    for row in sampled:
+    failures: dict[str, int] = {}
+    for index, row in enumerate(sampled, 1):
         try:
             result = generate("distill", _prompt(row, languages, questions_per_file, policy), schema, config=config)
-        except Exception:
+        except Exception as exc:
             # One unavailable or malformed answer must not discard the whole run.
-            failed += 1
+            # Only the class name is reported: messages may quote document text.
+            name = type(exc).__name__
+            failures[name] = failures.get(name, 0) + 1
+            print(f"eval-build: question call {index} of {len(sampled)} failed: {name}", file=sys.stderr)
             continue
         answers = result.output if isinstance(result.output, dict) else {}
         for language in languages:
@@ -251,7 +260,8 @@ def build_eval_fixture(conn, memory_root, *, config, questions_per_file=3, langu
             "languages": list(languages),
             "questions_per_file": questions_per_file,
             "sampled_documents": len(sampled),
-            "failed_documents": failed,
+            "failed_documents": sum(failures.values()),
+            "failures": dict(sorted(failures.items())),
         },
         "documents": [_fixture_document(row) for row in corpus],
         "queries": queries,
