@@ -103,6 +103,27 @@ def test_apply_patch_requires_a_replacement_unless_deletion_is_allowed(tmp_path)
     assert "Rollbacks" not in result
 
 
+@pytest.mark.parametrize("find", [
+    "Deploys run from the build host.\nRollbacks need the on-call lead.\n",
+    BODY,
+    "\nDeploys run from the build host.\nRollbacks need the on-call lead.\n",
+])
+def test_apply_patch_refuses_to_empty_a_file(tmp_path, find):
+    target = tmp_path / "deploy.md"
+    target.write_text(BODY, encoding="utf-8")
+    with pytest.raises(PatchError, match="would empty the file; propose remove"):
+        apply_patch(target, find, "", expected_sha=_sha(target), allow_empty=True)
+    with pytest.raises(PatchError, match="would empty the file"):
+        apply_patch(target, find, "  \n", expected_sha=_sha(target), allow_empty=True)
+    assert target.read_text(encoding="utf-8") == BODY
+
+
+def test_patch_text_refuses_to_empty_a_file_without_frontmatter():
+    with pytest.raises(PatchError, match="would empty the file"):
+        patch_text("Only line.\n", "Only line.", "", allow_empty=True)
+    assert patch_text("Keep.\nDrop.\n", "Drop.\n", "", allow_empty=True) == "Keep.\n"
+
+
 def test_patch_text_rejects_an_empty_find():
     with pytest.raises(PatchError, match="empty"):
         patch_text("abc", "", "x")
@@ -246,6 +267,16 @@ def test_accept_allows_an_empty_replacement_only_for_a_stated_deletion(tmp_path,
     assert "Rollbacks" not in (root / "deploy.md").read_text(encoding="utf-8")
 
 
+def test_accept_defers_a_patch_that_would_empty_the_file(tmp_path, capsys):
+    root, db_path, config = _fixture(tmp_path, find="Deploys run from the build host.\nRollbacks need the on-call lead.\n",
+                                     body="", rationale="delete obsolete file")
+    assert _suggestions(root, db_path, config, "accept", id=1) == 3
+    assert (root / "deploy.md").read_text(encoding="utf-8") == BODY
+    assert _row(db_path)[0] == "pending"
+    out = capsys.readouterr().out
+    assert "deferred #1:" in out and "would empty the file" in out
+
+
 def test_merge_turns_a_patch_into_a_full_body_update(tmp_path):
     root, db_path, config = _fixture(tmp_path, find="the")
     merged = tmp_path / "merged.md"
@@ -284,6 +315,17 @@ def test_review_yes_applies_a_patch(tmp_path):
     assert dream.cmd_review(args) == 0
     assert "the release runner" in (root / "deploy.md").read_text(encoding="utf-8")
     assert _row(db_path)[0] == "accepted"
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_review_yes_labels_a_deferred_patch_with_its_reason(tmp_path, capsys, dry_run):
+    root, db_path, config = _fixture(tmp_path, find="the")
+    args = argparse.Namespace(db=db_path, memory=str(root), config=config, yes=True, dry_run=dry_run)
+    assert dream.cmd_review(args) == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if "(#1)" in line]
+    assert lines == ["  [patch ] deploy.md  (#1) — deferred: find text matches 2 places"]
+    assert (root / "deploy.md").read_text(encoding="utf-8") == BODY
+    assert _row(db_path)[0] == "pending"
 
 
 def test_interactive_review_shows_the_patched_diff(tmp_path, monkeypatch, capsys):

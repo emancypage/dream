@@ -1053,6 +1053,13 @@ def cmd_review(args: argparse.Namespace) -> int:
             tgt = memory_root / target_path
             old = tgt.read_text(encoding="utf-8") if tgt.exists() else ""
             new_content = _resolved_body(kind, old, body)
+            if kind == "patch":
+                find, patch_rationale = _patch_fields(conn, sug_id)
+                try:
+                    patch_text(old, find or "", body or "", allow_empty=states_deletion(patch_rationale))
+                except PatchError as exc:
+                    print(f"  [{kind:<6}] {target_path}  (#{sug_id}) — deferred: {exc}")
+                    continue
             noop = (kind == "index" and new_content == old)
             tag = "no-op" if noop else ("would apply" if dry else "applied")
             print(f"  [{kind:<6}] {target_path}  (#{sug_id}) — {tag}")

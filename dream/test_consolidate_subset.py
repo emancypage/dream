@@ -231,10 +231,30 @@ def _names(paths):
     return [path.name for path in paths]
 
 
+def _select(conn, root, batch, settings, **kwargs):
+    return C.select_memory_subset(conn, root, batch, settings, constitution_path=None, **kwargs)
+
+
+def test_select_memory_subset_requires_the_constitution_path(tmp_path):
+    root, conn = _store(tmp_path, sync=False)
+    with pytest.raises(TypeError):
+        C.select_memory_subset(conn, root, [], ConsolidateSettings(mode="subset"))
+
+
+def test_subset_query_groups_are_capped(tmp_path, monkeypatch):
+    root, conn = _store(tmp_path)
+    calls = []
+    real = C.rank_lexical
+    monkeypatch.setattr(C, "rank_lexical", lambda conn, query, **kw: calls.append(query) or real(conn, query))
+    findings = [" ".join(f"term{i}x{j}" for j in range(30)) for i in range(20)]
+    _select(conn, root, _batch(*findings), ConsolidateSettings(mode="subset", subset_files=3))
+    assert len(calls) == C.MAX_SUBSET_QUERIES == 8
+
+
 def test_subset_always_contains_memory_md_first(tmp_path):
     root, conn = _store(tmp_path)
     for batch in (_batch("kw03 needs a new owner"), _batch("nothing matches here"), []):
-        selected = C.select_memory_subset(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=5))
+        selected = _select(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=5))
         assert _names(selected)[0] == "MEMORY.md"
         assert all(path.parent == root for path in selected)
 
@@ -243,7 +263,7 @@ def test_subset_takes_top_ranked_files_up_to_subset_files_without_counting_memor
     root, conn = _store(tmp_path)
     mentioned = [3, 7, 11, 19, 23, 29, 31, 41]
     batch = _batch(*(f"Decision about kw{i:02d} rollout" for i in mentioned))
-    selected = C.select_memory_subset(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=5))
+    selected = _select(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=5))
     names = _names(selected)
     assert names[0] == "MEMORY.md"
     topics = names[1:]
@@ -256,14 +276,14 @@ def test_subset_query_is_not_cut_off_after_the_first_findings(tmp_path):
     root, conn = _store(tmp_path)
     filler = [f"Filler finding {' '.join(f'noise{i}{j}' for j in range(10))}" for i in range(6)]
     batch = _batch(*filler, "The kw57 migration finished.")
-    selected = C.select_memory_subset(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=3))
+    selected = _select(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=3))
     assert _topic_name(57) in _names(selected)
 
 
 def test_subset_uses_preferences_projects_decisions_and_user_facts(tmp_path):
     root, conn = _store(tmp_path)
     for index, field in ((5, "preferences"), (6, "projects"), (8, "decisions"), (9, "user_facts")):
-        selected = C.select_memory_subset(
+        selected = _select(
             conn, root, _batch(f"About kw{index:02d}", field=field), ConsolidateSettings(mode="subset", subset_files=2)
         )
         assert _topic_name(index) in _names(selected)
@@ -279,14 +299,14 @@ def test_slug_matches_use_stems_and_frontmatter_names_with_word_boundaries(tmp_p
     root, conn = _store(tmp_path, sync=False, extra=extra)
     batch = _batch("See project_api_gateway.md for the routes.", "The Grafana-Boards page moved.",
                    field="decisions")
-    selected = _names(C.select_memory_subset(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=1)))
+    selected = _names(_select(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=1)))
     assert selected == ["MEMORY.md", "project_api_gateway.md", "reference_dashboards.md"]
 
 
 def test_slug_mentioned_files_are_included_beyond_the_cap(tmp_path):
     root, conn = _store(tmp_path)
     batch = _batch("kw01 and kw02 changed", "project_topic_44.md and project_topic_45.md moved too")
-    selected = _names(C.select_memory_subset(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=1)))
+    selected = _names(_select(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=1)))
     topics = [name for name in selected if name.startswith("project_topic_")]
     assert len(topics) == 3
     assert {_topic_name(44), _topic_name(45)} <= set(topics)
@@ -296,11 +316,11 @@ def test_slug_mentioned_files_are_included_beyond_the_cap(tmp_path):
 def test_slug_matches_scan_every_finding_field_and_the_summary(tmp_path):
     root, conn = _store(tmp_path)
     for field in ("references", "open_threads"):
-        selected = _names(C.select_memory_subset(
+        selected = _names(_select(
             conn, root, _batch("project_topic_44.md", field=field), ConsolidateSettings(mode="subset", subset_files=1)
         ))
         assert _topic_name(44) in selected
-    selected = _names(C.select_memory_subset(
+    selected = _names(_select(
         conn, root, _batch(summary="touched topic-45 again"), ConsolidateSettings(mode="subset", subset_files=1)
     ))
     assert _topic_name(45) in selected
@@ -309,7 +329,7 @@ def test_slug_matches_scan_every_finding_field_and_the_summary(tmp_path):
 def test_missing_recall_index_falls_back_to_memory_md_and_slug_matches(tmp_path):
     root, conn = _store(tmp_path, sync=False)
     batch = _batch("kw10 changed", "project_topic_12.md was renamed")
-    selected = _names(C.select_memory_subset(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=5)))
+    selected = _names(_select(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=5)))
     assert selected == ["MEMORY.md", _topic_name(12)]
 
 
@@ -318,7 +338,7 @@ def test_broken_recall_tables_fall_back_without_crashing(tmp_path, capsys):
     conn.execute("DROP TABLE recall_documents_fts")
     conn.execute("DROP TABLE recall_documents")
     batch = _batch("kw10 changed", "project_topic_12.md was renamed")
-    selected = _names(C.select_memory_subset(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=5)))
+    selected = _names(_select(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=5)))
     assert selected == ["MEMORY.md", _topic_name(12)]
     assert "recall index unavailable" in capsys.readouterr().err
 
@@ -328,7 +348,7 @@ def test_stale_index_entries_for_deleted_or_excluded_files_are_skipped(tmp_path)
     (root / _topic_name(20)).unlink()
     (root / ".dream-retention.json").write_text(json.dumps({"memory_paths": [_topic_name(21)]}), encoding="utf-8")
     batch = _batch("kw20 and kw21 and kw22 changed", "project_topic_21.md too")
-    selected = _names(C.select_memory_subset(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=5)))
+    selected = _names(_select(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=5)))
     assert _topic_name(20) not in selected
     assert _topic_name(21) not in selected
     assert _topic_name(22) in selected
@@ -346,7 +366,7 @@ def test_dense_hook_is_off_without_an_embedder_and_fails_open(tmp_path):
             raise RuntimeError("server down")
 
     assert C._dense_for_subset(conn, "kw03", BrokenEmbedder()) is None
-    selected = C.select_memory_subset(
+    selected = _select(
         conn, root, _batch("kw03 moved"), ConsolidateSettings(mode="subset", subset_files=2), embedder=BrokenEmbedder()
     )
     assert _topic_name(3) in _names(selected)
@@ -439,7 +459,12 @@ def test_subset_mode_with_an_empty_batch_makes_no_provider_call(tmp_path, monkey
     assert conn.execute("SELECT COUNT(*) FROM consolidation_runs").fetchone()[0] == 0
 
 
-def test_new_on_an_existing_target_becomes_update_against_the_current_body(tmp_path, monkeypatch):
+def _appended(root, name, addition):
+    current = (root / name).read_text(encoding="utf-8")
+    return current.rstrip("\n") + "\n\n" + addition
+
+
+def test_new_on_an_existing_unshown_target_becomes_an_append_update(tmp_path, monkeypatch):
     output = {"suggestions": [_suggestion("new", "project_topic_30.md", "---\nname: topic-30\n---\n\nRewritten.\n",
                                           "fresh topic")]}
     root, conn, _, suggestions = _run_subset(tmp_path, monkeypatch, output)
@@ -447,11 +472,50 @@ def test_new_on_an_existing_target_becomes_update_against_the_current_body(tmp_p
     assert s.kind == "update"
     assert s.target_existed is True
     assert s.base_sha256 == _sha(root / "project_topic_30.md")
-    assert s.body == "---\nname: topic-30\n---\n\nRewritten.\n"
+    assert s.body == _appended(root, "project_topic_30.md", "Rewritten.\n")
+    assert s.body.startswith((root / "project_topic_30.md").read_text(encoding="utf-8").rstrip("\n"))
     assert s.rationale.startswith("fresh topic")
     assert "converted from `new`" in s.rationale
-    row = conn.execute("SELECT kind, base_sha256, target_existed FROM suggestions").fetchone()
-    assert row == ("update", _sha(root / "project_topic_30.md"), 1)
+    assert "appended: target not shown to the model" in s.rationale
+    row = conn.execute("SELECT kind, body, base_sha256, target_existed FROM suggestions").fetchone()
+    assert row == ("update", s.body, _sha(root / "project_topic_30.md"), 1)
+
+
+def test_new_on_an_existing_shown_target_becomes_a_plain_update(tmp_path, monkeypatch):
+    body = "---\nname: topic-04\n---\n\nRewritten after reading it.\n"
+    output = {"suggestions": [_suggestion("new", "project_topic_04.md", body, "fresh topic")]}
+    root, _, _, suggestions = _run_subset(tmp_path, monkeypatch, output)
+    [s] = suggestions
+    assert (s.kind, s.body, s.base_sha256) == ("update", body, _sha(root / "project_topic_04.md"))
+    assert "converted from `new`" in s.rationale
+    assert "appended" not in s.rationale
+
+
+def test_update_on_an_unshown_target_appends_and_never_drops_its_body(tmp_path, monkeypatch):
+    output = {"suggestions": [
+        _suggestion("update", "project_topic_32.md", "---\nname: topic-32\n---\n\nOnly new facts.\n"),
+        _suggestion("update", "project_topic_33.md", "---\nname: topic-33\n---\n\n"),
+    ]}
+    root, _, _, suggestions = _run_subset(tmp_path, monkeypatch, output)
+    [s] = suggestions
+    assert s.target_path == "project_topic_32.md"
+    assert s.body == _appended(root, "project_topic_32.md", "Only new facts.\n")
+    assert "BODY-32" in s.body
+    assert s.base_sha256 == _sha(root / "project_topic_32.md")
+    assert "appended: target not shown to the model" in s.rationale
+
+
+def test_subset_drops_suggestions_for_existing_files_that_are_not_eligible(tmp_path, monkeypatch, capsys):
+    _fixed_clock(monkeypatch)
+    root, conn = _store(tmp_path, extra={"project_private.md": "---\nname: private\n---\n\nPRIVATE-MARKER notes.\n"})
+    (root / ".dream-retention.json").write_text(json.dumps({"text_markers": ["PRIVATE-MARKER"]}), encoding="utf-8")
+    _distill(conn, "s-1", {"projects": ["kw04 moved"]})
+    monkeypatch.setattr(C, "generate", lambda *a, **k: SimpleNamespace(output={"suggestions": [
+        _suggestion("update", "project_private.md", "---\nname: private\n---\n\nHarmless addition.\n"),
+    ]}, provider="fake", model="fake"))
+    assert C.consolidate(conn, root, config=_config(tmp_path, root, mode="subset", subset_files=1)) == []
+    assert conn.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0] == 0
+    assert "dropped update project_private.md" in capsys.readouterr().out
 
 
 def test_new_on_an_existing_target_is_matched_by_its_normalized_name(tmp_path, monkeypatch):
@@ -479,20 +543,100 @@ def test_subset_drops_every_remove_and_logs_it(tmp_path, monkeypatch, capsys):
     assert "dropped remove project_topic_30.md" in out
 
 
-def test_subset_drops_patches_for_files_not_shown_and_flags_blind_updates(tmp_path, monkeypatch, capsys):
+def test_subset_drops_patches_for_files_not_shown_and_keeps_shown_updates(tmp_path, monkeypatch, capsys):
+    shown_body = "---\nname: topic-05\n---\n\nSeen and rewritten.\n"
     output = {"suggestions": [
         _suggestion("patch", "project_topic_31.md", "new text", find="Facts about kw31"),
         _suggestion("update", "project_topic_32.md", "---\nname: topic-32\n---\n\nOnly new facts.\n"),
-        _suggestion("update", "project_topic_05.md", "---\nname: topic-05\n---\n\nSeen and rewritten.\n"),
+        _suggestion("update", "project_topic_05.md", shown_body),
         _suggestion("patch", "project_topic_04.md", "Facts about kw04, now owned by ops", find="Facts about kw04"),
     ]}
     _, _, _, suggestions = _run_subset(tmp_path, monkeypatch, output)
     by_target = {s.target_path: s for s in suggestions}
     assert set(by_target) == {"project_topic_32.md", "project_topic_05.md", "project_topic_04.md"}
-    assert "not shown in full" in by_target["project_topic_32.md"].rationale
-    assert by_target["project_topic_05.md"].rationale == "because"
+    assert "appended: target not shown to the model" in by_target["project_topic_32.md"].rationale
+    assert (by_target["project_topic_05.md"].body, by_target["project_topic_05.md"].rationale) == (shown_body, "because")
     assert by_target["project_topic_04.md"].kind == "patch"
     assert "dropped patch project_topic_31.md" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("find", [
+    "Facts about kw04 and nothing else. Body marker BODY-04.\n",
+    "---\nname: topic-04\ndescription: about kw04\nmetadata:\n  type: project\n---\n\n"
+    "Facts about kw04 and nothing else. Body marker BODY-04.\n",
+])
+def test_subset_drops_a_patch_that_would_empty_a_file(tmp_path, monkeypatch, capsys, find):
+    output = {"suggestions": [_suggestion("patch", "project_topic_04.md", "", "delete obsolete file", find=find)]}
+    root, conn, _, suggestions = _run_subset(tmp_path, monkeypatch, output)
+    assert suggestions == []
+    assert conn.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0] == 0
+    out = capsys.readouterr().out
+    assert "dropped patch project_topic_04.md" in out and "would empty the file" in out
+
+
+def test_subset_never_persists_retention_excluded_find_text(tmp_path, monkeypatch):
+    _fixed_clock(monkeypatch)
+    root, conn = _store(tmp_path, extra={"project_topic_04.md": (
+        "---\nname: topic-04\n---\n\nFacts about kw04. Old SECRET-X note.\n")})
+    (root / ".dream-retention.json").write_text(json.dumps({"text_markers": ["SECRET-Y"]}), encoding="utf-8")
+    _distill(conn, "s-1", {"projects": ["kw04 moved"]})
+    monkeypatch.setattr(C, "generate", lambda *a, **k: SimpleNamespace(output={"suggestions": [
+        _suggestion("patch", "project_topic_04.md", "Old note.", find="Old SECRET-Y note."),
+        _suggestion("update", "project_topic_04.md", "---\nname: topic-04\n---\n\nFine.\n", find="SECRET-Y"),
+    ]}, provider="fake", model="fake"))
+    suggestions = C.consolidate(conn, root, config=_config(tmp_path, root, mode="subset", subset_files=2))
+    assert [(s.kind, s.find) for s in suggestions] == [("update", None)]
+    stored = json.dumps(conn.execute("SELECT * FROM suggestions").fetchall())
+    previews = "".join(path.read_text(encoding="utf-8") for path in root.glob(".suggestions/*.md"))
+    assert "SECRET-Y" not in stored and "SECRET-Y" not in previews
+
+
+def test_subset_base_sha_is_the_hash_of_the_bytes_the_model_saw(tmp_path, monkeypatch, capsys):
+    real_select = C.select_memory_subset
+
+    def select_then_edit(*args, **kwargs):
+        (args[1] / "project_topic_04.md").write_text("---\nname: topic-04\n---\n\nEdited by hand.\n", encoding="utf-8")
+        return real_select(*args, **kwargs)
+
+    monkeypatch.setattr(C, "select_memory_subset", select_then_edit)
+    output = {"suggestions": [
+        _suggestion("update", "project_topic_04.md", "---\nname: topic-04\n---\n\nModel rewrite.\n")]}
+    root, conn, calls, suggestions = _run_subset(tmp_path, monkeypatch, output)
+    assert "BODY-04" in calls[0]["prompt"]
+    [s] = suggestions
+    assert s.base_sha256 != _sha(root / "project_topic_04.md")
+    conn.close()
+    db_path = tmp_path / "accept.db"
+    write = dream.open_db(db_path)
+    write.execute(
+        "INSERT INTO suggestions(kind, target_path, body, rationale, status, base_sha256, target_existed) "
+        "VALUES (?, ?, ?, ?, 'pending', ?, 1)", (s.kind, s.target_path, s.body, s.rationale, s.base_sha256))
+    write.commit()
+    write.close()
+    args = argparse.Namespace(db=db_path, memory=str(root), suggestions_cmd="accept", id=1,
+                              config=_config(tmp_path, root))
+    assert dream.cmd_suggestions(args) == 3
+    assert "conflict #1" in capsys.readouterr().out
+    assert "Edited by hand." in (root / "project_topic_04.md").read_text(encoding="utf-8")
+
+
+def test_preview_names_never_collide_with_an_existing_preview(tmp_path, monkeypatch):
+    _fixed_clock(monkeypatch)
+    root, conn = _store(tmp_path)
+    _distill(conn, "s-1", {"projects": ["kw04 and kw05 were reorganised"]})
+    sug_dir = root / ".suggestions"
+    sug_dir.mkdir()
+    taken = sug_dir / "2026-10-19-002-update-project-topic-04.md"
+    taken.write_text("someone else's preview", encoding="utf-8")
+    monkeypatch.setattr(C, "generate", lambda *a, **k: SimpleNamespace(output={"suggestions": [
+        _suggestion("update", "project_topic_04.md", "---\nname: topic-04\n---\n\nA.\n"),
+        _suggestion("update", "project_topic_05.md", "---\nname: topic-05\n---\n\nB.\n"),
+    ]}, provider="fake", model="fake"))
+    C.consolidate(conn, root, config=_config(tmp_path, root, mode="subset", subset_files=3))
+    assert taken.read_text(encoding="utf-8") == "someone else's preview"
+    names = [row[0] for row in conn.execute("SELECT sug_file FROM suggestions ORDER BY id")]
+    assert names == ["2026-10-19-003-update-project-topic-04.md", "2026-10-19-004-update-project-topic-05.md"]
+    assert all((sug_dir / name).exists() for name in names)
 
 
 def test_subset_patch_is_persisted_with_find_text_and_a_unified_diff_preview(tmp_path, monkeypatch):

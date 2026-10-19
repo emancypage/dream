@@ -15,6 +15,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from backend import generate
 from config import ConsolidateSettings, DreamConfig, load_config
@@ -103,6 +104,20 @@ class PatchError(ValueError):
     """A `patch` cannot apply as proposed; the suggestion stays pending with this reason."""
 
 
+class PatchEmptiesFile(PatchError):
+    """A patch would leave nothing but frontmatter; deleting a file is a `remove`."""
+
+
+def _without_frontmatter(text: str) -> str:
+    """The text after a leading YAML frontmatter block, or the whole text."""
+    if text.startswith("---\n"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            line_end = text.find("\n", end + 4)
+            return "" if line_end == -1 else text[line_end + 1:]
+    return text
+
+
 _DELETION = re.compile(r"\b(?:delet(?:e|es|ed|ing|ion)|remov(?:e|es|ed|ing|al))\b", re.IGNORECASE)
 
 
@@ -126,7 +141,8 @@ def patch_text(text: str, find: str, replace: str, *, allow_empty: bool = False)
 
     Pure: callers decide what to do with the result. The target must already be
     NFC so that matching never rewrites bytes outside the replaced span; zero or
-    several matches are ambiguous and never applied as a best guess.
+    several matches are ambiguous and never applied as a best guess. A patch
+    may not empty a file: that would bypass the `remove` grace period.
     """
     if not find:
         raise PatchError("patch find text is empty")
@@ -138,7 +154,10 @@ def patch_text(text: str, find: str, replace: str, *, allow_empty: bool = False)
         raise PatchError(f"find text matches {count} places")
     if not replace and not allow_empty:
         raise PatchError("empty replacement without a stated deletion in the rationale")
-    return text.replace(needle, unicodedata.normalize("NFC", replace), 1)
+    patched = text.replace(needle, unicodedata.normalize("NFC", replace), 1)
+    if not _without_frontmatter(patched).strip():
+        raise PatchEmptiesFile("patch would empty the file; propose remove")
+    return patched
 
 
 REMOVE_GRACE_DAYS = 21
@@ -155,8 +174,9 @@ def _drop_fresh_removals(
     passes no mtimes, and LLMs are unreliable at date arithmetic) — so the "untouched
     for N days" half of the staleness criterion is enforced here, after the model
     responds, rather than asked of the model. A held-back suggestion isn't lost: the
-    audit re-runs against the full store every night, so a genuinely-closed topic is
-    simply re-proposed once its mtime crosses the grace period.
+    audit re-runs against the full store (every night in full mode, weekly through
+    `dream audit` in subset mode), so a genuinely-closed topic is simply re-proposed
+    once its mtime crosses the grace period.
     """
     now = dt.datetime.now(dt.timezone.utc)
     kept: list[Suggestion] = []
@@ -192,11 +212,19 @@ def render_memory_file(name: str, body: str, *, annotation: str | None = None) -
     return f"{header}\n{body}\n"
 
 
-def memory_files(memory_root: Path, *, constitution_path) -> list[tuple[Path, str]]:
-    """Top-level memory files a model may see, with their bodies, sorted by name.
+class MemoryFile(NamedTuple):
+    path: Path
+    body: str
+    sha256: str  # of the exact bytes `body` was decoded from
+
+
+def memory_files(memory_root: Path, *, constitution_path) -> list[MemoryFile]:
+    """Top-level memory files a model may see, sorted by name.
 
     Skips the constitution, hidden files and anything the local retention policy
-    excludes, exactly as the full-mode memory store does.
+    excludes, exactly as the full-mode memory store does. Each body is decoded
+    (with read_text's newline handling) from the same bytes its SHA-256 covers,
+    so a suggestion's base SHA always matches what the model was shown.
     """
     if not memory_root.exists():
         return []
@@ -208,17 +236,19 @@ def memory_files(memory_root: Path, *, constitution_path) -> list[tuple[Path, st
             continue
         if f.name.startswith("."):
             continue
-        body = f.read_text(encoding='utf-8')
+        data = f.read_bytes()
+        body = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
         if policy.excludes(source_path=f.name, text=body) or policy.excludes_memory_path(memory_root, f.name):
             continue
-        files.append((f, body))
+        files.append(MemoryFile(f, body, hashlib.sha256(data).hexdigest()))
     return files
 
 
 def read_current_memory(memory_root: Path, *, constitution_path) -> str:
     if not memory_root.exists():
         return "(memory root is empty — no files yet)"
-    chunks = [render_memory_file(f.name, body) for f, body in memory_files(memory_root, constitution_path=constitution_path)]
+    chunks = [render_memory_file(entry.path.name, entry.body)
+              for entry in memory_files(memory_root, constitution_path=constitution_path)]
     blob = "\n---\n".join(chunks)
     if len(blob) > MAX_CURRENT_MEMORY_CHARS:
         print(
@@ -307,6 +337,9 @@ INDEX_FILE = "MEMORY.md"
 _QUERY_FIELDS = ("preferences", "projects", "decisions", "user_facts")
 # build_safe_fts_match reads only the first 32 terms of a query.
 _FTS_QUERY_TERMS = 32
+# Bounds the rank_lexical calls one subset selection makes; slug matching still
+# reads every finding.
+MAX_SUBSET_QUERIES = 8
 _INDEX_LINK = re.compile(r"\]\(([^)]+\.md)\)")
 _FRONTMATTER_NAME = re.compile(r"^name:\s*['\"]?([^'\"\n]+?)['\"]?\s*$", re.MULTILINE)
 
@@ -416,8 +449,8 @@ def select_memory_subset(
     batch: list[tuple[str, str, dict, str]],
     settings: ConsolidateSettings,
     *,
+    constitution_path,
     embedder=None,
-    constitution_path=None,
 ) -> list[Path]:
     """Memory files to show a subset consolidation, MEMORY.md first.
 
@@ -427,9 +460,13 @@ def select_memory_subset(
     back to MEMORY.md and the slug matches; it never fails the run.
     """
     files = memory_files(memory_root, constitution_path=constitution_path)
-    by_name = {path.name: (path, body) for path, body in files}
+    by_name = {entry.path.name: entry for entry in files}
     selected: list[str] = [INDEX_FILE] if INDEX_FILE in by_name else []
     groups = _query_groups(_batch_findings(batch, _QUERY_FIELDS))
+    if len(groups) > MAX_SUBSET_QUERIES:
+        print(f"subset selection: ranking by the first {MAX_SUBSET_QUERIES} of {len(groups)} finding groups",
+              file=sys.stderr)
+        groups = groups[:MAX_SUBSET_QUERIES]
     if groups:
         try:
             selected += _ranked_memory_files(conn, groups, set(by_name), settings.subset_files, embedder)
@@ -437,16 +474,17 @@ def select_memory_subset(
             print(f"subset selection: recall index unavailable ({type(exc).__name__}); "
                   "using MEMORY.md and slug matches", file=sys.stderr)
     mention_text = "\n".join(_batch_findings(batch)).casefold()
-    for path, body in files:
-        if path.name not in selected and any(_mentions(mention_text, slug) for slug in _slugs(path, body)):
-            selected.append(path.name)
-    return [by_name[name][0] for name in selected]
+    for entry in files:
+        name = entry.path.name
+        if name not in selected and any(_mentions(mention_text, slug) for slug in _slugs(entry.path, entry.body)):
+            selected.append(name)
+    return [by_name[name].path for name in selected]
 
 
-def _other_memory_lines(files: list[tuple[Path, str]], shown: list[str]) -> str:
+def _other_memory_lines(files: list[MemoryFile], shown: list[str]) -> str:
     """Index lines (or bare names) of every eligible file the model is not shown."""
-    hidden = [path.name for path, _body in files if path.name not in shown and path.name != INDEX_FILE]
-    index_body = next((body for path, body in files if path.name == INDEX_FILE), "")
+    hidden = [entry.path.name for entry in files if entry.path.name not in shown and entry.path.name != INDEX_FILE]
+    index_body = next((entry.body for entry in files if entry.path.name == INDEX_FILE), "")
     lines: list[str] = []
     listed: set[str] = set()
     for line in index_body.splitlines():
@@ -480,29 +518,34 @@ def _patch_mode_suggestions(
     *,
     allowed: tuple[str, ...],
     shown: set[str],
-    base_state: dict[str, tuple[bool, str | None]],
+    files: list[MemoryFile],
     policy,
     projects: dict,
     subset: bool,
 ) -> list[Suggestion]:
     """Host checks for subset and audit output (full mode keeps its own loop).
 
-    Only `allowed` kinds survive. A patch needs a nonempty `find`, an existing
-    target the model was shown in full, and never targets MEMORY.md, whose index
-    lines are only appended. In subset mode a `new` on an existing file becomes
-    an `update` against that file's current SHA.
+    Only `allowed` kinds survive, and only for eligible memory files or new
+    paths. Base SHAs come from the bytes the model was shown. A patch needs a
+    nonempty `find`, a target shown in full, never targets MEMORY.md (index
+    lines are only appended) and may not empty a file. In subset mode a `new`
+    on an existing file becomes an `update`, and a full-body `update` of a file
+    the model was not shown becomes an append to its current body.
     """
     root = memory_root.resolve()
     index = root / INDEX_FILE
+    eligible = {entry.path.name: entry for entry in files}
     shown_paths = {(memory_root / name).resolve() for name in shown}
     out: list[Suggestion] = []
     for s in payload.get("suggestions", []):
         kind = s.get("kind", "new")
         target_path = s.get("target_path", "")
+        body = s.get("body", "")
         resolved = (memory_root / target_path).resolve()
         # Look the target up by its normalized name, so "./topic.md" still counts as existing.
         state_key = resolved.relative_to(root).as_posix() if resolved.is_relative_to(root) else target_path
         rationale = s.get("rationale", "")
+        find = (s.get("find") or None) if kind == "patch" else None
         if resolved == (memory_root / POLICY_FILE).resolve():
             continue
         if kind not in allowed:
@@ -514,12 +557,15 @@ def _patch_mode_suggestions(
         ):
             continue
         if kind != "remove" and (
-            policy.excludes(source_path=target_path, text=s.get("body", "") + "\n" + rationale)
+            policy.excludes(source_path=target_path, text=body + "\n" + rationale + "\n" + (find or ""))
             or policy.excludes_memory_path(memory_root, target_path)
         ):
             continue
-        existed, base_hash = base_state.get(state_key, (False, None))
-        find = (s.get("find") or None) if kind == "patch" else None
+        entry = eligible.get(state_key)
+        existed = entry is not None
+        if not existed and resolved.exists():
+            _drop(kind, target_path, "target exists but is not an eligible memory file")
+            continue
         if kind in ("patch", "remove") and resolved not in shown_paths:
             _drop(kind, target_path, "target was not shown in full")
             continue
@@ -533,18 +579,30 @@ def _patch_mode_suggestions(
             if not existed:
                 _drop(kind, target_path, "patch target does not exist")
                 continue
+            try:
+                patch_text(entry.body, find, body, allow_empty=states_deletion(rationale))
+            except PatchEmptiesFile as exc:
+                _drop(kind, target_path, str(exc))
+                continue
+            except PatchError:
+                pass  # kept: the preview explains it and accepting defers it
         if subset and kind == "new" and existed:
             kind = "update"
             rationale += f" (host: converted from `new` because {target_path} already exists)"
         if subset and kind == "update" and existed and resolved not in shown_paths:
-            rationale += " (host: this file was not shown in full to the model; compare with its current body)"
+            addition = _without_frontmatter(body).strip("\n")
+            if not addition.strip():
+                _drop(kind, target_path, "nothing to append to a file the model was not shown")
+                continue
+            body = entry.body.rstrip("\n") + "\n\n" + addition + "\n"
+            rationale += " (host: appended: target not shown to the model)"
         out.append(Suggestion(
             kind=kind,
             target_path=target_path,
-            body=s.get("body", ""),
+            body=body,
             rationale=rationale,
             source_sessions=s.get("source_sessions", []),
-            base_sha256=base_hash,
+            base_sha256=entry.sha256 if entry else None,
             target_existed=existed,
             find=find,
         ))
@@ -569,10 +627,11 @@ def _consolidate_subset(
         return []
     constitution_path = cfg.data["character"]["constitution_path"]
     files = memory_files(memory_root, constitution_path=constitution_path)
-    bodies = {path.name: body for path, body in files}
-    shown = [path.name for path in select_memory_subset(
-        conn, memory_root, batch, settings, embedder=embedder, constitution_path=constitution_path)]
-    base_state = _memory_state(memory_root)
+    bodies = {entry.path.name: entry.body for entry in files}
+    selected = select_memory_subset(
+        conn, memory_root, batch, settings, constitution_path=constitution_path, embedder=embedder)
+    # Only files read above are shown, so every shown body matches its base SHA.
+    shown = [path.name for path in selected if path.name in bodies]
     current_memory = _bounded_memory_blob(
         [render_memory_file(name, bodies[name]) for name in shown], "memory subset")
     prompt = (
@@ -590,7 +649,7 @@ def _consolidate_subset(
     res = generate("consolidate", prompt, CONSOLIDATE_PATCH_SCHEMA, model=model, config=cfg)
     suggestions = _patch_mode_suggestions(
         res.output, memory_root, allowed=("new", "update", "index", "patch"), shown=set(shown),
-        base_state=base_state, policy=policy, projects=projects, subset=True,
+        files=files, policy=policy, projects=projects, subset=True,
     )
     suggestions = _drop_fresh_removals(suggestions, memory_root)
     _persist(conn, memory_root, suggestions, batch=batch, provider=res.provider, model=res.model)
@@ -600,21 +659,21 @@ def _consolidate_subset(
 # ------------------------------------------------------------ weekly audit
 
 
-def audit_chunks(files: list[tuple[Path, str]], limit: int) -> list[list[tuple[Path, str]]]:
+def audit_chunks(files: list[MemoryFile], limit: int) -> list[list[MemoryFile]]:
     """Pack whole files, in order, into chunks whose rendered size stays within limit.
 
     A file larger than the limit gets a chunk to itself and is never split.
     """
-    chunks: list[list[tuple[Path, str]]] = []
-    current: list[tuple[Path, str]] = []
+    chunks: list[list[MemoryFile]] = []
+    current: list[MemoryFile] = []
     size = 0
-    for path, body in files:
-        rendered = len(render_memory_file(path.name, body))
+    for entry in files:
+        rendered = len(render_memory_file(entry.path.name, entry.body))
         added = rendered + (len("\n---\n") if current else 0)
         if current and size + added > limit:
             chunks.append(current)
             current, size, added = [], 0, rendered
-        current.append((path, body))
+        current.append(entry)
         size += added
     if current:
         chunks.append(current)
@@ -636,12 +695,11 @@ def run_audit(
     """
     cfg = config or load_config()
     files = memory_files(memory_root, constitution_path=cfg.data["character"]["constitution_path"])
-    topics = [(path, body) for path, body in files if path.name != INDEX_FILE]
+    topics = [entry for entry in files if entry.path.name != INDEX_FILE]
     if not topics:
         return []
-    index_body = next((body for path, body in files if path.name == INDEX_FILE), "(MEMORY.md does not exist)")
+    index_body = next((entry.body for entry in files if entry.path.name == INDEX_FILE), "(MEMORY.md does not exist)")
     policy = load_retention_policy(memory_root)
-    base_state = _memory_state(memory_root)
     chunks = audit_chunks(topics, MAX_CURRENT_MEMORY_CHARS // 4)
     template = AUDIT_PROMPT_PATH.read_text(encoding="utf-8")
     suggestions: list[Suggestion] = []
@@ -656,14 +714,15 @@ def run_audit(
             .replace("{{chunk_file_count}}", str(len(chunk)))
             .replace("{{file_count}}", str(len(topics)))
             .replace("{{memory_index}}", index_body)
-            .replace("{{current_memory}}", "\n---\n".join(render_memory_file(path.name, body) for path, body in chunk))
+            .replace("{{current_memory}}",
+                     "\n---\n".join(render_memory_file(entry.path.name, entry.body) for entry in chunk))
         )
         prompt += policy.context()
         res = generate("audit", prompt, CONSOLIDATE_PATCH_SCHEMA, model=model, config=cfg)
         provider, used_model = res.provider, res.model
         suggestions += _patch_mode_suggestions(
-            res.output, memory_root, allowed=("remove", "patch"), shown={path.name for path, _ in chunk},
-            base_state=base_state, policy=policy, projects={}, subset=False,
+            res.output, memory_root, allowed=("remove", "patch"), shown={entry.path.name for entry in chunk},
+            files=files, policy=policy, projects={}, subset=False,
         )
     suggestions = _drop_fresh_removals(suggestions, memory_root)
     _persist(conn, memory_root, suggestions, batch=[], provider=provider, model=used_model)
@@ -792,10 +851,9 @@ def _persist(
                 "INSERT INTO consolidation_runs(run_id, provider, model) VALUES (?, ?, ?)",
                 (run_id, provider, model),
             )
-            for i, s in enumerate(suggestions, start=start_n):
+            n = start_n
+            for s in suggestions:
                 slug = re.sub(r"[^a-z0-9-]+", "-", s.target_path.lower().replace(".md", "")).strip("-")[:50] or "suggestion"
-                fname = f"{today}-{i:03d}-{s.kind}-{slug}.md"
-                fpath = sug_dir / fname
                 header = (
                     f"<!-- dream suggestion\n"
                     f"kind: {s.kind}\n"
@@ -806,8 +864,21 @@ def _persist(
                     f"-->\n\n"
                 )
                 preview = _patch_preview(memory_root, s) if s.kind == "patch" else (s.body or "(remove)")
-                fpath.write_text(header + preview, encoding="utf-8")
-                written.append(fpath)
+                # Exclusive create: a preview left by an earlier or concurrent run is never
+                # overwritten and two rows never share a preview file.
+                while True:
+                    fname = f"{today}-{n:03d}-{s.kind}-{slug}.md"
+                    fpath = sug_dir / fname
+                    try:
+                        handle = open(fpath, "x", encoding="utf-8")
+                    except FileExistsError:
+                        n += 1
+                        continue
+                    written.append(fpath)
+                    with handle:
+                        handle.write(header + preview)
+                    break
+                n += 1
                 conn.execute(
                     "INSERT INTO suggestions(kind, target_path, body, rationale, source_sessions, "
                     "sug_file, base_sha256, target_existed, consolidation_run_id, find_text) "

@@ -1,5 +1,6 @@
 """Tests for consolidate's memory-store prompt budget (read_current_memory)."""
 import contextlib
+import hashlib
 import io
 import sys
 import tempfile
@@ -64,5 +65,6 @@ def test_memory_files_apply_the_read_current_memory_filters():
         (root / "sub" / "nested.md").write_text("nested", encoding="utf-8")
         (root / ".dream-retention.json").write_text(json.dumps({"memory_paths": ["excluded.md"]}), encoding="utf-8")
         files = memory_files(root, constitution_path=None)
-        assert [(path.name, body) for path, body in files] == [("a.md", "a.md"), ("b.md", "b.md")]
-        assert all(path.parent == root for path, _body in files)
+        assert [(entry.path.name, entry.body) for entry in files] == [("a.md", "a.md"), ("b.md", "b.md")]
+        assert all(entry.path.parent == root for entry in files)
+        assert all(entry.sha256 == hashlib.sha256(entry.body.encode("utf-8")).hexdigest() for entry in files)

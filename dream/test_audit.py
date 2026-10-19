@@ -100,15 +100,15 @@ def test_audit_chunks_hold_whole_files_within_the_limit(tmp_path):
     (root / "project_huge.md").write_text("h" * 5_000, encoding="utf-8")
     files = C.memory_files(root, constitution_path=None)
     chunks = C.audit_chunks(files, 1_000)
-    names = [path.name for chunk in chunks for path, _body in chunk]
-    assert sorted(names) == sorted(path.name for path, _body in files)
+    names = [entry.path.name for chunk in chunks for entry in chunk]
+    assert sorted(names) == sorted(entry.path.name for entry in files)
     for chunk in chunks:
-        rendered = "\n---\n".join(C.render_memory_file(path.name, body) for path, body in chunk)
+        rendered = "\n---\n".join(C.render_memory_file(entry.path.name, entry.body) for entry in chunk)
         if len(chunk) > 1:
             assert len(rendered) <= 1_000
         else:
-            assert chunk[0][1] == (root / chunk[0][0].name).read_text(encoding="utf-8")
-    [huge_chunk] = [chunk for chunk in chunks if any(path.name == "project_huge.md" for path, _ in chunk)]
+            assert chunk[0].body == (root / chunk[0].path.name).read_text(encoding="utf-8")
+    [huge_chunk] = [chunk for chunk in chunks if any(entry.path.name == "project_huge.md" for entry in chunk)]
     assert len(huge_chunk) == 1
 
 
@@ -162,6 +162,53 @@ def test_audit_drops_suggestions_for_files_it_was_not_shown(tmp_path, monkeypatc
     conn = _db()
     assert C.run_audit(conn, root, config=_config(tmp_path, root)) == []
     assert conn.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0] == 0
+
+
+def test_audit_drops_a_patch_that_would_empty_a_file(tmp_path, monkeypatch, capsys):
+    root = _store(tmp_path, count=2)
+    body = "Topic 00 facts. Marker BODY-00.\n"
+    _fake(monkeypatch, lambda n, prompt: {"suggestions": [
+        _suggestion("patch", "project_topic_00.md", "", "delete obsolete file", find=body)]})
+    conn = _db()
+    assert C.run_audit(conn, root, config=_config(tmp_path, root)) == []
+    assert conn.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0] == 0
+    out = capsys.readouterr().out
+    assert "dropped patch project_topic_00.md" in out and "would empty the file" in out
+
+
+def test_audit_never_persists_retention_excluded_find_text(tmp_path, monkeypatch):
+    root = _store(tmp_path, count=2)
+    (root / ".dream-retention.json").write_text('{"text_markers": ["SECRET-Y"]}', encoding="utf-8")
+    _fake(monkeypatch, lambda n, prompt: {"suggestions": [
+        _suggestion("patch", "project_topic_00.md", "Topic 00 facts.", find="Topic 00 facts. SECRET-Y")]})
+    conn = _db()
+    assert C.run_audit(conn, root, config=_config(tmp_path, root)) == []
+    assert conn.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0] == 0
+    assert not list(root.glob(".suggestions/*.md"))
+
+
+def test_audit_base_sha_is_the_hash_of_the_bytes_the_model_saw(tmp_path, monkeypatch, capsys):
+    root = _store(tmp_path, count=2)
+    real_files = C.memory_files
+
+    def read_then_edit(*args, **kwargs):
+        files = real_files(*args, **kwargs)
+        (root / "project_topic_00.md").write_text("---\nname: topic-00\n---\n\nEdited by hand.\n", encoding="utf-8")
+        return files
+
+    monkeypatch.setattr(C, "memory_files", read_then_edit)
+    calls = _fake(monkeypatch, lambda n, prompt: {"suggestions": [
+        _suggestion("patch", "project_topic_00.md", "Topic 00 facts, revised.", find="Topic 00 facts.")]})
+    db_path = tmp_path / "dream.db"
+    conn = dream.open_db(db_path)
+    [s] = C.run_audit(conn, root, config=_config(tmp_path, root))
+    conn.close()
+    assert "BODY-00" in calls[0]["prompt"]
+    args = argparse.Namespace(db=db_path, memory=str(root), suggestions_cmd="accept", id=1,
+                              config=_config(tmp_path, root))
+    assert dream.cmd_suggestions(args) == 3
+    assert "conflict #1" in capsys.readouterr().out
+    assert "Edited by hand." in (root / "project_topic_00.md").read_text(encoding="utf-8")
 
 
 def test_audit_removals_keep_the_21_day_grace(tmp_path, monkeypatch):
