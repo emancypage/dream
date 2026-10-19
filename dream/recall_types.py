@@ -8,11 +8,21 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class AdapterSettings:
-    """Configuration of one optional recall adapter (embedder or reranker)."""
+    """Configuration of one optional recall adapter (embedder or reranker).
+
+    The connection fields after ``remote_data_egress`` are read by the
+    ``openai-compatible`` embedder only; the reranker table never sets them.
+    """
 
     enabled: bool
     type: str
     remote_data_egress: bool
+    base_url: str = "http://127.0.0.1:8081"
+    model: str = "bge-m3"
+    dimension: int = 1024
+    timeout_seconds: float = 1.5
+    dense_candidates: int = 200
+    api_key_env: str | None = None
 
 
 @dataclass(frozen=True)

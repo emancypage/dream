@@ -140,3 +140,61 @@ def test_codex_memories_config_existence_oserror_returns_read_error(tmp_path, mo
 
     assert not ok
     assert detail.startswith("Codex Memories configuration could not be read: ")
+
+
+def _embedder_check(tmp_path, body):
+    from config import load_config
+    from recall_context import recall_preflight
+    path = tmp_path / "config.toml"
+    path.write_text(body, encoding="utf-8")
+    checks = recall_preflight(load_config(path), tmp_path / "missing.db")
+    return next((ok, detail) for name, ok, detail in checks if name == "recall.embedder")
+
+
+def _embedder_table(url, **extra):
+    from test_recall_embedder_http import DIMENSION, MODEL
+    values = {"enabled": "true", "type": '"openai-compatible"', "base_url": f'"{url}"', "model": f'"{MODEL}"', "dimension": DIMENSION}
+    values.update(extra)
+    return "[recall.embedder]\n" + "".join(f"{key} = {value}\n" for key, value in values.items())
+
+
+def test_preflight_reports_a_disabled_embedder_without_network(tmp_path):
+    assert _embedder_check(tmp_path, "") == (True, "disabled")
+
+
+def test_preflight_reports_a_reachable_embedder_with_server_model_and_dimension(tmp_path):
+    from test_recall_embedder_http import DIMENSION, MODEL, FakeEmbeddingServer
+    server = FakeEmbeddingServer().start()
+    try:
+        ok, detail = _embedder_check(tmp_path, _embedder_table(server.url))
+        assert ok
+        assert detail.startswith("reachable") and MODEL in detail and f"dimension {DIMENSION}" in detail
+        # One probe string, never a document.
+        assert server.posted_inputs() == ["dream preflight probe"]
+    finally:
+        server.stop()
+
+
+def test_preflight_reports_an_unreachable_embedder(tmp_path):
+    from test_recall_embedder_http import refused_url
+    ok, detail = _embedder_check(tmp_path, _embedder_table(refused_url(), timeout_seconds=0.5))
+    assert not ok and detail.startswith("unreachable")
+
+
+def test_preflight_reports_a_server_model_mismatch_as_misconfigured(tmp_path):
+    from test_recall_embedder_http import FakeEmbeddingServer
+    server = FakeEmbeddingServer(model="bge-m3-q8").start()
+    try:
+        ok, detail = _embedder_check(tmp_path, _embedder_table(server.url))
+        assert not ok and detail.startswith("misconfigured") and "bge-m3-q8" in detail
+    finally:
+        server.stop()
+
+
+def test_preflight_reports_invalid_embedder_config_as_misconfigured(tmp_path):
+    ok, detail = _embedder_check(tmp_path, _embedder_table("http://127.0.0.1:8081", dimension=0))
+    assert not ok and detail.startswith("misconfigured") and "dimension" in detail
+    ok, detail = _embedder_check(tmp_path, _embedder_table("http://192.0.2.10:8081"))
+    assert not ok and detail.startswith("misconfigured") and "remote_data_egress" in detail
+    ok, detail = _embedder_check(tmp_path, '[recall.embedder]\nenabled = false\nbase_url = "http://evil.com@127.0.0.1:8081"\n')
+    assert not ok and detail.startswith("misconfigured")

@@ -91,6 +91,16 @@ calibration_path = "~/.config/dream/recall-calibration.json"
 enabled = false
 type = "none"
 remote_data_egress = false
+# A local OpenAI-compatible embedding server (llama-server --embedding or
+# Ollama). To use it set enabled = true and type = "openai-compatible", check
+# it with `dream preflight`, then run `dream embed`. A non-loopback base_url
+# needs remote_data_egress = true. api_key_env names an optional environment
+# variable holding a bearer token.
+base_url = "http://127.0.0.1:8081"
+model = "bge-m3"
+dimension = 1024
+timeout_seconds = 1.5
+dense_candidates = 200
 
 [recall.reranker]
 enabled = false

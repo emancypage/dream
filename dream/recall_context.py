@@ -8,15 +8,16 @@ import sqlite3
 import subprocess
 import time
 import tomllib
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from recall_events import POLICY_VERSION
-from recall_adapters import apply_optional_adapters
+from recall_adapters import AdapterError, EmbedderUnavailable, apply_optional_adapters, build_embedder, embed_query, embedder_fallback_reason
+from recall_embeddings import dense_candidates
 from recall_render import render_context
 from recall_query import rank_lexical
-from recall_select import select_recall_candidates
-from recall_types import RecallDiagnostics, RecallQuery, RecallResult
+from recall_select import calibration_for, select_recall_candidates
+from recall_types import RecallCandidate, RecallDiagnostics, RecallQuery, RecallResult
 from storage import open_db_readonly
 from retention_policy import load_retention_policy
 
@@ -48,27 +49,155 @@ def _load_calibrations(conn):
     }
 
 
+EMBEDDER_MODE = "lexical_plus_embedder"
+PREFLIGHT_PROBE = "dream preflight probe"
+
+
+@dataclass(frozen=True)
+class Retrieval:
+    """Ranked and selected candidates of one recall pipeline run."""
+
+    candidates: tuple[RecallCandidate, ...]
+    selected: tuple[RecallCandidate, ...]
+    mode: str
+    fallback_reason: str | None
+    calibration_version: str | None
+
+
+def _without_embedder(settings):
+    return replace(settings, embedder=replace(settings.embedder, enabled=False))
+
+
+def _dense_list(conn, query: RecallQuery, settings, embedder, calibrations):
+    """Return ``(dense, query_vector, fallback_reason)`` for an enabled embedder.
+
+    The query text is embedded at most once. The dense list is dropped
+    before any network call when ``lexical`` is calibrated but the embedder
+    mode is not, because fused scores are on another scale than the lexical
+    threshold. Every failure leaves ``dense`` None, so ranking stays lexical.
+    """
+    if embedder is None:
+        return None, None, "embedder-unavailable"
+    if "lexical" in calibrations and EMBEDDER_MODE not in calibrations:
+        return None, None, "embedder-uncalibrated"
+    if not query.query_text.strip():
+        return None, None, None
+    try:
+        fingerprint = str(embedder.fingerprint)
+        query_vector = embed_query(embedder, query.query_text)
+        kinds = ("approved_memory", "distilled_summary") + (("raw_transcript",) if query.allow_raw_transcript else ())
+        dense = dense_candidates(conn, query_vector, fingerprint, kinds, limit=settings.embedder.dense_candidates)
+    except Exception as exc:
+        return None, None, embedder_fallback_reason(exc)
+    if not dense:
+        return None, None, "embedder-no-vectors"
+    return dense, query_vector, None
+
+
+def retrieve(conn, query: RecallQuery, settings, calibrations, *, embedder=None, reranker=None,
+             allow_cache_writes: bool = False, keep=None) -> Retrieval:
+    """Rank, fuse the optional dense list, rescore and select with the active mode's calibration.
+
+    ``keep`` filters ranked candidates (retention policy, constitution) before
+    adapters and selection. The recall hooks and the evaluator share this
+    pipeline, so a fixture measures exactly what a session receives.
+    """
+    dense = query_vector = fallback = None
+    adapter_settings = settings
+    if settings.embedder.enabled:
+        dense, query_vector, fallback = _dense_list(conn, query, settings, embedder, calibrations)
+        if query_vector is None:
+            # Nothing dense contributes: no second embedder call, lexical scores stay.
+            adapter_settings = _without_embedder(settings)
+    candidates = rank_lexical(conn, query, dense=dense)
+    if keep is not None:
+        candidates = [candidate for candidate in candidates if keep(candidate)]
+    candidates, mode, adapter_fallback = apply_optional_adapters(
+        conn, query, candidates, adapter_settings, embedder=embedder, reranker=reranker,
+        allow_cache_writes=allow_cache_writes, query_vector=query_vector,
+    )
+    _threshold, version = calibration_for(calibrations, mode, query)
+    selected = select_recall_candidates(candidates, query, settings, calibrations, mode=mode)
+    return Retrieval(tuple(candidates), selected, mode, fallback or adapter_fallback, version)
+
+
 def run_context(conn, query: RecallQuery, settings, explain: bool = False, *, embedder=None, reranker=None, allow_cache_writes: bool = True, memory_root=None, constitution_path) -> RecallResult:
     started = time.perf_counter()
     policy = load_retention_policy(memory_root)
-    candidates = rank_lexical(conn, query)
     from character.safety import is_constitution_source
-    candidates = [candidate for candidate in candidates if not (
-        is_constitution_source(candidate.document.source_path, memory_root=memory_root, constitution_path=constitution_path)
-        or
-        policy.excludes(source_path=candidate.document.source_path,
-                        project_slug=candidate.document.project_slug, text=candidate.document.text)
-        or (candidate.document.source_kind == "approved_memory" and memory_root is not None
-            and policy.excludes_memory_path(memory_root, candidate.document.source_path))
-    )]
-    candidates, mode, fallback = apply_optional_adapters(
-        conn, query, candidates, settings, embedder=embedder, reranker=reranker, allow_cache_writes=allow_cache_writes,
+
+    def keep(candidate) -> bool:
+        return not (
+            is_constitution_source(candidate.document.source_path, memory_root=memory_root, constitution_path=constitution_path)
+            or
+            policy.excludes(source_path=candidate.document.source_path,
+                            project_slug=candidate.document.project_slug, text=candidate.document.text)
+            or (candidate.document.source_kind == "approved_memory" and memory_root is not None
+                and policy.excludes_memory_path(memory_root, candidate.document.source_path))
+        )
+
+    outcome = retrieve(
+        conn, query, settings, _load_calibrations(conn), embedder=embedder, reranker=reranker,
+        allow_cache_writes=allow_cache_writes, keep=keep,
     )
-    selected = select_recall_candidates(candidates, query, settings, _load_calibrations(conn))
-    rendered = render_context(selected, query.requested_codepoint_budget, query.query_text)
+    rendered = render_context(outcome.selected, query.requested_codepoint_budget, query.query_text)
     elapsed = int((time.perf_counter() - started) * 1000)
-    diagnostics = RecallDiagnostics(len(candidates), len(selected), fallback, len(rendered), elapsed, None)
-    return RecallResult(tuple(selected), rendered, mode, None, diagnostics)
+    diagnostics = RecallDiagnostics(len(outcome.candidates), len(outcome.selected), outcome.fallback_reason,
+                                    len(rendered), elapsed, outcome.calibration_version)
+    return RecallResult(outcome.selected, rendered, outcome.mode, outcome.calibration_version, diagnostics)
+
+
+def embedder_config_errors(config) -> tuple[str, ...]:
+    return tuple(error for error in config.optional_config_errors if "recall.embedder" in error)
+
+
+def configured_embedder(config):
+    """Build the configured embedder without contacting it: ``(embedder, problem)``.
+
+    ``(None, None)`` means the embedder is off. A problem means it was
+    requested but cannot be used (invalid configuration, or a non-loopback
+    URL without ``remote_data_egress``); callers then run lexical recall and
+    report the problem.
+    """
+    errors = embedder_config_errors(config)
+    raw = (config.data.get("recall") or {}).get("embedder")
+    requested = isinstance(raw, dict) and raw.get("enabled") is True
+    if errors:
+        return None, ("; ".join(errors) if requested else None)
+    try:
+        return build_embedder(config.recall_settings().embedder), None
+    except AdapterError as exc:
+        return None, str(exc)
+
+
+def embedder_preflight(config) -> tuple[bool, str]:
+    """Report the embedder: disabled, misconfigured, unreachable or reachable.
+
+    Reachability sends one fixed probe string, never a document.
+    """
+    errors = embedder_config_errors(config)
+    if errors:
+        return False, "misconfigured: " + "; ".join(errors)
+    settings = config.recall_settings().embedder
+    if not settings.enabled:
+        return True, "disabled"
+    try:
+        embedder = build_embedder(settings)
+    except AdapterError as exc:
+        return False, f"misconfigured: {exc}"
+    if embedder is None:
+        return True, f"adapter type {settings.type}"
+    try:
+        vectors = embedder.embed([PREFLIGHT_PROBE])
+    except EmbedderUnavailable as exc:
+        return False, f"unreachable: {exc}"
+    except AdapterError as exc:
+        return False, f"misconfigured: {exc}"
+    except Exception as exc:
+        return False, f"unreachable: {type(exc).__name__}"
+    model = embedder.server_model or f"{settings.model} (not reported by the server)"
+    scope = "remote" if embedder.remote_data_egress else "loopback"
+    return True, f"reachable: server model {model}, dimension {len(vectors[0])}, {scope}"
 
 
 def hook_success_json(hook_event_name: str, context: str) -> str:
@@ -147,8 +276,9 @@ def recall_preflight(config, db_path) -> list[tuple[str, bool, str]]:
             checks.append(("recall.index", False, str(exc)))
     else:
         checks.append(("recall.index", False, "database does not exist"))
-    for label, adapter in (("recall.embedder", config.recall_settings().embedder), ("recall.reranker", config.recall_settings().reranker)):
-        checks.append((label, not adapter.enabled or adapter.type == "none", "disabled" if not adapter.enabled else f"adapter type {adapter.type}"))
+    checks.append(("recall.embedder", *embedder_preflight(config)))
+    reranker = config.recall_settings().reranker
+    checks.append(("recall.reranker", not reranker.enabled or reranker.type == "none", "disabled" if not reranker.enabled else f"adapter type {reranker.type}"))
     executable = shutil.which("codex")
     version_ok = False
     detail = "codex executable not found"

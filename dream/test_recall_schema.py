@@ -195,6 +195,8 @@ def test_recall_tables_created_with_expected_columns(tmp_path):
         "adapter_fingerprint": {"notnull": 1, "pk": 3},
         "vector_json": {"notnull": 1, "pk": 0},
         "created_at": {"notnull": 1, "pk": 0},
+        "vector_blob": {"notnull": 0, "pk": 0},
+        "dimension": {"notnull": 0, "pk": 0},
     }
     conn.close()
 

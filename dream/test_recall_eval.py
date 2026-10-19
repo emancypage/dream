@@ -231,3 +231,89 @@ def test_recall_eval_parser_accepts_by_language(tmp_path, capsys, monkeypatch):
     rc = dream.main(["--config", str(tmp_path / "missing.toml"), "recall-eval", "--fixtures", str(_language_fixture(tmp_path)), "--by-language"])
     assert rc == 0
     assert "breakdown" in json.loads(capsys.readouterr().out)
+
+
+def test_embedder_mode_embeds_fixture_documents_into_the_eval_database(tmp_path):
+    from dream import open_db
+    embedder = KeywordEmbedder()
+    conn = open_db(tmp_path / "dream.db")
+    evaluate_fixture_file(_language_fixture(tmp_path), conn, _settings(), embedder=embedder)
+    assert conn.execute("SELECT COUNT(*) FROM recall_embeddings WHERE adapter_fingerprint='keyword-v1'").fetchone()[0] == 2
+
+
+def test_recall_eval_cli_reports_the_configured_embedder_mode(tmp_path, capsys):
+    import argparse
+
+    from config import load_config
+    from dream import cmd_recall_eval
+    from test_recall_embedder_http import DIMENSION, MODEL, FakeEmbeddingServer
+
+    server = FakeEmbeddingServer().start()
+    db_dir = tmp_path / "store"
+    db_dir.mkdir()
+    db_dir.chmod(0o555)
+    try:
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            "[recall.embedder]\nenabled = true\ntype = \"openai-compatible\"\n"
+            f"base_url = \"{server.url}\"\nmodel = \"{MODEL}\"\ndimension = {DIMENSION}\n", encoding="utf-8")
+        rc = cmd_recall_eval(argparse.Namespace(
+            fixtures=_language_fixture(tmp_path), db=db_dir / "dream.db", config=load_config(config_path), by_language=True,
+        ))
+        assert rc == 0
+        breakdown = json.loads(capsys.readouterr().out)["breakdown"]
+        assert set(breakdown) == {"lexical", "lexical_plus_embedder"}
+        assert breakdown["lexical"]["pl"]["recall_at_5"] == 0.0
+        assert breakdown["lexical_plus_embedder"]["pl"]["recall_at_5"] == 1.0
+        assert breakdown["lexical_plus_embedder"]["en"]["recall_at_5"] == 1.0
+        assert breakdown["lexical_plus_embedder"]["all"]["fallback_count"] == 0
+        posted = server.posted_inputs()
+        assert any("PostgreSQL migrations" in text for text in posted)
+        assert "jaka baza danych" in posted
+        assert list(db_dir.iterdir()) == []
+    finally:
+        db_dir.chmod(0o755)
+        server.stop()
+
+
+def test_recall_eval_cli_reports_lexical_only_when_the_embedder_is_misconfigured(tmp_path, capsys):
+    import argparse
+
+    from config import load_config
+    from dream import cmd_recall_eval
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[recall.embedder]\nenabled = true\ntype = "openai-compatible"\nbase_url = "http://192.0.2.10:8081"\n', encoding="utf-8")
+    rc = cmd_recall_eval(argparse.Namespace(fixtures=_language_fixture(tmp_path), db=tmp_path / "dream.db",
+                                            config=load_config(config_path), by_language=True))
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert set(json.loads(captured.out)["breakdown"]) == {"lexical"}
+    assert "remote_data_egress" in captured.err
+
+
+def test_embedder_mode_calibration_needs_an_embedder_and_sweeps_fused_scores(tmp_path):
+    from dream import open_db
+    fixture = _language_fixture(tmp_path)
+    with pytest.raises(ValueError, match="embedder"):
+        calibrate_fixture_file(fixture, open_db(tmp_path / "a.db"), "lexical_plus_embedder")
+    lexical = calibrate_fixture_file(fixture, open_db(tmp_path / "b.db"), "lexical")
+    embedder = KeywordEmbedder()
+    record = calibrate_fixture_file(fixture, open_db(tmp_path / "c.db"), "lexical_plus_embedder", embedder=embedder)
+    assert record.mode == "lexical_plus_embedder"
+    assert record.calibration_version != lexical.calibration_version
+    assert record.fixture_sha256 == lexical.fixture_sha256
+    assert embedder.calls > 0
+
+
+def test_recall_calibrate_cli_refuses_embedder_mode_without_an_embedder(tmp_path, capsys):
+    import argparse
+
+    from config import load_config
+    from dream import cmd_recall_calibrate
+
+    rc = cmd_recall_calibrate(argparse.Namespace(fixtures=_language_fixture(tmp_path), db=tmp_path / "dream.db",
+                                                 config=load_config(tmp_path / "missing.toml"), mode="lexical_plus_embedder", output=None))
+    assert rc == 2
+    assert "embedder" in capsys.readouterr().err
+    assert not (tmp_path / "dream.db").exists()

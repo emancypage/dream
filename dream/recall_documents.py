@@ -3,9 +3,12 @@
 Collects approved memory files, distilled summaries, and (optionally) raw
 transcripts into plain row lists, then in one write transaction upserts
 changed rows, removes stale rows for the source kinds that collected
-successfully, and repairs the external-content FTS index when it is missing,
+successfully, removes embedding vectors of document revisions that no longer
+exist, and repairs the external-content FTS index when it is missing,
 corrupt, or changed. Any collection, write, or FTS error rolls back and
-retains the previous complete database state. This module never prints to
+retains the previous complete database state. Embedding the synchronized
+documents is a separate step (``embed_recall_documents``) that runs after a
+successful sync, outside its transaction. This module never prints to
 stdout.
 """
 
@@ -19,6 +22,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from recall_embeddings import embedding_text, has_vector_blob, store_vector
 from retention_policy import load_retention_policy
 
 # One fixed namespace for every stable document ID, regardless of source kind.
@@ -53,6 +57,16 @@ def is_retained_document(row: dict, *, policy, memory_root, constitution_path) -
         or (row["source_kind"] == "approved_memory" and memory_root is not None
             and policy.excludes_memory_path(memory_root, row["source_path"]))
     )
+
+
+@dataclass
+class EmbedReport:
+    """Counters describing one embedding pass."""
+
+    fingerprint: str
+    candidates: int = 0
+    embedded: int = 0
+    error: str | None = None
 
 
 def stable_document_id(kind: str, locator: str) -> str:
@@ -381,6 +395,12 @@ def synchronize_recall_documents(
             _upsert_document(conn, row, indexed_at)
         for doc_id in stale_ids:
             conn.execute("DELETE FROM recall_documents WHERE id=?", (doc_id,))
+        # Vectors follow their document revision: removed, excluded or edited
+        # documents leave no embedding behind.
+        conn.execute(
+            "DELETE FROM recall_embeddings WHERE NOT EXISTS (SELECT 1 FROM recall_documents d "
+            "WHERE d.id = recall_embeddings.document_id AND d.content_sha256 = recall_embeddings.content_sha256)"
+        )
         state = _fts_index_state(conn)
         if state is None or not state[0] or not state[1] or changed or stale_ids:
             # Imported lazily: dream.py imports this module at load time.
@@ -399,3 +419,60 @@ def synchronize_recall_documents(
         skipped=skipped,
         raw_included=len(transcript_rows),
     )
+
+
+def embed_recall_documents(
+    conn: sqlite3.Connection,
+    embedder,
+    *,
+    include_raw_transcripts: bool,
+    refresh: bool = False,
+    batch_size: int = 32,
+) -> EmbedReport:
+    """Store vectors for current recall documents that lack one under the embedder's fingerprint.
+
+    This is the only document-embedding writer. It reads ``recall_documents``,
+    which synchronization has already filtered by retention policy and the
+    constitution guard, and sends the scrubbed, capped text in batches. Each
+    batch commits on its own, outside the synchronization transaction, so the
+    lexical index is never touched; the first failed batch stops the pass and
+    is reported once in ``error``. Raw transcripts are embedded only when
+    ``include_raw_transcripts`` is true. ``refresh`` re-embeds every current
+    document in place, which is the step after a model change behind an
+    unchanged name and dimension.
+    """
+    fingerprint = str(embedder.fingerprint)
+    report = EmbedReport(fingerprint)
+    if not has_vector_blob(conn):
+        report.error = "recall_embeddings has no vector_blob column; open the database with a Dream writer to migrate it"
+        return report
+    kinds = ["approved_memory", "distilled_summary"] + (["raw_transcript"] if include_raw_transcripts else [])
+    sql = (
+        "SELECT d.id, d.content_sha256, d.text FROM recall_documents d "
+        "WHERE d.source_kind IN (" + ",".join("?" for _ in kinds) + ")"
+    )
+    params: list[str] = list(kinds)
+    if not refresh:
+        sql += (
+            " AND NOT EXISTS (SELECT 1 FROM recall_embeddings e WHERE e.document_id = d.id "
+            "AND e.content_sha256 = d.content_sha256 AND e.adapter_fingerprint = ? AND e.vector_blob IS NOT NULL)"
+        )
+        params.append(fingerprint)
+    rows = conn.execute(sql + " ORDER BY d.id", params).fetchall()
+    report.candidates = len(rows)
+    # Prefer the adapter's document-batch call (longer timeout) when it has one.
+    embed_batch = getattr(embedder, "embed_documents", None) or embedder.embed
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start:start + batch_size]
+        try:
+            vectors = embed_batch([embedding_text(text) for _doc_id, _digest, text in batch])
+            if len(vectors) != len(batch):
+                raise ValueError("embedder returned the wrong vector count")
+            with conn:
+                for (doc_id, digest, _text), vector in zip(batch, vectors):
+                    store_vector(conn, doc_id, digest, fingerprint, vector)
+        except Exception as exc:
+            report.error = f"{type(exc).__name__}: {exc}"[:300]
+            break
+        report.embedded += len(batch)
+    return report

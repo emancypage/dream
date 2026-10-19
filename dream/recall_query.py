@@ -100,8 +100,16 @@ def _load_documents(conn, ids: list[str] | None = None) -> list[RecallDocument]:
     return [_row_document(row) for row in conn.execute(sql, params).fetchall()]
 
 
-def rank_lexical(conn, query: RecallQuery) -> list[RecallCandidate]:
-    """Rank prompt topics by FTS; use fused project signals for session starts."""
+def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | None = None) -> list[RecallCandidate]:
+    """Rank prompt topics by FTS; use fused project signals for session starts.
+
+    ``dense`` is an optional pre-computed ``[(document_id, cosine)]`` list in
+    rank order. Its eligible IDs (the same exclusions and raw-transcript rule)
+    become a fifth RRF list named ``dense``; on the prompt path they join the
+    FTS matches as topic candidates and the order becomes fused score first,
+    because an FTS-first key would rank every dense-only candidate below every
+    lexical hit. With no eligible dense IDs the result is exactly lexical.
+    """
     structured = extract_structured_terms(query.query_text)
     is_prompt = not query.hook_event.startswith("session-start")
     allowed = "d.source_kind != 'raw_transcript'" if not query.allow_raw_transcript else "1=1"
@@ -122,8 +130,10 @@ def rank_lexical(conn, query: RecallQuery) -> list[RecallCandidate]:
         except Exception:
             lists["fts"] = []
 
+    dense_ids = [doc_id for doc_id, _cosine in (dense or ()) if doc_id in by_id]
+
     if is_prompt:
-        topic_ids = set(lists.get("fts", ()))
+        topic_ids = set(lists.get("fts", ())) | set(dense_ids)
         all_docs = [doc for doc in all_docs if doc.id in topic_ids]
 
     if structured:
@@ -147,6 +157,9 @@ def rank_lexical(conn, query: RecallQuery) -> list[RecallCandidate]:
                 matches.append((doc.id, -overlap))
         matches.sort(key=lambda item: (item[1], item[0]))
         lists["paths"] = [item[0] for item in matches]
+
+    if dense_ids:
+        lists["dense"] = dense_ids
 
     # Recency is a supporting signal, not an independent source of unrelated
     # documents.  It boosts documents found by content, structure, or path
@@ -176,9 +189,10 @@ def rank_lexical(conn, query: RecallQuery) -> list[RecallCandidate]:
         excerpt = scrub_text(doc.text, Path.home())
         best = min(components.values())
         result.append(RecallCandidate(doc, excerpt, dict(components), score, best))
+    fts_first = is_prompt and not dense_ids
     result.sort(
         key=lambda candidate: (
-            candidate.component_ranks.get("fts", float("inf")) if is_prompt else 0,
+            candidate.component_ranks.get("fts", float("inf")) if fts_first else 0,
             -candidate.score,
             trust_order.get(candidate.document.trust_level, 99),
             candidate.best_component_rank,

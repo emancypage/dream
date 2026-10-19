@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
+import re
 import tomllib
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +47,10 @@ _RECALL_BUDGET_KEYS = {
 }
 _RECALL_PATH_KEYS = {"diagnostic_path", "calibration_path"}
 _ADAPTER_KEYS = {"enabled", "type", "remote_data_egress"}
+# The embedder alone gains connection keys; the reranker keeps the three above.
+_EMBEDDER_KEYS = _ADAPTER_KEYS | {"base_url", "model", "dimension", "timeout_seconds", "dense_candidates", "api_key_env"}
+_EMBEDDER_TYPES = ("none", "openai-compatible")
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _RECALL_DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "install_hooks": False,
@@ -139,10 +146,21 @@ class DreamConfig:
         if problems:
             # An invalid optional adapter falls back to its safe disabled default.
             return _DEFAULT_ADAPTER
-        return AdapterSettings(
+        settings = AdapterSettings(
             enabled=raw.get("enabled", False),
             type=raw.get("type", "none"),
             remote_data_egress=raw.get("remote_data_egress", False),
+        )
+        if name != "embedder":
+            return settings
+        return AdapterSettings(
+            settings.enabled, settings.type, settings.remote_data_egress,
+            base_url=raw.get("base_url", _DEFAULT_ADAPTER.base_url),
+            model=raw.get("model", _DEFAULT_ADAPTER.model),
+            dimension=raw.get("dimension", _DEFAULT_ADAPTER.dimension),
+            timeout_seconds=float(raw.get("timeout_seconds", _DEFAULT_ADAPTER.timeout_seconds)),
+            dense_candidates=raw.get("dense_candidates", _DEFAULT_ADAPTER.dense_candidates),
+            api_key_env=raw.get("api_key_env", _DEFAULT_ADAPTER.api_key_env),
         )
 
 
@@ -312,7 +330,7 @@ def _validate_adapter_table(name: str, raw: Any, optional_errors: list[str]) -> 
     if not isinstance(raw, dict):
         optional_errors.append(f"recall.{name} must be a table")
         return
-    unknown = sorted(set(raw) - _ADAPTER_KEYS)
+    unknown = sorted(set(raw) - (_EMBEDDER_KEYS if name == "embedder" else _ADAPTER_KEYS))
     if unknown:
         optional_errors.append(f"unknown recall.{name} options: {', '.join(unknown)}")
     for key in ("enabled", "remote_data_egress"):
@@ -320,6 +338,45 @@ def _validate_adapter_table(name: str, raw: Any, optional_errors: list[str]) -> 
             optional_errors.append(f"recall.{name}.{key} must be a boolean")
     if "type" in raw and (not isinstance(raw["type"], str) or not raw["type"]):
         optional_errors.append(f"recall.{name}.type must be a non-empty string")
+    elif name == "embedder" and "type" in raw and raw["type"] not in _EMBEDDER_TYPES:
+        optional_errors.append(f"recall.embedder.type must be one of: {', '.join(_EMBEDDER_TYPES)}")
+    if name == "embedder":
+        _validate_embedder_connection(raw, optional_errors)
+
+
+def _valid_base_url(value: Any) -> bool:
+    if not isinstance(value, str) or "@" in value or has_url_extras(value):
+        return False
+    try:
+        parts = urlsplit(value)
+        parts.port  # raises ValueError for a malformed or out-of-range port
+    except ValueError:
+        return False
+    return parts.scheme in {"http", "https"} and bool(parts.hostname)
+
+
+def _validate_embedder_connection(raw: dict[str, Any], optional_errors: list[str]) -> None:
+    """Record problems in the embedder's connection keys; values are never echoed.
+
+    The loopback/egress rule needs the adapter and is checked when the
+    embedder is built (see recall_adapters.build_embedder).
+    """
+    def positive_int(value: Any, maximum: int | None = None) -> bool:
+        return type(value) is int and value > 0 and (maximum is None or value <= maximum)
+
+    if "base_url" in raw and not _valid_base_url(raw["base_url"]):
+        optional_errors.append("recall.embedder.base_url must be an http(s) URL with a host and no credentials, query or fragment")
+    if "model" in raw and (not isinstance(raw["model"], str) or not raw["model"].strip()):
+        optional_errors.append("recall.embedder.model must be a non-empty string")
+    if "dimension" in raw and not positive_int(raw["dimension"], 4096):
+        optional_errors.append("recall.embedder.dimension must be an integer between 1 and 4096")
+    timeout = raw.get("timeout_seconds")
+    if "timeout_seconds" in raw and (type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0):
+        optional_errors.append("recall.embedder.timeout_seconds must be a positive number")
+    if "dense_candidates" in raw and not positive_int(raw["dense_candidates"]):
+        optional_errors.append("recall.embedder.dense_candidates must be a positive integer")
+    if "api_key_env" in raw and (not isinstance(raw["api_key_env"], str) or not _ENV_NAME.fullmatch(raw["api_key_env"])):
+        optional_errors.append("recall.embedder.api_key_env must be an environment variable name")
 
 
 def load_config(path: Path | None = None, overrides: dict[str, Any] | None = None) -> DreamConfig:

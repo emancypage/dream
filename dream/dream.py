@@ -46,8 +46,8 @@ from search import search as fts_search, session_summary  # noqa: E402
 from backend import active_backend, generate, preflight  # noqa: E402
 from config import load_config  # noqa: E402
 from curate import CURATION_SCHEMA, build_curation_prompt, parse_curation_output  # noqa: E402
-from recall_documents import synchronize_recall_documents  # noqa: E402
-from recall_context import append_diagnostic, parse_hook_payload, recall_preflight, run_context, hook_success_json  # noqa: E402
+from recall_documents import embed_recall_documents, synchronize_recall_documents  # noqa: E402
+from recall_context import append_diagnostic, configured_embedder, parse_hook_payload, recall_preflight, run_context, hook_success_json  # noqa: E402
 from recall_hook_state import claim_hook_event, finish_hook_event, successful_session_start_ids  # noqa: E402
 from recall_hooks import install_hooks, uninstall_hooks  # noqa: E402
 from storage import open_db_readonly  # noqa: E402
@@ -55,13 +55,14 @@ from retention_policy import POLICY_FILE, excludes_source_sessions, load_retenti
 
 
 def _sync_recall_documents(conn: sqlite3.Connection, memory_root,
-                           *, include_raw_transcripts: bool = False, constitution_path) -> None:
+                           *, include_raw_transcripts: bool = False, constitution_path) -> bool:
     """Keep the recall store current after a successful mutation.
 
     Synchronization is quiet on success and non-fatal: any error (missing
     recall objects, FTS problems, ...) is reported to stderr and swallowed so
     the caller's already-committed mutation is never undone and the command
-    keeps its documented behavior. Raw transcripts are opt-in.
+    keeps its documented behavior. Raw transcripts are opt-in. Returns
+    whether synchronization succeeded.
     """
     try:
         synchronize_recall_documents(
@@ -72,6 +73,34 @@ def _sync_recall_documents(conn: sqlite3.Connection, memory_root,
         )
     except Exception as e:
         print(f"recall sync skipped: {type(e).__name__}: {e}", file=sys.stderr)
+        return False
+    return True
+
+
+def _embed_recall_documents(conn: sqlite3.Connection, config) -> None:
+    """Nightly: embed new or changed recall documents after a successful sync.
+
+    Quiet when the embedder is off. Never fails the caller: an unusable or
+    unreachable embedder prints one diagnostic line to stderr and leaves the
+    lexical index complete.
+    """
+    try:
+        embedder, problem = configured_embedder(config)
+        if problem:
+            print(f"recall embed skipped: embedder misconfigured: {problem}", file=sys.stderr)
+            return
+        if embedder is None:
+            return
+        report = embed_recall_documents(
+            conn, embedder, include_raw_transcripts=config.recall_settings().allow_raw_transcript_prompt,
+        )
+    except Exception as e:
+        print(f"recall embed skipped: {type(e).__name__}: {e}", file=sys.stderr)
+        return
+    if report.error:
+        print(f"recall embed skipped: {report.error} ({report.embedded} of {report.candidates} documents stored)", file=sys.stderr)
+    elif report.embedded:
+        print(f"Recall embeddings: stored {report.embedded} vectors.")
 
 
 def _sub_label() -> str:
@@ -114,6 +143,7 @@ def _backup_before_schema_migration(conn: sqlite3.Connection, path: Path) -> Pat
         or "distillation_key" not in _table_columns(conn, "distilled")
         or "base_sha256" not in _table_columns(conn, "suggestions")
         or "find_text" not in _table_columns(conn, "suggestions")
+        or "vector_blob" not in _table_columns(conn, "recall_embeddings")
     )
     migrations = _table_columns(conn, "schema_migrations")
     version = conn.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0] if migrations else 0
@@ -157,6 +187,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "target_existed": "INTEGER",
             "consolidation_run_id": "TEXT",
             "find_text": "TEXT",
+        },
+        # Float32 recall vectors. No schema_migrations version: read-only
+        # paths detect the column with PRAGMA table_info and fail open.
+        "recall_embeddings": {
+            "vector_blob": "BLOB",
+            "dimension": "INTEGER",
         },
     }
     with conn:
@@ -333,7 +369,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     for name, seen, ingested, messages in results:
         print(f"{name}: scanned {seen}, ingested {ingested}, {messages} messages stored.")
     print(f"DB: {args.db}")
-    _sync_recall_documents(conn, args.config.memory_root, constitution_path=args.config.data['character']['constitution_path'])
+    if _sync_recall_documents(conn, args.config.memory_root, constitution_path=args.config.data['character']['constitution_path']):
+        _embed_recall_documents(conn, args.config)
     failures = getattr(results, "failures", [])
     if failures:
         print(f"Ingestion completed with {len(failures)} source/session errors. Failed items remain eligible for retry.",
@@ -1176,6 +1213,35 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def cmd_embed(args: argparse.Namespace) -> int:
+    embedder, problem = configured_embedder(args.config)
+    if problem:
+        print(f"dream embed: embedder misconfigured: {problem}", file=sys.stderr)
+        return 2
+    if embedder is None:
+        print('dream embed: the embedder is disabled; set [recall.embedder] enabled = true and type = "openai-compatible"',
+              file=sys.stderr)
+        return 2
+    conn = open_db(args.db)
+    try:
+        # Synchronize first, so retention exclusions and edits are current
+        # before any text leaves the process.
+        if not _sync_recall_documents(conn, args.config.memory_root,
+                                      constitution_path=args.config.data["character"]["constitution_path"]):
+            return 1
+        report = embed_recall_documents(
+            conn, embedder, include_raw_transcripts=args.config.recall_settings().allow_raw_transcript_prompt,
+            refresh=args.refresh,
+        )
+    finally:
+        conn.close()
+    print(f"Embedded {report.embedded} of {report.candidates} documents under {report.fingerprint}.")
+    if report.error:
+        print(f"dream embed: stopped: {report.error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _open_ephemeral_eval_db() -> sqlite3.Connection:
     """In-memory database for fixture runs: fixture rows never reach the live index."""
     conn = sqlite3.connect(":memory:")
@@ -1186,8 +1252,11 @@ def _open_ephemeral_eval_db() -> sqlite3.Connection:
 
 def cmd_recall_eval(args: argparse.Namespace) -> int:
     from recall_eval import evaluate_fixture_file
+    embedder, problem = configured_embedder(args.config)
+    if problem:
+        print(f"recall-eval: embedder misconfigured, reporting lexical only: {problem}", file=sys.stderr)
     conn = _open_ephemeral_eval_db()
-    report = evaluate_fixture_file(args.fixtures, conn, args.config.recall_settings())
+    report = evaluate_fixture_file(args.fixtures, conn, args.config.recall_settings(), embedder=embedder)
     conn.close()
     result = report.to_dict()
     if getattr(args, "by_language", False):
@@ -1234,12 +1303,19 @@ def cmd_eval_build(args: argparse.Namespace) -> int:
 
 
 def cmd_recall_calibrate(args: argparse.Namespace) -> int:
-    from recall_eval import calibrate_fixture_file
+    from recall_eval import EMBEDDER_MODE, calibrate_fixture_file
+    embedder = None
+    if args.mode == EMBEDDER_MODE:
+        embedder, problem = configured_embedder(args.config)
+        if embedder is None:
+            print(f"recall-calibrate: {EMBEDDER_MODE} needs the configured embedder: {problem or 'the embedder is disabled'}",
+                  file=sys.stderr)
+            return 2
     # Calibrate on an in-memory copy of the fixture: a stale or now-excluded
     # fixture row must never be re-inserted into the live recall index.
     conn = _open_ephemeral_eval_db()
     try:
-        record = calibrate_fixture_file(args.fixtures, conn, args.mode)
+        record = calibrate_fixture_file(args.fixtures, conn, args.mode, embedder=embedder)
     finally:
         conn.close()
     result = {
@@ -1328,9 +1404,21 @@ def cmd_context(args: argparse.Namespace) -> int:
             if explain:
                 print(json.dumps({"candidate_count": 0, "selected_count": 0, "fallback_reason": "duplicate-or-running"}, separators=(",", ":")))
             return 0
-        result = run_context(conn, query, settings, explain=explain, allow_cache_writes=False,
+        # Building the embedder contacts nothing; an unusable one means lexical recall.
+        embedder, embedder_problem = configured_embedder(args.config)
+        if embedder_problem:
+            from dataclasses import replace
+            settings = replace(settings, embedder=replace(settings.embedder, enabled=False))
+        result = run_context(conn, query, settings, explain=explain, embedder=embedder, allow_cache_writes=False,
                              memory_root=args.config.memory_root,
                              constitution_path=args.config.data["character"]["constitution_path"])
+        fallback_reason = result.diagnostics.fallback_reason or ("embedder-misconfigured" if embedder_problem else None)
+        if embedder_problem or str(fallback_reason).startswith(("embedder-unavailable", "embedder-error")):
+            try:
+                append_diagnostic(settings, {"event": query.hook_event, "fallback_reason": fallback_reason,
+                                             "embedder_problem": (embedder_problem or "")[:400] or None})
+            except Exception:
+                pass
         character_text = ""
         character_diagnostic = None
         reminder_text = ""
@@ -1366,7 +1454,7 @@ def cmd_context(args: argparse.Namespace) -> int:
                 "short_review_diagnostic": reminder_diagnostic,
                 "elapsed_ms": result.diagnostics.elapsed_ms,
                 "calibration_version": result.calibration_version,
-                "fallback_reason": result.diagnostics.fallback_reason,
+                "fallback_reason": fallback_reason,
             }, ensure_ascii=False, separators=(",", ":")))
         else:
             print(hook_success_json(event_name, combined_context))
@@ -1490,6 +1578,11 @@ def main(argv: list[str] | None = None) -> int:
 
     ppre = sub.add_parser("preflight", help="Check configured provider executables and auth")
     ppre.set_defaults(func=cmd_preflight)
+
+    pemb = sub.add_parser("embed", help="Store recall embeddings with the configured local embedder")
+    pemb.add_argument("--refresh", action="store_true",
+                      help="Re-embed every current document, e.g. after a model change behind the same name")
+    pemb.set_defaults(func=cmd_embed)
 
     pctx = sub.add_parser("context", help="Run fail-open automatic recall context")
     csub = pctx.add_subparsers(dest="context_cmd", required=True)

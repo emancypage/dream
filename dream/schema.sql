@@ -180,6 +180,9 @@ CREATE TABLE IF NOT EXISTS recall_calibrations (
     created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- dream.py _migrate() adds vector_blob BLOB (L2-normalized little-endian
+-- float32) and dimension INTEGER. Blob writers store '[]' in vector_json;
+-- readers use vector_json only when vector_blob is NULL.
 CREATE TABLE IF NOT EXISTS recall_embeddings (
     document_id         TEXT NOT NULL,
     content_sha256      TEXT NOT NULL,

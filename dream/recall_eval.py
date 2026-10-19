@@ -10,10 +10,10 @@ import datetime as dt
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
-from recall_adapters import apply_optional_adapters
+from recall_context import EMBEDDER_MODE, retrieve
+from recall_documents import embed_recall_documents
 from recall_query import rank_lexical
 from recall_render import render_context
-from recall_select import select_recall_candidates
 from recall_types import CalibrationRecord, RecallQuery, RecallSettings
 
 # Every fixture under the repository's fixtures directory is public by definition.
@@ -124,7 +124,11 @@ def _p95(latencies: list[float]) -> float:
 
 
 def _run_queries(data: dict, conn, settings: RecallSettings, calibration: dict, embedder=None) -> list[dict]:
-    """Run every fixture query once and keep per-query evidence for aggregation."""
+    """Run every fixture query once and keep per-query evidence for aggregation.
+
+    Queries go through the same ``retrieve`` pipeline as the recall hooks,
+    read-only: the dense list, the rescore and the per-mode threshold.
+    """
     outcomes: list[dict] = []
     for item in data["queries"]:
         language = str(item.get("language") or UNTAGGED_LANGUAGE)
@@ -132,13 +136,9 @@ def _run_queries(data: dict, conn, settings: RecallSettings, calibration: dict, 
             raise ValueError(f"fixture query language {ALL_LANGUAGES!r} is reserved for the aggregate slice")
         query = _query(item, settings)
         started = time.perf_counter()
-        candidates = rank_lexical(conn, query)
-        fallback = None
-        if embedder is not None:
-            candidates, _mode, fallback = apply_optional_adapters(
-                conn, query, candidates, settings, embedder=embedder, allow_cache_writes=False,
-            )
-        selected = select_recall_candidates(candidates, query, settings, calibration)
+        outcome = retrieve(conn, query, settings, calibration, embedder=embedder, allow_cache_writes=False)
+        fallback = outcome.fallback_reason
+        selected = outcome.selected
         rendered = render_context(selected, query.requested_codepoint_budget, query.query_text)
         latency = (time.perf_counter() - started) * 1000
         selected_ids = [candidate.document.id for candidate in selected]
@@ -184,20 +184,45 @@ def _breakdown(outcomes: list[dict]) -> dict[str, SliceMetrics]:
     return result
 
 
+def _lexical_settings(settings: RecallSettings) -> RecallSettings:
+    # The lexical baseline never consults an adapter, whatever the configuration says.
+    return replace(settings, embedder=replace(settings.embedder, enabled=False),
+                   reranker=replace(settings.reranker, enabled=False))
+
+
 def _embedder_settings(settings: RecallSettings) -> RecallSettings:
     # Measure the embedder alone: force it on and keep the reranker out of the mode.
     return replace(settings, embedder=replace(settings.embedder, enabled=True),
                    reranker=replace(settings.reranker, enabled=False))
 
 
-def _evaluate(data: dict, conn, settings: RecallSettings, threshold: float | None = None, *, embedder=None) -> EvaluationReport:
+def _embed_fixture_documents(conn, embedder, settings: RecallSettings):
+    """Embed fixture documents into the throwaway eval database.
+
+    Read-only recall never embeds documents, so without this step the
+    embedder mode would silently equal lexical. A failure is not fatal: the
+    queries then report it as a fallback.
+    """
+    try:
+        return embed_recall_documents(conn, embedder, include_raw_transcripts=settings.allow_raw_transcript_prompt)
+    except Exception:
+        return None
+
+
+def _evaluate(data: dict, conn, settings: RecallSettings, threshold: float | None = None, *, embedder=None,
+              primary_mode: str = "lexical") -> EvaluationReport:
+    """Run every mode; ``threshold`` applies to ``primary_mode``, which the top-level fields describe."""
     _ensure_documents(conn, data["documents"])
     mode = "lexical"
-    calibration = {mode: {"threshold": threshold}} if threshold is not None else {}
-    outcomes = {mode: _run_queries(data, conn, settings, calibration)}
+
+    def calibration(name: str) -> dict:
+        return {name: {"threshold": threshold}} if threshold is not None and name == primary_mode else {}
+
+    outcomes = {mode: _run_queries(data, conn, _lexical_settings(settings), calibration(mode))}
     if embedder is not None:
-        outcomes["lexical_plus_embedder"] = _run_queries(data, conn, _embedder_settings(settings), calibration, embedder=embedder)
-    lexical = outcomes[mode]
+        _embed_fixture_documents(conn, embedder, settings)
+        outcomes[EMBEDDER_MODE] = _run_queries(data, conn, _embedder_settings(settings), calibration(EMBEDDER_MODE), embedder=embedder)
+    lexical = outcomes[primary_mode]
     latencies = [outcome["latency"] for outcome in lexical]
     all_forbidden = sum(outcome["forbidden"] for outcome in lexical)
     duplicate_count = sum(outcome["duplicates"] for outcome in lexical)
@@ -238,23 +263,65 @@ def _is_public_fixture(path: Path) -> bool:
     return path.expanduser().resolve().is_relative_to(FIXTURES_ROOT)
 
 
-def calibrate_fixture_file(path, conn, mode: str) -> CalibrationRecord:
-    """Choose the best observed score threshold from a held-out fixture."""
+class _QueryMemo:
+    """Reuse query embeddings across a threshold sweep: one server call per distinct text."""
+
+    def __init__(self, embedder):
+        self._embedder = embedder
+        self._vectors: dict[str, list[float]] = {}
+        self.fingerprint = embedder.fingerprint
+        self.remote_data_egress = embedder.remote_data_egress
+
+    def embed(self, texts):
+        texts = list(texts)
+        if len(texts) != 1:
+            return self._embedder.embed(texts)
+        if texts[0] not in self._vectors:
+            self._vectors[texts[0]] = list(self._embedder.embed(texts)[0])
+        return [self._vectors[texts[0]]]
+
+    def embed_documents(self, texts):
+        # Document batches keep the wrapped adapter's longer batch timeout.
+        return (getattr(self._embedder, "embed_documents", None) or self._embedder.embed)(texts)
+
+
+def calibrate_fixture_file(path, conn, mode: str, *, embedder=None) -> CalibrationRecord:
+    """Choose the best observed score threshold from a held-out fixture.
+
+    ``lexical_plus_embedder`` evaluates in that mode, sweeping the fused and
+    rescored scores, and needs the configured embedder; its version also
+    covers the embedder fingerprint, because a threshold belongs to a model.
+    """
     fixture_path = Path(path)
     if _is_public_fixture(fixture_path):
         raise ValueError("public evaluation fixtures cannot be used for calibration")
+    if mode == EMBEDDER_MODE and embedder is None:
+        raise ValueError(f"calibrating {EMBEDDER_MODE} needs the configured embedder")
     data = _fixture(fixture_path)
     settings = _default_settings()
     _ensure_documents(conn, data["documents"])
     scores = {0.0}
-    for item in data["queries"]:
-        scores.update(candidate.score for candidate in rank_lexical(conn, _query(item, settings)))
+    if mode == EMBEDDER_MODE:
+        embedder = _QueryMemo(embedder)
+        report = _embed_fixture_documents(conn, embedder, settings)
+        if report is None or report.error:
+            raise ValueError(f"could not embed the fixture documents: {report.error if report else 'embedder failed'}")
+        for item in data["queries"]:
+            outcome = retrieve(conn, _query(item, settings), _embedder_settings(settings), {}, embedder=embedder)
+            if outcome.fallback_reason:
+                raise ValueError(f"embedder mode fell back during calibration: {outcome.fallback_reason}")
+            scores.update(candidate.score for candidate in outcome.candidates)
+    else:
+        embedder = None
+        for item in data["queries"]:
+            scores.update(candidate.score for candidate in rank_lexical(conn, _query(item, settings)))
     best: tuple[tuple[float, float, float], float, EvaluationReport] | None = None
     for threshold in sorted(scores):
-        report = _evaluate(data, conn, settings, threshold)
+        report = _evaluate(data, conn, settings, threshold, embedder=embedder, primary_mode=mode if embedder else "lexical")
         key = (report.mrr if report.forbidden_count == 0 else -1.0, report.recall_at_3 if report.forbidden_count == 0 else -1.0, -threshold)
         if best is None or key > best[0]:
             best = (key, threshold, report)
     canonical_hash = hashlib.sha256(_canonical(data)).hexdigest()
-    version = hashlib.sha256(f"{canonical_hash}:{mode}:calibration-v1".encode("utf-8")).hexdigest()
+    label = f"{mode}:{embedder.fingerprint}" if embedder is not None else mode
+    version = hashlib.sha256(f"{canonical_hash}:{label}:calibration-v1".encode("utf-8")).hexdigest()
     return CalibrationRecord(mode, version, best[1] if best else 0.0, canonical_hash, dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"))
