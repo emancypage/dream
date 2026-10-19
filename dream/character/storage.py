@@ -7,7 +7,7 @@ import os
 from character.types import canonical_json, content_hash
 from character.safety import guard_path, policy_for
 
-TABLES = ('character_constitutions', 'character_moments', 'character_seeds', 'character_pairs', 'character_judgments', 'character_review_events', 'character_eval_runs', 'character_eval_results')
+TABLES = ('character_constitutions', 'character_moments', 'character_seeds', 'character_pairs', 'character_judgments', 'character_review_events', 'character_eval_runs', 'character_eval_results', 'character_short_examples')
 
 def _table(table):
     if table not in TABLES:

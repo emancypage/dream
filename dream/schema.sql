@@ -296,3 +296,13 @@ CREATE TABLE IF NOT EXISTS character_eval_results (
  payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS character_eval_results_identity ON character_eval_results(revision, content_sha256);
+
+-- Separately reviewed startup wording. Full source pairs remain unchanged.
+CREATE TABLE IF NOT EXISTS character_short_examples (
+ id TEXT PRIMARY KEY,
+ work_key TEXT UNIQUE,
+ revision INTEGER NOT NULL CHECK(revision > 0),
+ content_sha256 TEXT NOT NULL,
+ payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS character_short_examples_identity ON character_short_examples(revision, content_sha256);

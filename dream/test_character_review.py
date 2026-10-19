@@ -88,8 +88,8 @@ def test_accept_right_exports_human_choice_and_keeps_original_evidence(env,monke
     row=json.loads(export.export_pairs(db,c)['text'])
     assert row['chosen']=='Long' and row['rejected']=='Short'
     assert row['metadata']['review_event']['answer']=='right'
-    block=render.render_block(db,c)['text']
-    assert 'Preferred\n> Long\nAvoid\n> Short' in block
+    # Full-pair acceptance alone must not inject an unreviewed short example.
+    assert render.render_block(db,c)['manifest']['pair_ids']==[]
     edited=r.review_pair(db,c,'p','edit',expected_sha=accepted['content_sha256'],body='New answer',reason='Improve')
     assert 'accepted_answer' not in edited
     assert not r.accepted_pairs(db,c)

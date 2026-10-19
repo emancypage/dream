@@ -428,6 +428,11 @@ dream character accept PAIR_ID --answer right --expected-sha HASH --reason "Pref
 dream character defer PAIR_ID --expected-sha HASH
 dream character reject PAIR_ID --expected-sha HASH --reason "The answer lacks evidence"
 dream character edit PAIR_ID --expected-sha HASH --body-file /tmp/chosen.txt --reason "Corrected the example"
+dream character short draft PAIR_ID --expected-pair-sha HASH --body-file /tmp/short.json
+dream character short list
+dream character short show SHORT_ID
+dream character short approve SHORT_ID --expected-sha SHORT_HASH --reason "Reviewed the exact short wording"
+dream character short reject SHORT_ID --expected-sha SHORT_HASH --reason "This changes my meaning"
 dream character render --preview
 dream character render
 dream character export --format dpo-jsonl --preview
@@ -444,8 +449,24 @@ against chosen requires `--acknowledge-flags` and a human reason. Generation
 skips traits without seeds without treating that as a failure. Seed expansion is
 explicit through `--expand-seeds` and bounded by `max_seed_expansions`.
 
+Short examples use `dream-character-short-v1` in a separate database table. The
+input JSON contains five nonempty text fields: `situation`, `preferred`, `avoid`,
+`feedback`, and `limits`. Their combined length is at most 2500 Unicode codepoints.
+Draft them only from accepted pairs. The full pair, answers, judgments, and prior
+review records stay unchanged. The source pair ID, revision, and hash are recorded
+automatically. Full-record DPO export continues to use the full accepted answers.
+
+Show the complete short wording and hash to the human before approving it. An
+accepted full pair does not approve its short version. `short approve` records a
+separate human decision bound to the exact short hash. To change a short version,
+run `short draft` again with its current `--expected-sha` and the current source
+`--expected-pair-sha`. Changing the wording returns it to draft status. Source or
+constitution changes make it stale. Policy exclusions apply through source lineage.
+These commands make no model calls. Database migration adds the short-example table
+after backing up the existing database.
+
 `render` writes a character block and manifest under the state directory. It uses
-the complete approved constitution and at most three accepted examples. It counts
+the complete approved constitution and at most three approved short examples. It counts
 the header and complete examples within the codepoint budget. An oversized
 constitution causes an error. Dream never installs the block into `AGENTS.md`,
 `CLAUDE.md`, or native Codex Memories. You choose where to load it. Copies outside
@@ -455,7 +476,11 @@ change.
 Setting `hook_injection = true` adds a separate trusted character section to
 session-start context. Recall stays a separate untrusted section with relevance
 ranking. The hook makes no model calls and writes no database state. Its total
-context limit can be smaller than the file-rendering budget. A character block
+context limit can be smaller than the file-rendering budget. Session startup renders
+approved short examples directly from the database. No saved render is required.
+Draft, rejected, stale, or unreviewed short versions are never injected. When no
+short version is approved, the hook includes the constitution without examples.
+A character block
 which cannot fit is omitted with a diagnostic; the constitution is never cut.
 The flag defaults to false. Review any changed hook definition before trusting it.
 Injection is independent of `character.enabled`, which controls generation,

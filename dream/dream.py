@@ -114,7 +114,7 @@ def _backup_before_schema_migration(conn: sqlite3.Connection, path: Path) -> Pat
     )
     migrations = _table_columns(conn, "schema_migrations")
     version = conn.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0] if migrations else 0
-    needs_upgrade = needs_upgrade or version < 3
+    needs_upgrade = needs_upgrade or version < 4
     if not needs_upgrade:
         return None
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -224,6 +224,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # schema.sql above; messages_fts is never dropped or recreated).
         conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (2)")
         conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (3)")
+        conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (4)")
 
 
 def rebuild_recall_fts(conn: sqlite3.Connection) -> None:

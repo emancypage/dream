@@ -65,6 +65,19 @@ def _check_artifact_inputs(config, manifest):
                     raise ValueError('accepted pair changed; render again')
         finally:
             conn.close()
+    if manifest.get('short_ids'):
+        from character.short import approved_examples
+        conn = open_db_readonly(config.db_path)
+        try:
+            current = {p['short_example']['id']: p['short_example']
+                       for p in approved_examples(conn, config, document)}
+            for identity in manifest['short_ids']:
+                short = current.get(identity)
+                if (short is None or short['revision'] != manifest['short_revisions'].get(identity)
+                        or short['content_sha256'] != manifest['short_hashes'].get(identity)):
+                    raise ValueError('approved short example changed; render again')
+        finally:
+            conn.close()
 
 
 def protected_paths(config, candidate=None):

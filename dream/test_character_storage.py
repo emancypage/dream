@@ -15,13 +15,13 @@ def test_migration_backup_precedes_character_ddl(tmp_path):
     from dream import open_db
     path = tmp_path / 'dream.db'
     conn = open_db(path)
-    conn.execute('DELETE FROM schema_migrations WHERE version=3')
-    for name in ('constitutions', 'moments', 'seeds', 'pairs', 'judgments', 'review_events', 'eval_runs', 'eval_results'):
+    conn.execute('DELETE FROM schema_migrations WHERE version>=3')
+    for name in ('constitutions', 'moments', 'seeds', 'pairs', 'judgments', 'review_events', 'eval_runs', 'eval_results', 'short_examples'):
         conn.execute(f'DROP TABLE character_{name}')
     conn.commit()
     conn.close()
     conn = open_db(path)
-    assert conn.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 3
+    assert conn.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 4
     backups = list(tmp_path.glob('dream.db.bak-*'))
     assert len(backups) == 1
     backup = sqlite3.connect(backups[0])

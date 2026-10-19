@@ -50,6 +50,11 @@ def test_complete_character_cli_workflow_with_fake_providers(tmp_path, monkeypat
     assert command('character', 'judge', '--limit', '1')['judged'] == 1
     pair = command('character', 'list')[0]
     command('character', 'accept', pair['id'], '--expected-sha', pair['content_sha256'], '--reason', 'I reviewed the exact response and its evidence.')
+    accepted = command('character', 'show', pair['id'])
+    body = tmp_path / 'short.json'
+    body.write_text(json.dumps(dict(situation='The user asks for proof.', preferred='Run the test and report its output.', avoid='Trust me.', feedback='Report test evidence.', limits='State what the test covers.')))
+    draft = command('character', 'short', 'draft', pair['id'], '--expected-pair-sha', accepted['content_sha256'], '--body-file', str(body))
+    command('character', 'short', 'approve', draft['id'], '--expected-sha', draft['content_sha256'], '--reason', 'Reviewed the exact short wording.')
     command('character', 'render')
     command('character', 'export', '--format', 'dpo-jsonl')
     exported = json.loads((state / 'accepted.dpo.jsonl').read_text())

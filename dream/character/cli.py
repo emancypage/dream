@@ -46,6 +46,21 @@ def register(subparsers):
             command.add_argument('--body-file', required=True)
     command = commands.add_parser('render')
     command.add_argument('--preview', action='store_true')
+    short = commands.add_parser('short', help='Draft and review short session-start examples')
+    short_commands = short.add_subparsers(dest='short_cmd', required=True)
+    short_commands.add_parser('list')
+    command = short_commands.add_parser('show')
+    command.add_argument('id')
+    command = short_commands.add_parser('draft')
+    command.add_argument('pair_id')
+    command.add_argument('--expected-pair-sha', required=True)
+    command.add_argument('--expected-sha')
+    command.add_argument('--body-file', required=True, help='JSON with situation, preferred, avoid, feedback, limits')
+    for name in ('approve', 'reject'):
+        command = short_commands.add_parser(name)
+        command.add_argument('id')
+        command.add_argument('--expected-sha', required=True)
+        command.add_argument('--reason', required=True)
     command = commands.add_parser('export')
     command.add_argument('--format', choices=('dpo-jsonl',), required=True)
     command.add_argument('--preview', action='store_true')
@@ -73,7 +88,7 @@ def _initialize_for_mutation(config):
         reader = open_db_readonly(config.db_path)
         try:
             migrations = reader.execute("SELECT 1 FROM sqlite_master WHERE name='schema_migrations'").fetchone()
-            ready = bool(migrations and reader.execute('SELECT COALESCE(MAX(version),0) FROM schema_migrations').fetchone()[0] >= 3)
+            ready = bool(migrations and reader.execute('SELECT COALESCE(MAX(version),0) FROM schema_migrations').fetchone()[0] >= 4)
         finally:
             reader.close()
     if not ready:
@@ -93,6 +108,7 @@ def run(args):
     try:
         guard_path(cfg.db_path, cfg)
         mutation = (action in ('generate', 'judge', 'accept', 'reject', 'defer', 'edit')
+                    or action == 'short' and args.short_cmd in ('draft', 'approve', 'reject')
                     or action == 'eval' and not args.report)
         if mutation:
             _initialize_for_mutation(cfg)
@@ -117,6 +133,19 @@ def run(args):
                 result = review_pair(conn, cfg, args.id, action, expected_sha=args.expected_sha,
                                      reason=args.reason, body=body, acknowledge_flags=args.acknowledge_flags,
                                      **selection)
+        elif action == 'short':
+            from character.short import list_examples, show_example, draft_example, review_example
+            if args.short_cmd == 'list':
+                result = list_examples(conn, cfg)
+            elif args.short_cmd == 'show':
+                result = show_example(conn, cfg, args.id)
+            elif args.short_cmd == 'draft':
+                body = json.loads(Path(args.body_file).read_text(encoding='utf-8'))
+                result = draft_example(conn, cfg, args.pair_id, expected_pair_sha=args.expected_pair_sha,
+                                       expected_sha=args.expected_sha, body=body)
+            else:
+                result = review_example(conn, cfg, args.id, args.short_cmd,
+                                        expected_sha=args.expected_sha, reason=args.reason)
         elif action in ('render', 'export'):
             if action == 'render':
                 from character.render import render_block

@@ -7,10 +7,10 @@ from character import storage
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    from character import judge, review
+    from character import judge, review, short
     cfg=load_config(tmp_path/'none', {'storage':{'db_path':str(tmp_path/'db'),'memory_root':str(tmp_path/'memory')},'character':{'enabled':True,'constitution_path':str(tmp_path/'constitution'),'state_root':str(tmp_path/'state')}})
     doc=SimpleNamespace(text='Rules',sha256='abc',version='1',traits={'brief':'Be brief'})
-    for mod in (judge,review): monkeypatch.setattr(mod,'load_constitution',lambda *a,**k:doc)
+    for mod in (judge,review,short): monkeypatch.setattr(mod,'load_constitution',lambda *a,**k:doc)
     conn=sqlite3.connect(cfg.db_path); conn.executescript((Path(__file__).parent/'schema.sql').read_text())
     pair=storage.insert_record(conn,'character_pairs',dict(id='p',revision=1,constitution_sha256='abc',prompt_messages=[{'role':'user','content':'Task'}],chosen='Short',rejected='Long',trait_ids=['brief'],conflict=False,status='pending',provenance={'historical_family':'anthropic'},generator_calls=[{'family':'openai','stage':'character_generate'}])); conn.commit()
     return judge,review,cfg,conn,pair

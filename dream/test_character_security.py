@@ -82,6 +82,8 @@ def test_pair_edited_after_pure_render_cannot_be_written(env,monkeypatch):
     monkeypatch.setattr(render,'load_constitution',lambda config:document)
     monkeypatch.setattr('character.constitution.load_constitution',lambda config:document)
     accepted=r.review_pair(db,c,'p','accept',expected_sha=p['content_sha256'],reason='Checked')
+    from test_character_short import approve_example
+    approve_example(db,c,accepted)
     result=render.render_block(db,c)
     storage.update_record(db,'character_pairs',dict(accepted,revision=accepted['revision']+1,chosen='Edited later'),expected_sha=accepted['content_sha256']); db.commit()
     db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
@@ -103,6 +105,8 @@ def _accepted_with_parent(env,monkeypatch,parent_kind):
     monkeypatch.setattr(render,'load_constitution',lambda config:document)
     monkeypatch.setattr(export,'load_constitution',lambda config:document)
     monkeypatch.setattr('character.constitution.load_constitution',lambda config:document)
+    from test_character_short import approve_example
+    approve_example(db,c,accepted)
     return c,db,parent,accepted
 
 

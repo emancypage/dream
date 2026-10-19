@@ -55,7 +55,7 @@ def test_enabled_writer_migrates_v2_but_readers_do_not(tmp_path, monkeypatch, ca
     db = tmp_path / 'dream.db'
     conn = dream.open_db(db)
     for table in storage.TABLES: conn.execute('DROP TABLE ' + table)
-    conn.execute('DELETE FROM schema_migrations WHERE version=3'); conn.commit(); conn.close()
+    conn.execute('DELETE FROM schema_migrations WHERE version>=3'); conn.commit(); conn.close()
     constitution = tmp_path / 'rules.md'; constitution.write_text(TEXT)
     cfg = tmp_path / 'config.toml'
     cfg.write_text('[storage]\ndb_path="' + str(db) + '"\n[character]\nenabled=true\nconstitution_path="' + str(constitution) + '"\nstate_root="' + str(tmp_path / 'state') + '"\n')
@@ -70,7 +70,7 @@ def test_enabled_writer_migrates_v2_but_readers_do_not(tmp_path, monkeypatch, ca
     assert dream.main(['--config', str(cfg), 'character', 'generate', '--limit', '1']) == 0
     assert list(tmp_path.glob('dream.db.bak-*'))
     with sqlite3.connect(db) as check:
-        assert check.execute('SELECT max(version) FROM schema_migrations').fetchone()[0] == 3
+        assert check.execute('SELECT max(version) FROM schema_migrations').fetchone()[0] == 4
 
 
 import pytest
@@ -83,7 +83,7 @@ def test_saved_render_and_export_never_migrate_database(tmp_path, command):
     db = tmp_path / 'dream.db'
     conn = dream.open_db(db)
     for table in storage.TABLES: conn.execute('DROP TABLE ' + table)
-    conn.execute('DELETE FROM schema_migrations WHERE version=3'); conn.commit(); conn.close()
+    conn.execute('DELETE FROM schema_migrations WHERE version>=3'); conn.commit(); conn.close()
     constitution = tmp_path / 'rules.md'; constitution.write_text(TEXT)
     cfg = tmp_path / 'config.toml'
     cfg.write_text('[storage]\ndb_path="' + str(db) + '"\n[character]\nenabled=true\nconstitution_path="' + str(constitution) + '"\nstate_root="' + str(tmp_path / 'state') + '"\n')

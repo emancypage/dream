@@ -4,8 +4,9 @@ from character import export,render
 
 def test_exact_dpo_structure_stable_and_prompt_seq_removed(inputs,monkeypatch):
     config,pairs=inputs
-    for name in ('load_constitution','policy_for','policy_fingerprint','accepted_pairs'):
+    for name in ('load_constitution','policy_for','policy_fingerprint'):
         monkeypatch.setattr(export,name,getattr(render,name))
+    monkeypatch.setattr(export,'accepted_pairs',lambda *a:pairs)
     first=export.export_pairs(None,config)
     assert first==export.export_pairs(None,config)
     lines=[json.loads(line) for line in first['text'].splitlines()]
@@ -19,8 +20,9 @@ def test_serialized_metadata_keys_checked_by_policy(inputs,monkeypatch):
     from types import SimpleNamespace
     import pytest
     config,pairs=inputs
-    for name in ('load_constitution','accepted_pairs'):
+    for name in ('load_constitution',):
         monkeypatch.setattr(export,name,getattr(render,name))
+    monkeypatch.setattr(export,'accepted_pairs',lambda *a:pairs)
     monkeypatch.setattr(export,'policy_for',lambda c:SimpleNamespace(excludes=lambda **k:'"human_review_reason"' in k.get('text','')))
     with pytest.raises(ValueError,match='policy'):
         export.export_pairs(None,config)
