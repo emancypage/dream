@@ -6,8 +6,8 @@ Targets llama-server, Ollama, vLLM and similar servers that expose
 no streaming and no tool calls.
 
   * Structured output is requested with `response_format = json_schema`. A
-    server that rejects it (HTTP 400/422, or an error body naming
-    response_format) gets exactly one retry with `json_object`, with the
+    server that rejects it (HTTP 400/422 with a body naming response_format
+    or json_schema) gets exactly one retry with `json_object`, with the
     schema moved into the system prompt. Output is validated host-side
     against the stage schema either way, as for the CLI providers.
   * Every other failure (timeout, refused connection, any other HTTP status,
@@ -33,7 +33,7 @@ import urllib.request
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
-from config import is_loopback_url
+from config import has_url_extras, is_loopback_url
 from model_types import (
     GenerationRequest,
     GenerationResult,
@@ -45,6 +45,7 @@ from model_types import (
 PROVIDER = "openai-compatible"
 DEFAULT_TIMEOUT_SECONDS = 600
 PREFLIGHT_TIMEOUT_SECONDS = 5.0
+_RESPONSE_BODY_LIMIT = 16 * 1024 * 1024
 _ERROR_BODY_LIMIT = 65536
 _ERROR_EXCERPT_CHARS = 300
 
@@ -61,14 +62,17 @@ def _opener() -> urllib.request.OpenerDirector:
 
 
 class _HTTPStatusError(ProviderError):
-    def __init__(self, display: str, status: int, body: str):
+    def __init__(self, display: str, status: int, body: str, api_key: str | None = None):
+        if api_key:
+            body = body.replace(api_key, "[redacted]")  # A server may echo the header.
         excerpt = " ".join(body.split())[:_ERROR_EXCERPT_CHARS]
         super().__init__(f"{PROVIDER} server at {display} returned HTTP {status}: {excerpt}")
         self.status = status
         self.body = body
 
     def rejects_response_format(self) -> bool:
-        return self.status in (400, 422) or "response_format" in self.body.lower()
+        body = self.body.lower()
+        return self.status in (400, 422) and ("response_format" in body or "json_schema" in body)
 
 
 class OpenAICompatibleProvider:
@@ -134,7 +138,9 @@ def _checked_base_url(settings: Mapping[str, Any]) -> str:
     base_url = settings.get("base_url")
     if not isinstance(base_url, str) or not base_url:
         raise ProviderError(f"{PROVIDER} provider requires base_url")
-    # Config validation enforces this too; repeat it for direct callers.
+    # Config validation enforces both rules too; repeat them for direct callers.
+    if has_url_extras(base_url):
+        raise ProviderError(f"{PROVIDER} base_url must not contain credentials, a query or a fragment")
     if settings.get("remote_data_egress", False) is not True and not is_loopback_url(base_url):
         raise ProviderError(f"{PROVIDER} base_url is not loopback and remote_data_egress is not true")
     return base_url
@@ -196,9 +202,9 @@ def _request_json(
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         with _opener().open(req, timeout=timeout) as response:
-            raw = response.read()
+            raw = response.read(_RESPONSE_BODY_LIMIT + 1)
     except urllib.error.HTTPError as exc:
-        raise _HTTPStatusError(display, exc.code, _error_body(exc)) from exc
+        raise _HTTPStatusError(display, exc.code, _error_body(exc), api_key) from exc
     except TimeoutError as exc:
         raise ProviderError(f"{PROVIDER} server at {display} timed out after {timeout:g}s") from exc
     except urllib.error.URLError as exc:
@@ -207,6 +213,8 @@ def _request_json(
         raise ProviderError(f"{PROVIDER} server at {display} is unreachable: {exc.reason}") from exc
     except (OSError, http.client.HTTPException) as exc:
         raise ProviderError(f"{PROVIDER} request to {display} failed: {type(exc).__name__}") from exc
+    if len(raw) > _RESPONSE_BODY_LIMIT:
+        raise ProviderError(f"{PROVIDER} response from {display} exceeds {_RESPONSE_BODY_LIMIT} bytes")
     try:
         return json.loads(raw)
     except ValueError as exc:

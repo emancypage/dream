@@ -29,7 +29,10 @@ type = "claude-cli"
 # Ollama, vLLM). Route a stage to it with provider = "local-qwen". The key is
 # read from the named environment variable at call time and may be omitted.
 # A non-loopback base_url requires remote_data_egress = true. The stage's
-# model and timeout_seconds win; the provider's values are defaults.
+# model and timeout_seconds win; the provider's values are defaults. Built-in
+# stages always set timeout_seconds, so the provider's timeout_seconds applies
+# only when a stage omits it. dream distill --refresh notices a changed stage
+# provider or model, but not a model changed only in this table.
 # [providers.local-qwen]
 # type = "openai-compatible"
 # base_url = "http://127.0.0.1:8080"

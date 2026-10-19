@@ -3,6 +3,7 @@
 import json
 import sqlite3
 import threading
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import pytest
 
 import backend
 from config import ConfigError, load_config
-from distill import DISTILL_SCHEMA, distill_session
+from distill import DISTILL_SCHEMA, distill_session, prompt_version, sessions_needing_distill
 from model_types import GenerationRequest, ProviderError, SchemaValidationError
 from providers import openai_compatible
 from providers.registry import create_provider, preflight_provider
@@ -214,22 +215,26 @@ def test_rejected_json_schema_falls_back_once_to_json_object(server):
     assert second["body"]["messages"][1] == {"role": "user", "content": "Say ok."}
 
 
-def test_error_body_naming_response_format_triggers_fallback(server):
-    def responder(request):
-        if request["body"]["response_format"]["type"] == "json_schema":
-            return 500, {"error": {"message": "Unsupported response_format"}}
-        return 200, _completion(json.dumps({"value": "fallback"}))
+def test_server_error_naming_response_format_is_not_retried(server):
+    server.responder = lambda request: (500, {"error": {"message": "Unsupported response_format"}})
 
-    server.responder = responder
+    with pytest.raises(ProviderError, match="500"):
+        openai_compatible.generate(_request(), _settings(server))
+    assert len(server.chat_requests()) == 1
 
-    assert openai_compatible.generate(_request(), _settings(server)).output == {"value": "fallback"}
-    assert len(server.chat_requests()) == 2
+
+def test_bad_request_unrelated_to_response_format_is_not_retried(server):
+    server.responder = lambda request: (400, {"error": {"message": "the request exceeds the available context size"}})
+
+    with pytest.raises(ProviderError, match="400"):
+        openai_compatible.generate(_request(), _settings(server))
+    assert len(server.chat_requests()) == 1
 
 
 def test_fallback_output_is_validated_host_side(server):
     def responder(request):
         if request["body"]["response_format"]["type"] == "json_schema":
-            return 422, {"error": "unprocessable response_format"}
+            return 422, {"error": "json_schema is not supported by this server"}
         return 200, _completion(json.dumps({"value": 3}))
 
     server.responder = responder
@@ -314,6 +319,33 @@ def test_provider_timeout_is_only_a_fallback_for_direct_requests(server):
         openai_compatible.generate(_request(timeout_seconds=0), _settings(server, timeout_seconds=1))
 
 
+def test_connect_timeout_is_a_provider_error(server, monkeypatch):
+    class TimingOutOpener:
+        def open(self, request, timeout):
+            raise urllib.error.URLError(TimeoutError("connect timed out"))
+
+    monkeypatch.setattr(openai_compatible, "_opener", lambda: TimingOutOpener())
+
+    with pytest.raises(ProviderError, match="timed out after 30s"):
+        openai_compatible.generate(_request(), _settings(server))
+
+
+def test_oversized_response_body_is_rejected(server, monkeypatch):
+    monkeypatch.setattr(openai_compatible, "_RESPONSE_BODY_LIMIT", 64)
+    server.responder = lambda request: (200, _completion(json.dumps({"value": "x" * 200})))
+
+    with pytest.raises(ProviderError, match="exceeds 64 bytes"):
+        openai_compatible.generate(_request(), _settings(server))
+
+
+def test_response_body_at_the_limit_is_accepted(server, monkeypatch):
+    body = json.dumps(_completion(json.dumps({"value": "ok"}))).encode("utf-8")
+    monkeypatch.setattr(openai_compatible, "_RESPONSE_BODY_LIMIT", len(body))
+    server.responder = lambda request: (200, body)
+
+    assert openai_compatible.generate(_request(), _settings(server)).output == {"value": "ok"}
+
+
 def test_connection_refused_is_a_provider_error(server):
     url = server.base_url
     server.close()
@@ -364,6 +396,20 @@ def test_api_key_never_appears_in_errors(server, monkeypatch):
     assert "sk-local-secret" not in str(excinfo.value)
 
 
+def test_api_key_echoed_by_server_is_redacted_from_errors(server, monkeypatch):
+    monkeypatch.setenv("DREAM_TEST_LOCAL_LLM_KEY", "sk-local-secret")
+    server.responder = lambda request: (
+        403, {"error": {"message": "rejected header " + request["headers"].get("authorization", "")}},
+    )
+
+    with pytest.raises(ProviderError) as excinfo:
+        openai_compatible.generate(_request(), _settings(server, api_key_env="DREAM_TEST_LOCAL_LLM_KEY"))
+    assert "sk-local-secret" not in str(excinfo.value)
+    assert "Bearer [redacted]" in str(excinfo.value)
+    ok, detail = preflight_provider(_settings(server, api_key_env="DREAM_TEST_LOCAL_LLM_KEY"))
+    assert not ok and "sk-local-secret" not in detail
+
+
 def test_no_api_key_env_sends_no_authorization(server, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-should-not-be-used")
     server.responder = lambda request: (200, _completion(json.dumps({"value": "ok"})))
@@ -379,6 +425,20 @@ def test_generate_refuses_non_loopback_url_without_egress_consent(server):
         openai_compatible.generate(
             _request(timeout_seconds=1), {"type": "openai-compatible", "base_url": "http://192.0.2.10:8080"},
         )
+    assert server.requests == []
+
+
+@pytest.mark.parametrize("suffix", ["/#@evil.com", "/?@evil.com"])
+def test_generate_refuses_base_url_with_query_or_fragment(server, suffix):
+    with pytest.raises(ProviderError, match="base_url"):
+        openai_compatible.generate(_request(timeout_seconds=1), _settings(server, base_url=server.base_url + suffix))
+    assert server.requests == []
+
+
+def test_generate_refuses_base_url_with_credentials(server):
+    url = server.base_url.replace("http://", "http://evil.com@")
+    with pytest.raises(ProviderError, match="base_url"):
+        openai_compatible.generate(_request(timeout_seconds=1), _settings(server, base_url=url))
     assert server.requests == []
 
 
@@ -445,6 +505,10 @@ def test_unrouted_provider_is_still_validated(tmp_path):
     ('type = "openai-compatible"\nbase_url = "http://127.0.0.1"\ntimeout_seconds = 1.5\n', "timeout_seconds"),
     ('type = "openai-compatible"\nbase_url = "http://127.0.0.1:0"\n', "base_url"),
     ('type = "openai-compatible"\nbase_url = "http://127.0.0.1:99999"\n', "base_url"),
+    ('type = "openai-compatible"\nbase_url = "http://evil.com@127.0.0.1:8080"\n', "base_url"),
+    ('type = "openai-compatible"\nbase_url = "http://user:pass@127.0.0.1:8080"\n', "base_url"),
+    ('type = "openai-compatible"\nbase_url = "http://127.0.0.1:8080/#@evil.com"\n', "base_url"),
+    ('type = "openai-compatible"\nbase_url = "http://127.0.0.1:8080/?@evil.com"\n', "base_url"),
     ('type = "openai-compatible"\nbase_url = "http://127.0.0.1"\nmodel = ""\n', "model"),
     ('type = "openai-compatible"\nbase_url = "http://127.0.0.1"\napi_key_env = 5\n', "api_key_env"),
     ('type = "openai-compatible"\nbase_url = "http://127.0.0.1"\napi_key = "sk-inline"\n', "unknown"),
@@ -501,16 +565,15 @@ def test_preflight_reports_http_error_without_raising(server):
     assert "401" in detail
 
 
-def test_backend_preflight_checks_unrouted_openai_compatible_providers(tmp_path, monkeypatch, server):
+def test_backend_preflight_skips_unused_openai_compatible_providers(tmp_path, monkeypatch, server):
+    # Same rule as an unused [providers.claude]: only routed providers can fail preflight.
     monkeypatch.setenv("HOME", str(tmp_path))
-    server.responder = lambda request: (200, {"object": "list", "data": [{"id": "qwen3-32b"}]})
     config = load_config(_write_config(
         tmp_path, f'type = "openai-compatible"\nbase_url = "{server.base_url}"\n', route=False,
     ))
     monkeypatch.setattr(backend, "preflight_provider", lambda cfg: (True, cfg["type"]))
-    checks = backend.preflight(config)
-    assert ("local", True, "openai-compatible") in checks
-    assert ("codex", True, "codex-cli") in checks
+    assert [name for name, *_ in backend.preflight(config)] == ["codex"]
+    assert server.requests == []
 
 
 def test_dream_preflight_command_reports_local_server(tmp_path, monkeypatch, server, capsys):
@@ -589,3 +652,92 @@ def test_distill_timeout_is_provider_failure_and_writes_no_row(tmp_path, monkeyp
         distill_session(conn, "s1", config=config)
     assert conn.execute("SELECT COUNT(*) FROM distilled").fetchone()[0] == 0
     assert len(server.chat_requests()) == 1
+
+
+# Refresh compares recorded stage settings, not the server-reported model
+
+
+def _pending(conn, config, *, refresh=True) -> list[str]:
+    return [sid for sid, _ in sessions_needing_distill(conn, config=config, refresh_config=refresh)]
+
+
+def _routed_config(tmp_path: Path, server, *, provider: str = "local", stage_extra: str = ""):
+    path = tmp_path / f"config-{provider}.toml"
+    path.write_text(
+        f'[storage]\ndb_path = "{tmp_path / "dream.db"}"\nmemory_root = "{tmp_path / "memory"}"\n'
+        f'[stages.distill]\nprovider = "{provider}"\n{stage_extra}'
+        f'[providers.local]\ntype = "openai-compatible"\nbase_url = "{server.base_url}"\nmodel = "qwen3-32b"\n'
+        f'[providers.local2]\ntype = "openai-compatible"\nbase_url = "{server.base_url}"\nmodel = "qwen3-32b"\n',
+        encoding="utf-8",
+    )
+    return load_config(path)
+
+
+def test_refresh_keeps_openai_compatible_session_distilled_until_route_changes(tmp_path, monkeypatch, server):
+    server.responder = lambda request: (200, _completion(json.dumps(DISTILL_OUTPUT), model="qwen3-32b-q4_k_m.gguf"))
+    config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+    distill_session(conn, "s1", config=config)
+
+    assert _pending(conn, config) == []
+    assert _pending(conn, config, refresh=False) == []
+    assert _pending(conn, _routed_config(tmp_path, server)) == []
+    assert _pending(conn, _routed_config(tmp_path, server, stage_extra='model = "qwen3-14b"\n')) == ["s1"]
+    assert _pending(conn, _routed_config(tmp_path, server, provider="local2")) == ["s1"]
+    assert _pending(conn, _routed_config(tmp_path, server, provider="codex")) == ["s1"]
+
+
+def test_refresh_keeps_stage_model_route_distilled(tmp_path, monkeypatch, server):
+    server.responder = lambda request: (200, _completion(json.dumps(DISTILL_OUTPUT), model="served-name"))
+    config, conn = _distill_fixture(tmp_path, monkeypatch, server, stage_extra='model = "qwen3-14b"\n')
+    distill_session(conn, "s1", config=config)
+
+    assert _pending(conn, config) == []
+    assert _pending(conn, _routed_config(tmp_path, server)) == ["s1"]
+
+
+def test_refresh_without_recorded_stage_settings_keeps_column_comparison(tmp_path, monkeypatch, server):
+    config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+    conn.execute(
+        "INSERT INTO distilled(session_id, provider, model, prompt_version, provider_options, notes_json) "
+        "VALUES ('s1', 'openai-compatible', 'qwen3-32b-q4_k_m.gguf', ?, NULL, '{}')",
+        (prompt_version(),),
+    )
+
+    assert _pending(conn, config) == ["s1"]
+    assert _pending(conn, config, refresh=False) == []
+
+
+def test_refresh_still_detects_content_changes_on_openai_compatible_route(tmp_path, monkeypatch, server):
+    server.responder = lambda request: (200, _completion(json.dumps(DISTILL_OUTPUT)))
+    config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+    distill_session(conn, "s1", config=config)
+    conn.execute("UPDATE distilled SET prompt_version = 'older-prompt'")
+
+    assert _pending(conn, config) == ["s1"]
+
+
+def _codex_config(tmp_path: Path, stage_extra: str = ""):
+    path = tmp_path / "codex.toml"
+    path.write_text(
+        f'[storage]\ndb_path = "{tmp_path / "dream.db"}"\nmemory_root = "{tmp_path / "memory"}"\n'
+        f'[stages.distill]\nprovider = "codex"\n{stage_extra}',
+        encoding="utf-8",
+    )
+    return load_config(path)
+
+
+def test_codex_refresh_comparison_is_unchanged(tmp_path, monkeypatch, server):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+    stage_options = json.dumps({"provider": "codex", "reasoning_effort": "low", "timeout_seconds": 600}, sort_keys=True)
+    conn.execute(
+        "INSERT INTO distilled(session_id, provider, model, prompt_version, provider_options, notes_json) "
+        "VALUES ('s1', 'codex', NULL, ?, ?, '{}')",
+        (prompt_version(), stage_options),
+    )
+
+    assert _pending(conn, _codex_config(tmp_path)) == []
+    assert _pending(conn, _codex_config(tmp_path, 'model = "m-1"\n')) == ["s1"]
+    # Recorded stage settings never override the column comparison for CLI routes.
+    conn.execute("UPDATE distilled SET provider = 'openai-compatible'")
+    assert _pending(conn, _codex_config(tmp_path)) == ["s1"]

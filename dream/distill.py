@@ -210,6 +210,44 @@ def distill_session(
     return result
 
 
+def _drop_unchanged_local_routes(conn: sqlite3.Connection, rows: list, stage: dict) -> list:
+    """Refresh filter for an openai-compatible distill route.
+
+    Such rows record provider "openai-compatible" and the server-reported
+    model, which never equal the stage's provider name and model, so the
+    column comparison flags every session. Compare the recorded stage settings
+    (provider_options) with the current stage instead. Rows without
+    provider_options keep the column comparison. A model changed only inside
+    [providers.<name>] is not detected.
+    """
+    recorded = {
+        row[0]: (row[1], row[2])
+        for row in conn.execute(
+            """
+            SELECT d.session_id, d.provider_options,
+                   COALESCE(d.source_revision, '') <> COALESCE(s.source_revision, '')
+                OR COALESCE(d.parser_version, '') <> COALESCE(s.parser_version, '')
+                OR COALESCE(d.prompt_version, '') <> ?
+            FROM distilled d JOIN sessions s ON s.session_id = d.session_id
+            """,
+            (prompt_version(),),
+        )
+    }
+    kept = []
+    for row in rows:
+        options, content_changed = recorded.get(row[0], (None, True))
+        if options is not None and not content_changed:
+            try:
+                previous = json.loads(options)
+            except ValueError:
+                previous = None
+            if (isinstance(previous, dict) and previous.get("provider") == stage["provider"]
+                    and previous.get("model") == stage.get("model")):
+                continue
+        kept.append(row)
+    return kept
+
+
 def sessions_needing_distill(
     conn: sqlite3.Connection,
     min_chars: int = 500,
@@ -245,4 +283,7 @@ def sessions_needing_distill(
     policy = load_retention_policy(cfg.memory_root)
     excluded_sessions = {row[0] for row in conn.execute("SELECT session_id, project_slug FROM sessions")
                          if policy.excludes(project_slug=row[1])}
-    return [(r[0], r[1]) for r in conn.execute(sql, params).fetchall() if r[0] not in excluded_sessions]
+    rows = conn.execute(sql, params).fetchall()
+    if refresh_config and cfg.provider(provider_name).get("type") == "openai-compatible":
+        rows = _drop_unchanged_local_routes(conn, rows, stage)
+    return [(r[0], r[1]) for r in rows if r[0] not in excluded_sessions]

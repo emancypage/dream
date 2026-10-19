@@ -53,9 +53,6 @@ def preflight(config: DreamConfig | None = None, *, stages=None) -> list[tuple[s
     cfg = config or load_config()
     selected = stages if stages is not None else [name for name in cfg.data["stages"] if not name.startswith("character_")]
     used = {cfg.stage(name)["provider"] for name in selected}
-    if stages is None:
-        # Local model servers are checked once configured, before a stage routes to them.
-        used |= {name for name, provider in cfg.data.get("providers", {}).items() if provider.get("type") == "openai-compatible"}
     return [
         (name, *preflight_provider(cfg.provider(name)))
         for name in sorted(used)

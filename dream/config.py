@@ -165,6 +165,17 @@ def is_loopback_url(url: str) -> bool:
         return False
 
 
+def has_url_extras(url: str) -> bool:
+    """True when a URL carries userinfo, a query or a fragment (all can disguise the host)."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+        return bool(parts.username is not None or parts.password is not None or parts.query or parts.fragment)
+    except ValueError:
+        return True
+
+
 def _validate_openai_compatible_provider(name: str, provider: dict[str, Any]) -> None:
     """A local model server; sending prompts off this machine needs explicit consent."""
     from urllib.parse import urlsplit
@@ -180,6 +191,8 @@ def _validate_openai_compatible_provider(name: str, provider: dict[str, Any]) ->
         valid_url = False
     if not valid_url:
         raise ConfigError(f"provider {name} requires base_url as an http(s) URL with a host")
+    if has_url_extras(base_url):
+        raise ConfigError(f"provider {name} base_url must not contain credentials, a query or a fragment")
     for key in ("model", "api_key_env"):
         if key in provider and (not isinstance(provider[key], str) or not provider[key].strip()):
             raise ConfigError(f"provider {name} {key} must be a non-empty string")
