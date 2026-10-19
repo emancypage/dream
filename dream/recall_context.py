@@ -48,11 +48,14 @@ def _load_calibrations(conn):
     }
 
 
-def run_context(conn, query: RecallQuery, settings, explain: bool = False, *, embedder=None, reranker=None, allow_cache_writes: bool = True, memory_root=None) -> RecallResult:
+def run_context(conn, query: RecallQuery, settings, explain: bool = False, *, embedder=None, reranker=None, allow_cache_writes: bool = True, memory_root=None, constitution_path) -> RecallResult:
     started = time.perf_counter()
     policy = load_retention_policy(memory_root)
     candidates = rank_lexical(conn, query)
+    from character.safety import is_constitution_source
     candidates = [candidate for candidate in candidates if not (
+        is_constitution_source(candidate.document.source_path, memory_root=memory_root, constitution_path=constitution_path)
+        or
         policy.excludes(source_path=candidate.document.source_path,
                         project_slug=candidate.document.project_slug, text=candidate.document.text)
         or (candidate.document.source_kind == "approved_memory" and memory_root is not None
@@ -160,3 +163,26 @@ def recall_preflight(config, db_path) -> list[tuple[str, bool, str]]:
     memories_ok, memories_detail = codex_memories_check()
     checks.append(("codex.memories-double-injection", memories_ok, memories_detail))
     return checks
+
+
+def compose_hook_context(recall_text, character_text, codepoint_limit, additional_context_limit, *, reminder_text=''):
+    """Keep complete character; conservatively bound tokens by UTF-8 bytes."""
+    if not character_text and not reminder_text:
+        return recall_text, None
+    limit = min(codepoint_limit, additional_context_limit)
+    reason = None
+    if len(reminder_text.encode('utf-8')) > limit:
+        return recall_text, 'review-reminder-over-budget'
+    prefix = reminder_text + ('\n\n' if reminder_text and character_text else '')
+    if len((prefix + character_text).encode('utf-8')) > limit:
+        character_text = ''
+        reason = 'character-over-budget'
+    trusted = reminder_text + ('\n\n' if reminder_text and character_text else '') + character_text
+    if not trusted:
+        return recall_text, reason
+    separator = '\n\n# Untrusted recall\n'
+    remaining = limit - len((trusted + separator).encode('utf-8'))
+    if remaining <= 0:
+        return trusted, reason
+    recall_text = recall_text.encode('utf-8')[:remaining].decode('utf-8', errors='ignore')
+    return trusted + (separator + recall_text if recall_text else ''), reason

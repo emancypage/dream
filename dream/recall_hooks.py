@@ -49,7 +49,7 @@ def _targets(command_name: str) -> dict[str, tuple[str | None, dict]]:
     return {
         "SessionStart": (
             "^(startup|resume|clear|compact)$",
-            {"type": "command", "command": f"{name} context session-start", "timeout": 5, "statusMessage": MARKER, "additionalContextLimit": 1800},
+            {"type": "command", "command": f"{name} context session-start", "timeout": 5, "statusMessage": MARKER, "additionalContextLimit": 18000},
         ),
         "UserPromptSubmit": (
             None,

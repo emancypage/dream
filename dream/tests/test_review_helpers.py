@@ -14,6 +14,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from config import load_config
 from dream import _index_target, _merge_index, _prune_orphaned_index_lines, open_db  # noqa: E402
 
 
@@ -91,7 +92,7 @@ def test_prune_orphaned_index_lines_drops_missing_target():
             "- [A](a.md) — hook a\n- [B](b.md) — hook b\n- [C](c.md) — hook c\n",
             encoding="utf-8",
         )
-        changed = _prune_orphaned_index_lines(root)
+        changed = _prune_orphaned_index_lines(root, constitution_path=None)
         assert changed is True
         result = (root / "MEMORY.md").read_text(encoding="utf-8")
         assert "(a.md)" in result
@@ -105,7 +106,7 @@ def test_prune_orphaned_index_lines_noop_when_all_targets_exist():
         (root / "a.md").write_text("x", encoding="utf-8")
         original = "- [A](a.md) — hook a\n"
         (root / "MEMORY.md").write_text(original, encoding="utf-8")
-        changed = _prune_orphaned_index_lines(root)
+        changed = _prune_orphaned_index_lines(root, constitution_path=None)
         assert changed is False
         assert (root / "MEMORY.md").read_text(encoding="utf-8") == original
 
@@ -117,7 +118,7 @@ def test_prune_orphaned_index_lines_preserves_non_link_lines():
             "## Header\n\n- [Gone](gone.md) — orphaned\n\nsome prose\n",
             encoding="utf-8",
         )
-        _prune_orphaned_index_lines(root)
+        _prune_orphaned_index_lines(root, constitution_path=None)
         result = (root / "MEMORY.md").read_text(encoding="utf-8")
         assert "## Header" in result
         assert "some prose" in result
@@ -127,7 +128,7 @@ def test_prune_orphaned_index_lines_preserves_non_link_lines():
 def test_prune_orphaned_index_lines_no_memory_md():
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
-        assert _prune_orphaned_index_lines(root) is False
+        assert _prune_orphaned_index_lines(root, constitution_path=None) is False
 
 
 def test_migration_adds_sug_file_to_legacy_db():
@@ -240,7 +241,7 @@ def test_cmd_review_auto_apply_prunes_orphaned_index_lines():
         conn.commit()
         conn.close()
 
-        args = argparse.Namespace(db=db_path, memory=str(root), yes=True, dry_run=False)
+        args = argparse.Namespace(db=db_path, memory=str(root), yes=True, dry_run=False, config=load_config(Path(d) / 'absent.toml'))
         cmd_review(args)
 
         result = (root / "MEMORY.md").read_text(encoding="utf-8")
@@ -269,7 +270,7 @@ def test_cmd_review_interactive_prunes_orphaned_index_lines(monkeypatch):
         conn.close()
 
         monkeypatch.setattr("builtins.input", lambda _: "r")  # reject the one suggestion
-        args = argparse.Namespace(db=db_path, memory=str(root), yes=False, dry_run=False)
+        args = argparse.Namespace(db=db_path, memory=str(root), yes=False, dry_run=False, config=load_config(Path(d) / 'absent.toml'))
         cmd_review(args)
 
         result = (root / "MEMORY.md").read_text(encoding="utf-8")
@@ -292,7 +293,7 @@ def test_apply_suggestion_remove_deletes_file_and_marks_accepted():
         sug_id = cur.lastrowid
         conn.commit()
 
-        _apply_suggestion(conn, root, root / ".suggestions", sug_id, "remove", "dead.md", "", None)
+        _apply_suggestion(conn, root, root / ".suggestions", sug_id, "remove", "dead.md", "", None, constitution_path=None)
 
         assert not (root / "dead.md").exists()
         row = conn.execute("SELECT status FROM suggestions WHERE id=?", (sug_id,)).fetchone()
@@ -316,7 +317,7 @@ def test_apply_suggestion_remove_refuses_path_escape():
         sug_id = cur.lastrowid
         conn.commit()
 
-        _apply_suggestion(conn, root, root / ".suggestions", sug_id, "remove", "../outside.md", "", None)
+        _apply_suggestion(conn, root, root / ".suggestions", sug_id, "remove", "../outside.md", "", None, constitution_path=None)
 
         assert outside.exists()  # untouched
         row = conn.execute("SELECT status FROM suggestions WHERE id=?", (sug_id,)).fetchone()
@@ -341,7 +342,7 @@ def test_apply_suggestion_remove_refuses_memory_md_aliases(target_path):
         sug_id = cur.lastrowid
         conn.commit()
 
-        _apply_suggestion(conn, root, root / ".suggestions", sug_id, "remove", target_path, "", None)
+        _apply_suggestion(conn, root, root / ".suggestions", sug_id, "remove", target_path, "", None, constitution_path=None)
 
         assert (root / "MEMORY.md").exists()
         row = conn.execute("SELECT status FROM suggestions WHERE id=?", (sug_id,)).fetchone()
@@ -372,7 +373,7 @@ def test_apply_suggestion_refuses_changed_target():
 
         applied = _apply_suggestion(
             conn, root, root / ".suggestions", sug_id, "update", "topic.md", "proposed", None
-        )
+        , constitution_path=None)
 
         assert applied is False
         assert target.read_text(encoding="utf-8") == "manual newer edit\n"

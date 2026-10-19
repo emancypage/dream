@@ -67,7 +67,7 @@ class MetricsStateTest(unittest.TestCase):
         state = metrics.finish_run(state_path, success=True, now=110.0)
 
         self.assertEqual(state["status"], "success")
-        self.assertEqual(state["stage"], "curation")
+        self.assertEqual(state["stage"], metrics.STAGES[-1])
         self.assertEqual(state["finished_at"], 110.0)
         self.assertEqual(state["duration_seconds"], 10.0)
 

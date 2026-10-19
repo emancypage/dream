@@ -1,0 +1,1 @@
+Create one new task prompt from the supplied untrusted human seed. Keep its language and trait meaning. Return only the prompt field. Do not create traits, approve rules, or copy public evaluation probes.

@@ -15,7 +15,7 @@ from recall_types import AdapterSettings, RecallSettings
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "dream" / "config.toml"
 
-_TOP_KEYS = {"storage", "stages", "providers", "sources", "review", "recall"}
+_TOP_KEYS = {"storage", "stages", "providers", "sources", "review", "recall", "character"}
 _STORAGE_KEYS = {"db_path", "memory_root"}
 _STAGE_KEYS = {"provider", "model", "reasoning_effort", "timeout_seconds"}
 _PROVIDER_KEYS = {"type", "auth", "executable", "extra_args"}
@@ -49,9 +49,9 @@ _RECALL_DEFAULTS: dict[str, Any] = {
     "install_hooks": False,
     "allow_raw_transcript_prompt": False,
     "first_prompt_only": True,
-    "session_start_budget_codepoints": 6000,
+    "session_start_budget_codepoints": 18000,
     "prompt_budget_codepoints": 4000,
-    "session_start_additional_context_limit": 1800,
+    "session_start_additional_context_limit": 18000,
     "prompt_additional_context_limit": 1200,
     "diagnostic_path": "~/.cache/dream/recall-diagnostics.jsonl",
     "calibration_path": "~/.config/dream/recall-calibration.json",
@@ -172,6 +172,7 @@ def _validate(data: dict[str, Any]) -> list[str]:
     for name, stage in data.get("stages", {}).items():
         if stage["provider"] not in providers:
             raise ConfigError(f"stage {name} references unknown provider {stage['provider']!r}")
+    _validate_character(data)
     _validate_recall(data.get("recall", {}), optional_errors)
     return optional_errors
 
@@ -241,3 +242,55 @@ def load_config(path: Path | None = None, overrides: dict[str, Any] | None = Non
         path=chosen if chosen.exists() else None,
         optional_config_errors=tuple(optional_errors),
     )
+
+
+def _validate_character(data):
+    raw = data.get("character", {})
+    if not isinstance(raw, dict):
+        raise ConfigError("character must be a table")
+    bools = {"enabled", "allow_same_family_judge", "hook_injection"}
+    paths = {"constitution_path", "state_root"}
+    ints = {"render_max_pairs", "render_budget_codepoints", "max_context_codepoints", "max_response_codepoints", "max_seed_expansions"}
+    _unknown_keys("character", raw, bools | paths | ints)
+    for key, value in raw.items():
+        if key in bools and type(value) is not bool:
+            raise ConfigError(f"character.{key} must be a boolean")
+        if key in paths and (not isinstance(value, str) or not value.strip()):
+            raise ConfigError(f"character.{key} must be a nonempty path")
+        if key in ints and (type(value) is not int or value < (0 if key == "max_seed_expansions" else 1)):
+            raise ConfigError(f"character.{key} must be a positive integer")
+    constitution = Path(raw["constitution_path"]).expanduser().resolve()
+    memory_root = DreamConfig(data, None).memory_root.resolve()
+    if constitution.is_relative_to(memory_root):
+        raise ConfigError("character constitution_path must stay outside the memory root")
+    for name, stage in data.get("stages", {}).items():
+        if not name.startswith("character_"):
+            continue
+        if name not in {"character_extract", "character_generate", "character_judge", "character_eval_response"}:
+            raise ConfigError(f"unknown character stage: {name}")
+        for key, value in stage.items():
+            if key == "timeout_seconds":
+                if type(value) is not int or value <= 0:
+                    raise ConfigError(f"stage {name} timeout_seconds must be positive integer")
+            elif not isinstance(value, str) or not value.strip():
+                raise ConfigError(f"stage {name} {key} must be nonempty string")
+    if raw.get("enabled"):
+        cfg = DreamConfig(data=data, path=None)
+        families = {name: provider_family(cfg, name) for name in (
+            "character_extract", "character_generate", "character_judge", "character_eval_response"
+        )}
+        if not raw.get("allow_same_family_judge") and any(
+            families[name] == families["character_judge"]
+            for name in ("character_extract", "character_generate")
+        ):
+            raise ConfigError("character judge family must differ from extraction and generation")
+
+
+def provider_family(config: DreamConfig, stage: str) -> str:
+    """Return a known provider/auth family; never infer one from a model name."""
+    provider = config.provider(config.stage(stage)["provider"])
+    if provider.get("type") == "claude-cli" and "auth" not in provider:
+        return "anthropic"
+    if provider.get("type") == "codex-cli" and provider.get("auth") == "chatgpt-subscription":
+        return "openai"
+    raise ConfigError(f"stage {stage} has unknown provider auth/family")

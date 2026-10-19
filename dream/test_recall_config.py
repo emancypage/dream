@@ -39,9 +39,9 @@ def test_recall_defaults_match_packaged_configuration():
     assert settings.install_hooks is False
     assert settings.allow_raw_transcript_prompt is False
     assert settings.first_prompt_only is True
-    assert settings.session_start_budget_codepoints == 6000
+    assert settings.session_start_budget_codepoints == 18000
     assert settings.prompt_budget_codepoints == 4000
-    assert settings.session_start_additional_context_limit == 1800
+    assert settings.session_start_additional_context_limit == 18000
     assert settings.prompt_additional_context_limit == 1200
     assert settings.diagnostic_path == "~/.cache/dream/recall-diagnostics.jsonl"
     assert settings.calibration_path == "~/.config/dream/recall-calibration.json"
@@ -86,7 +86,7 @@ def test_invalid_optional_embedder_config_is_recorded_without_blocking(tmp_path)
     # Core configuration still loads and stays intact.
     settings = config.recall_settings()
     assert settings.enabled is True
-    assert settings.session_start_budget_codepoints == 6000
+    assert settings.session_start_budget_codepoints == 18000
     # The invalid adapter falls back to its safe disabled default.
     assert settings.embedder == DEFAULT_ADAPTER
 

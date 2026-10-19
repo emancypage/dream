@@ -470,7 +470,7 @@ def test_curate_syncs_recall_after_final_index_prune(tmp_path, monkeypatch):
         },
     )
     conn = open_db(db_path)
-    dream._sync_recall_documents(conn, root)
+    dream._sync_recall_documents(conn, root, constitution_path=None)
     _insert_pending(conn, root, "topic.md", "update", "new")
     conn.commit()
     conn.close()

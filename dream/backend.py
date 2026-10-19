@@ -24,9 +24,12 @@ def generate(
     model: str | None = None,
     timeout: int | None = None,
     config: DreamConfig | None = None,
+    system_prompt: str | None = None,
 ) -> GenerationResult:
     cfg = config or load_config()
     stage_cfg = cfg.stage(stage)
+    if stage.startswith("character_") and not (model or stage_cfg.get("model")):
+        raise ValueError(f"character stage {stage} requires an explicit model ID")
     provider_name = stage_cfg["provider"]
     provider_cfg = cfg.provider(provider_name)
     provider = create_provider(provider_cfg["type"])
@@ -36,7 +39,7 @@ def generate(
         "executable": provider_cfg.get("executable"),
     }
     request = GenerationRequest(
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=SYSTEM_PROMPT if system_prompt is None else system_prompt,
         prompt=prompt,
         schema=schema,
         model=model or stage_cfg.get("model"),
@@ -46,9 +49,10 @@ def generate(
     return provider.generate_structured(request)
 
 
-def preflight(config: DreamConfig | None = None) -> list[tuple[str, bool, str]]:
+def preflight(config: DreamConfig | None = None, *, stages=None) -> list[tuple[str, bool, str]]:
     cfg = config or load_config()
-    used = {stage["provider"] for stage in cfg.data["stages"].values()}
+    selected = stages if stages is not None else [name for name in cfg.data["stages"] if not name.startswith("character_")]
+    used = {cfg.stage(name)["provider"] for name in selected}
     return [
         (name, *preflight_provider(cfg.provider(name)))
         for name in sorted(used)

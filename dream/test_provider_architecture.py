@@ -12,7 +12,7 @@ from model_types import SchemaValidationError, validate_output
 ROOT = Path(__file__).parent
 
 
-def test_nightly_service_invokes_codex_curation_not_mechanical_apply():
+def test_nightly_service_invokes_configured_curation_not_mechanical_apply():
     service = (ROOT / "systemd" / "dream.service").read_text(encoding="utf-8")
     assert "dream suggestions curate-configured" in service
     assert "dream suggestions apply-configured" not in service
@@ -22,7 +22,7 @@ def test_nightly_service_invokes_codex_curation_not_mechanical_apply():
 def test_nightly_service_continues_after_individual_stage_failures():
     service = (ROOT / "systemd" / "dream.service").read_text(encoding="utf-8")
     stages = [line for line in service.splitlines() if line.startswith("ExecStart=")]
-    assert len(stages) == 4
+    assert len(stages) == 6
     assert all("dream-stage --continue-on-error " in line for line in stages)
 
 
