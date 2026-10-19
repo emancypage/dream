@@ -9,6 +9,7 @@ Subcommands:
   consolidate   Run the configured consolidation stage and propose updates
   audit         Weekly staleness audit over the whole store (remove/patch only)
   search        FTS5 search over all ingested transcripts
+  recall        Read-only approved-memory query for agents (prints the recall block)
   review        Walk pending suggestions, accept/reject interactively
   status        Show DB stats
 
@@ -48,6 +49,7 @@ from config import load_config  # noqa: E402
 from curate import CURATION_SCHEMA, build_curation_prompt, parse_curation_output  # noqa: E402
 from recall_documents import embed_recall_documents, synchronize_recall_documents  # noqa: E402
 from recall_context import append_diagnostic, configured_embedder, parse_hook_payload, recall_preflight, recent_diagnostic, run_context, hook_success_json  # noqa: E402
+from recall_context import RECALL_KINDS, RecallUnavailable, agent_results, recall_for_agent, validate_agent_query  # noqa: E402
 from recall_hook_state import claim_hook_event, finish_hook_event, successful_session_start_ids  # noqa: E402
 from recall_hooks import install_hooks, uninstall_hooks  # noqa: E402
 from storage import open_db_readonly  # noqa: E402
@@ -534,6 +536,66 @@ def cmd_search(args: argparse.Namespace) -> int:
         print(f"\n{role_c}  {ts}  {_color(h.project_slug, 'grey')}  {_color('('+h.session_id[:8]+')', 'grey')}")
         print(f"  {h.snippet}")
     print(f"\n{len(hits)} hits.")
+    return 0
+
+
+def _recall_unavailable(reason: str) -> int:
+    """One bounded stderr line, nothing on stdout, exit 0: agents carry on without recall."""
+    print(f"dream recall: unavailable ({' '.join(str(reason).split())[:200]})", file=sys.stderr)
+    return 0
+
+
+def cmd_recall(args: argparse.Namespace) -> int:
+    """Agent-side recall over approved memory, read-only and fail-open.
+
+    Usage errors (an empty query, ``raw_transcript`` without the opt-in)
+    exit 2. A missing or busy database, an unmigrated schema or disabled
+    recall print one ``unavailable`` line to stderr and exit 0. The command
+    writes nothing: no markers, cache rows, embeddings or diagnostics.
+    """
+    settings = args.config.recall_settings()
+    try:
+        query_text, kinds = validate_agent_query(args.query, args.kinds, settings)
+    except ValueError as exc:
+        print(f"dream recall: {exc}", file=sys.stderr)
+        return 2
+    conn = None
+    try:
+        if not args.db.exists():
+            return _recall_unavailable("database does not exist")
+        conn = open_db_readonly(args.db)
+        # Building the embedder contacts nothing; an unusable one means lexical recall.
+        embedder, embedder_problem = configured_embedder(args.config)
+        if embedder_problem:
+            from dataclasses import replace
+            settings = replace(settings, embedder=replace(settings.embedder, enabled=False))
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = None
+        result = recall_for_agent(
+            conn, settings, query_text=query_text, cwd=cwd, memory_root=args.config.memory_root,
+            constitution_path=args.config.data["character"]["constitution_path"], project_slug=args.project,
+            kinds=kinds, limit=args.limit, budget_codepoints=settings.prompt_budget_codepoints, embedder=embedder,
+        )
+    except RecallUnavailable as exc:
+        return _recall_unavailable(str(exc))
+    except Exception as exc:
+        return _recall_unavailable(f"{type(exc).__name__}: {exc}")
+    finally:
+        if conn is not None:
+            conn.close()
+    if args.json:
+        fallback_reason = result.diagnostics.fallback_reason or ("embedder-misconfigured" if embedder_problem else None)
+        print(json.dumps({
+            "mode": result.mode,
+            "calibration_version": result.calibration_version,
+            "fallback_reason": fallback_reason,
+            "results": agent_results(result),
+            "context": result.rendered_context,
+        }, ensure_ascii=False))
+    elif result.rendered_context:
+        print(result.rendered_context)
     return 0
 
 
@@ -1569,6 +1631,14 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _recall_kinds(value: str) -> tuple[str, ...]:
+    kinds = tuple(dict.fromkeys(part.strip() for part in value.split(",") if part.strip()))
+    unknown = [kind for kind in kinds if kind not in RECALL_KINDS]
+    if not kinds or unknown:
+        raise argparse.ArgumentTypeError(f"expected a comma-separated list of: {', '.join(RECALL_KINDS)}")
+    return kinds
+
+
 def _language_codes(value: str) -> tuple[str, ...]:
     from eval_build import validate_languages
     try:
@@ -1629,6 +1699,17 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("--role", choices=["user", "assistant"])
     ps.add_argument("--project")
     ps.set_defaults(func=cmd_search)
+
+    prc = sub.add_parser("recall", help="Read-only approved-memory query for agents (untrusted reference data)")
+    prc.add_argument("query", help="3-8 content words, passed as one argument")
+    prc.add_argument("--project", help="Prefer this project slug; other projects stay eligible")
+    prc.add_argument("--kinds", type=_recall_kinds,
+                     help="Comma-separated source kinds (approved_memory, distilled_summary; raw_transcript "
+                          "needs recall.allow_raw_transcript_prompt)")
+    prc.add_argument("--limit", type=int, default=5, help="Results to return, clamped to 1-10 (default 5)")
+    prc.add_argument("--json", action="store_true",
+                     help="Print one JSON object with mode, calibration version, results and the rendered context")
+    prc.set_defaults(func=cmd_recall)
 
     pr = sub.add_parser("review", help="Walk pending suggestions interactively")
     pr.add_argument("--memory")
@@ -1724,6 +1805,8 @@ def main(argv: list[str] | None = None) -> int:
             if getattr(args, "explain", False):
                 print(json.dumps({"error": type(exc).__name__, "message": str(exc)[:400]}, separators=(",", ":")))
             return 0
+        if args.cmd == "recall":
+            return _recall_unavailable(f"configuration error: {type(exc).__name__}: {exc}")
         raise
     args.db = Path(args.db).expanduser() if args.db else args.config.db_path
     if hasattr(args, "memory"):

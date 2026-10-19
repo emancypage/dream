@@ -161,12 +161,21 @@ def retrieve(conn, query: RecallQuery, settings, calibrations, *, embedder=None,
     return Retrieval(tuple(candidates), selected, mode, fallback or adapter_fallback, version)
 
 
-def run_context(conn, query: RecallQuery, settings, explain: bool = False, *, embedder=None, reranker=None, allow_cache_writes: bool = False, memory_root=None, constitution_path) -> RecallResult:
+def run_context(conn, query: RecallQuery, settings, explain: bool = False, *, embedder=None, reranker=None, allow_cache_writes: bool = False, memory_root=None, constitution_path,
+                kinds: frozenset[str] | None = None, limit: int | None = None) -> RecallResult:
+    """Retrieve, select and render one recall run.
+
+    ``kinds`` is a hard source-kind filter applied before selection, and
+    ``limit`` keeps the first selected candidates before rendering. Both
+    default to None (every kind, no limit), which the hooks rely on.
+    """
     started = time.perf_counter()
     policy = load_retention_policy(memory_root)
     from character.safety import is_constitution_source
 
     def keep(candidate) -> bool:
+        if kinds is not None and candidate.document.source_kind not in kinds:
+            return False
         return not (
             is_constitution_source(candidate.document.source_path, memory_root=memory_root, constitution_path=constitution_path)
             or
@@ -180,11 +189,112 @@ def run_context(conn, query: RecallQuery, settings, explain: bool = False, *, em
         conn, query, settings, _load_calibrations(conn), embedder=embedder, reranker=reranker,
         allow_cache_writes=allow_cache_writes, keep=keep,
     )
-    rendered = render_context(outcome.selected, query.requested_codepoint_budget, query.query_text)
+    selected = outcome.selected if limit is None else outcome.selected[:limit]
+    rendered = render_context(selected, query.requested_codepoint_budget, query.query_text)
     elapsed = int((time.perf_counter() - started) * 1000)
-    diagnostics = RecallDiagnostics(len(outcome.candidates), len(outcome.selected), outcome.fallback_reason,
+    diagnostics = RecallDiagnostics(len(outcome.candidates), len(selected), outcome.fallback_reason,
                                     len(rendered), elapsed, outcome.calibration_version)
-    return RecallResult(outcome.selected, rendered, outcome.mode, outcome.calibration_version, diagnostics)
+    return RecallResult(selected, rendered, outcome.mode, outcome.calibration_version, diagnostics)
+
+
+AGENT_QUERY_EVENT = "agent-query"
+AGENT_QUERY_MAX_LIMIT = 10
+RECALL_KINDS = ("approved_memory", "distilled_summary", "raw_transcript")
+# Every agent query reads these. recall_embeddings is optional: without it ranking stays lexical.
+AGENT_RECALL_TABLES = ("recall_documents", "recall_documents_fts", "recall_calibrations")
+
+
+class RecallUnavailable(Exception):
+    """The store cannot answer an agent query: recall is disabled or the schema is missing."""
+
+
+def missing_recall_tables(conn) -> tuple[str, ...]:
+    names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    return tuple(name for name in AGENT_RECALL_TABLES if name not in names)
+
+
+def validate_agent_query(query_text, kinds, settings) -> tuple[str, frozenset[str] | None]:
+    """Check one agent query's user input: ``(query_text, kinds)`` or ValueError.
+
+    ``kinds`` None keeps every kind the prompt path allows. ``raw_transcript``
+    is accepted only when ``recall.allow_raw_transcript_prompt`` is true.
+    """
+    if not isinstance(query_text, str) or not query_text.strip():
+        raise ValueError("expected a non-empty query")
+    if kinds is None:
+        return query_text, None
+    if not isinstance(kinds, (list, tuple, set, frozenset)):
+        raise ValueError("kinds must be a list of kind names")
+    names = tuple(dict.fromkeys(kind.strip() if isinstance(kind, str) else repr(kind)[:40] for kind in kinds))
+    names = tuple(name for name in names if name)
+    if not names:
+        raise ValueError("expected at least one kind")
+    unknown = [name[:40] for name in names if name not in RECALL_KINDS]
+    if unknown:
+        raise ValueError(f"unknown kind {', '.join(unknown[:3])}; expected {', '.join(RECALL_KINDS)}")
+    if "raw_transcript" in names and not settings.allow_raw_transcript_prompt:
+        raise ValueError("raw_transcript recall is disabled; it needs recall.allow_raw_transcript_prompt = true")
+    return query_text, frozenset(names)
+
+
+def _rendered_candidates(candidates, budget_codepoints: int, query_text: str) -> tuple[RecallCandidate, ...]:
+    """The candidates whose block ``render_context`` keeps, in order.
+
+    Rendering is greedy and skips a block that no longer fits, so a candidate
+    is rendered exactly when it lengthens the rendering of the prefix before it.
+    """
+    shown = []
+    previous = 0
+    for index, candidate in enumerate(candidates):
+        length = len(render_context(candidates[:index + 1], budget_codepoints, query_text))
+        if length > previous:
+            shown.append(candidate)
+        previous = length
+    return tuple(shown)
+
+
+def recall_for_agent(conn, settings, *, query_text, cwd, memory_root, constitution_path, project_slug=None,
+                     kinds=None, limit=5, budget_codepoints=4000, embedder=None) -> RecallResult:
+    """Answer an agent's memory query: the entry point of ``dream recall`` and the MCP server.
+
+    The query takes the prompt path with the ``agent-query`` event, so the
+    active mode's calibrated threshold and the embedder calibration gate
+    apply, and runs with ``allow_cache_writes=False``. ``conn`` should be a
+    read-only connection; nothing here writes markers, cache rows or files.
+    ``project_slug`` joins the path evidence as a soft boost: every project
+    stays eligible. ``kinds`` is a hard filter and ``limit`` is clamped to
+    1-10. ``selected`` holds the candidates whose block is in the rendered
+    context. Invalid input raises ValueError; a disabled or unmigrated store
+    raises RecallUnavailable.
+    """
+    query_text, allowed = validate_agent_query(query_text, kinds, settings)
+    if project_slug is not None and not isinstance(project_slug, str):
+        raise ValueError("project must be a string")
+    project = (project_slug or "").strip()
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise ValueError("limit must be an integer")
+    limit = max(1, min(AGENT_QUERY_MAX_LIMIT, limit))
+    if not settings.enabled:
+        raise RecallUnavailable("recall disabled")
+    missing = missing_recall_tables(conn)
+    if missing:
+        raise RecallUnavailable("recall tables missing: " + ", ".join(missing))
+    allow_raw = settings.allow_raw_transcript_prompt and (allowed is None or "raw_transcript" in allowed)
+    query = RecallQuery(query_text, None, AGENT_QUERY_EVENT, str(cwd) if cwd else None, (project,) if project else (),
+                        int(budget_codepoints), frozenset(), allow_raw)
+    result = run_context(conn, query, settings, embedder=embedder, allow_cache_writes=False, memory_root=memory_root,
+                         constitution_path=constitution_path, kinds=allowed, limit=limit)
+    shown = _rendered_candidates(result.selected, query.requested_codepoint_budget, query.query_text)
+    return replace(result, selected=shown, diagnostics=replace(result.diagnostics, selected_count=len(shown)))
+
+
+def agent_results(result: RecallResult) -> list[dict]:
+    """The structured result rows of an agent query: ``id``, ``kind``, ``trust``, ``project``, ``score``."""
+    return [
+        {"id": candidate.document.id, "kind": candidate.document.source_kind, "trust": candidate.document.trust_level,
+         "project": candidate.document.project_slug, "score": candidate.score}
+        for candidate in result.selected
+    ]
 
 
 def embedder_config_errors(config) -> tuple[str, ...]:
