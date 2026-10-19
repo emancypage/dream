@@ -1,0 +1,262 @@
+"""
+OpenAI-compatible chat-completions provider for local model servers.
+
+Targets llama-server, Ollama, vLLM and similar servers that expose
+`/v1/chat/completions`, normally on a loopback port. Standard library only;
+no streaming and no tool calls.
+
+  * Structured output is requested with `response_format = json_schema`. A
+    server that rejects it (HTTP 400/422, or an error body naming
+    response_format) gets exactly one retry with `json_object`, with the
+    schema moved into the system prompt. Output is validated host-side
+    against the stage schema either way, as for the CLI providers.
+  * Every other failure (timeout, refused connection, any other HTTP status,
+    unparseable or schema-invalid output) raises ProviderError at once.
+  * The stage's `model` and `timeout_seconds` win; the provider's values are
+    defaults, and the final timeout fallback is 600 s. backend.generate
+    resolves the timeout, this module the model.
+  * Proxy environment variables are ignored and redirects are refused, so the
+    prompt and the optional key reach only the configured host. A
+    non-loopback `base_url` additionally needs `remote_data_egress = true`.
+  * `api_key_env` names an environment variable read at call time; its value
+    is sent as a Bearer header and is never logged, returned or stored.
+"""
+
+from __future__ import annotations
+
+import http.client
+import json
+import os
+import time
+import urllib.error
+import urllib.request
+from typing import Any, Mapping
+from urllib.parse import urlsplit
+
+from config import is_loopback_url
+from model_types import (
+    GenerationRequest,
+    GenerationResult,
+    ProviderError,
+    Usage,
+    validate_output,
+)
+
+PROVIDER = "openai-compatible"
+DEFAULT_TIMEOUT_SECONDS = 600
+PREFLIGHT_TIMEOUT_SECONDS = 5.0
+_ERROR_BODY_LIMIT = 65536
+_ERROR_EXCERPT_CHARS = 300
+
+
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # Surfaces the 3xx as an HTTPError instead of following it.
+
+
+def _opener() -> urllib.request.OpenerDirector:
+    # ProxyHandler({}) ignores http_proxy and friends; with redirects refused,
+    # every request reaches only the configured base_url.
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _RefuseRedirects)
+
+
+class _HTTPStatusError(ProviderError):
+    def __init__(self, display: str, status: int, body: str):
+        excerpt = " ".join(body.split())[:_ERROR_EXCERPT_CHARS]
+        super().__init__(f"{PROVIDER} server at {display} returned HTTP {status}: {excerpt}")
+        self.status = status
+        self.body = body
+
+    def rejects_response_format(self) -> bool:
+        return self.status in (400, 422) or "response_format" in self.body.lower()
+
+
+class OpenAICompatibleProvider:
+    def __init__(self, settings: Mapping[str, Any] | None = None):
+        self.settings = dict(settings or {})
+
+    def generate_structured(self, request: GenerationRequest) -> GenerationResult:
+        return generate(request, self.settings)
+
+
+def generate(request: GenerationRequest, settings: Mapping[str, Any]) -> GenerationResult:
+    """One chat completion validated against `request.schema`."""
+    base_url = _checked_base_url(settings)
+    url = _endpoint(base_url, "chat/completions")
+    timeout = _timeout(settings, request.timeout_seconds)
+    model = request.model or settings.get("model")
+    strict = {
+        "type": "json_schema",
+        "json_schema": {"name": "dream_output", "schema": request.schema, "strict": True},
+    }
+    t0 = time.monotonic()
+    try:
+        data = _request_json("POST", url, _payload(request, model, strict), settings, timeout)
+    except _HTTPStatusError as exc:
+        if not exc.rejects_response_format():
+            raise
+        fallback = _payload(request, model, {"type": "json_object"}, schema_in_prompt=True)
+        data = _request_json("POST", url, fallback, settings, timeout)
+    content, finish_reason = _message_content(data)
+    output = _parse_json(content, finish_reason)
+    validate_output(output, request.schema)
+    reported = data.get("model")
+    return GenerationResult(
+        output=output,
+        raw_result=content,
+        provider=PROVIDER,
+        model=reported if isinstance(reported, str) and reported else model,
+        usage=_usage(data),
+        duration_ms=int((time.monotonic() - t0) * 1000),
+    )
+
+
+def preflight(settings: Mapping[str, Any]) -> tuple[bool, str]:
+    """Check reachability and list `/v1/models` without calling the model."""
+    try:
+        base_url = _checked_base_url(settings)
+        timeout = min(PREFLIGHT_TIMEOUT_SECONDS, _timeout(settings, None))
+        data = _request_json("GET", _endpoint(base_url, "models"), None, settings, timeout)
+    except ProviderError as exc:
+        return False, str(exc)
+    entries = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return False, f"{_display(base_url)} /v1/models returned no model list"
+    ids = [entry["id"] for entry in entries if isinstance(entry, dict) and isinstance(entry.get("id"), str)]
+    detail = f"{_display(base_url)} reachable; models: {', '.join(ids) or '(none)'}"
+    model = settings.get("model")
+    if model and model not in ids:
+        detail += f"; configured model {model!r} not listed"
+    return True, detail
+
+
+def _checked_base_url(settings: Mapping[str, Any]) -> str:
+    base_url = settings.get("base_url")
+    if not isinstance(base_url, str) or not base_url:
+        raise ProviderError(f"{PROVIDER} provider requires base_url")
+    # Config validation enforces this too; repeat it for direct callers.
+    if settings.get("remote_data_egress", False) is not True and not is_loopback_url(base_url):
+        raise ProviderError(f"{PROVIDER} base_url is not loopback and remote_data_egress is not true")
+    return base_url
+
+
+def _endpoint(base_url: str, path: str) -> str:
+    root = base_url.rstrip("/")
+    if not root.endswith("/v1"):
+        root += "/v1"
+    return f"{root}/{path}"
+
+
+def _display(base_url: str) -> str:
+    # Host and port only: never echo userinfo or paths from the configured URL.
+    return urlsplit(base_url).netloc.rpartition("@")[2]
+
+
+def _timeout(settings: Mapping[str, Any], request_timeout: float | None) -> float:
+    return request_timeout or settings.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS
+
+
+def _payload(
+    request: GenerationRequest,
+    model: str | None,
+    response_format: dict[str, Any],
+    *,
+    schema_in_prompt: bool = False,
+) -> dict[str, Any]:
+    system = request.system_prompt
+    if schema_in_prompt:
+        schema_text = json.dumps(request.schema, sort_keys=True, ensure_ascii=False)
+        instruction = f"Return a single JSON object that satisfies this JSON schema:\n{schema_text}"
+        system = f"{system}\n\n{instruction}" if system else instruction
+    messages = [{"role": "system", "content": system}] if system else []
+    messages.append({"role": "user", "content": request.prompt})
+    payload: dict[str, Any] = {"messages": messages, "response_format": response_format, "stream": False}
+    if model:
+        payload["model"] = model
+    return payload
+
+
+def _request_json(
+    method: str,
+    url: str,
+    payload: dict[str, Any] | None,
+    settings: Mapping[str, Any],
+    timeout: float,
+) -> Any:
+    display = _display(url)
+    headers = {"Accept": "application/json"}
+    body = None
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    key_env = settings.get("api_key_env")
+    api_key = os.environ.get(key_env) if key_env else None
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with _opener().open(req, timeout=timeout) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        raise _HTTPStatusError(display, exc.code, _error_body(exc)) from exc
+    except TimeoutError as exc:
+        raise ProviderError(f"{PROVIDER} server at {display} timed out after {timeout:g}s") from exc
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise ProviderError(f"{PROVIDER} server at {display} timed out after {timeout:g}s") from exc
+        raise ProviderError(f"{PROVIDER} server at {display} is unreachable: {exc.reason}") from exc
+    except (OSError, http.client.HTTPException) as exc:
+        raise ProviderError(f"{PROVIDER} request to {display} failed: {type(exc).__name__}") from exc
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        raise ProviderError(f"{PROVIDER} server at {display} returned a non-JSON response") from exc
+
+
+def _error_body(exc: urllib.error.HTTPError) -> str:
+    try:
+        return exc.read(_ERROR_BODY_LIMIT).decode("utf-8", errors="replace")
+    except (OSError, http.client.HTTPException):
+        return ""
+
+
+def _message_content(data: Any) -> tuple[str, str | None]:
+    try:
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ProviderError(f"{PROVIDER} response has no choices[0].message") from exc
+    finish_reason = choice.get("finish_reason")
+    if not isinstance(content, str) or not content.strip():
+        raise ProviderError(f"{PROVIDER} response has no message content (finish_reason={finish_reason!r})")
+    return content, finish_reason
+
+
+def _parse_json(raw: str, finish_reason: str | None) -> Any:
+    raw = raw.strip()
+    candidates = [raw]
+    # Tolerate a ```json … ``` fence if the model added one despite the format.
+    if raw.startswith("```"):
+        body = raw.split("\n", 1)[1] if "\n" in raw else ""
+        candidates.append(body.rsplit("```", 1)[0].strip())
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+    # The excerpt is withheld: model output derives from private transcripts.
+    raise ProviderError(
+        f"could not parse {PROVIDER} output as JSON ({len(raw)} chars, finish_reason={finish_reason!r})"
+    )
+
+
+def _usage(data: dict[str, Any]) -> Usage | None:
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    def count(key: str) -> int | None:
+        value = usage.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    return Usage(input_tokens=count("prompt_tokens"), output_tokens=count("completion_tokens"))

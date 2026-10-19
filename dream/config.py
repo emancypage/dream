@@ -143,6 +143,59 @@ def _unknown_keys(label: str, data: dict[str, Any], allowed: set[str]) -> None:
         raise ConfigError(f"unknown {label} options: {', '.join(unknown)}")
 
 
+_OPENAI_COMPATIBLE_PROVIDER_KEYS = {"type", "base_url", "model", "api_key_env", "remote_data_egress", "timeout_seconds"}
+
+
+def is_loopback_url(url: str) -> bool:
+    """True only for 127.0.0.0/8, ::1 and the literal name localhost."""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _validate_openai_compatible_provider(name: str, provider: dict[str, Any]) -> None:
+    """A local model server; sending prompts off this machine needs explicit consent."""
+    from urllib.parse import urlsplit
+
+    _unknown_keys(f"provider {name}", provider, _OPENAI_COMPATIBLE_PROVIDER_KEYS)
+    base_url = provider.get("base_url")
+    try:
+        parts = urlsplit(base_url) if isinstance(base_url, str) else None
+        valid_url = bool(parts and parts.scheme in {"http", "https"} and parts.hostname)
+        # .port raises ValueError for a malformed or out-of-range port.
+        valid_url = valid_url and (parts.port is None or parts.port > 0)
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        raise ConfigError(f"provider {name} requires base_url as an http(s) URL with a host")
+    for key in ("model", "api_key_env"):
+        if key in provider and (not isinstance(provider[key], str) or not provider[key].strip()):
+            raise ConfigError(f"provider {name} {key} must be a non-empty string")
+    egress = provider.get("remote_data_egress", False)
+    if not isinstance(egress, bool):
+        raise ConfigError(f"provider {name} remote_data_egress must be a boolean")
+    timeout = provider.get("timeout_seconds", 600)
+    if type(timeout) is not int or timeout <= 0:
+        raise ConfigError(f"provider {name} timeout_seconds must be a positive integer")
+    if not egress and not is_loopback_url(base_url):
+        raise ConfigError(
+            f"provider {name} base_url is not a loopback address; "
+            "set remote_data_egress = true to allow sending prompts to it"
+        )
+
+
 def _validate(data: dict[str, Any]) -> list[str]:
     """Strictly validate core configuration; record optional adapter problems.
 
@@ -158,6 +211,9 @@ def _validate(data: dict[str, Any]) -> list[str]:
         if "provider" not in stage:
             raise ConfigError(f"stage {name} requires provider")
     for name, provider in data.get("providers", {}).items():
+        if provider.get("type") == "openai-compatible":
+            _validate_openai_compatible_provider(name, provider)
+            continue
         _unknown_keys(f"provider {name}", provider, _PROVIDER_KEYS)
         if provider.get("type") not in {"codex-cli", "claude-cli"}:
             raise ConfigError(f"provider {name} has unsupported type: {provider.get('type')!r}")

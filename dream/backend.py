@@ -32,7 +32,7 @@ def generate(
         raise ValueError(f"character stage {stage} requires an explicit model ID")
     provider_name = stage_cfg["provider"]
     provider_cfg = cfg.provider(provider_name)
-    provider = create_provider(provider_cfg["type"])
+    provider = create_provider(provider_cfg["type"], provider_cfg)
     options = {
         "reasoning_effort": stage_cfg.get("reasoning_effort"),
         "extra_args": provider_cfg.get("extra_args"),
@@ -43,7 +43,7 @@ def generate(
         prompt=prompt,
         schema=schema,
         model=model or stage_cfg.get("model"),
-        timeout_seconds=timeout or int(stage_cfg.get("timeout_seconds", 600)),
+        timeout_seconds=timeout or int(stage_cfg.get("timeout_seconds", provider_cfg.get("timeout_seconds", 600))),
         options={key: value for key, value in options.items() if value is not None},
     )
     return provider.generate_structured(request)
@@ -53,6 +53,9 @@ def preflight(config: DreamConfig | None = None, *, stages=None) -> list[tuple[s
     cfg = config or load_config()
     selected = stages if stages is not None else [name for name in cfg.data["stages"] if not name.startswith("character_")]
     used = {cfg.stage(name)["provider"] for name in selected}
+    if stages is None:
+        # Local model servers are checked once configured, before a stage routes to them.
+        used |= {name for name, provider in cfg.data.get("providers", {}).items() if provider.get("type") == "openai-compatible"}
     return [
         (name, *preflight_provider(cfg.provider(name)))
         for name in sorted(used)

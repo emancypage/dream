@@ -25,6 +25,19 @@ auth = "chatgpt-subscription"
 [providers.claude]
 type = "claude-cli"
 
+# Optional local model server with an OpenAI-compatible API (llama-server,
+# Ollama, vLLM). Route a stage to it with provider = "local-qwen". The key is
+# read from the named environment variable at call time and may be omitted.
+# A non-loopback base_url requires remote_data_egress = true. The stage's
+# model and timeout_seconds win; the provider's values are defaults.
+# [providers.local-qwen]
+# type = "openai-compatible"
+# base_url = "http://127.0.0.1:8080"
+# model = "qwen3-32b"
+# api_key_env = "LOCAL_LLM_API_KEY"
+# remote_data_egress = false
+# timeout_seconds = 600
+
 [[sources]]
 name = "codex"
 type = "codex-jsonl"

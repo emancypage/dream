@@ -8,7 +8,7 @@ from pathlib import Path
 from model_types import ModelProvider, ProviderError
 
 
-def create_provider(provider_type: str) -> ModelProvider:
+def create_provider(provider_type: str, settings: dict | None = None) -> ModelProvider:
     if provider_type == "codex-cli":
         from providers.codex import CodexCLIProvider
 
@@ -17,11 +17,19 @@ def create_provider(provider_type: str) -> ModelProvider:
         from providers.claude import ClaudeCLIProvider
 
         return ClaudeCLIProvider()
+    if provider_type == "openai-compatible":
+        from providers.openai_compatible import OpenAICompatibleProvider
+
+        return OpenAICompatibleProvider(settings)
     raise ProviderError(f"unsupported provider type: {provider_type}")
 
 
 def preflight_provider(config: dict) -> tuple[bool, str]:
     provider_type = config["type"]
+    if provider_type == "openai-compatible":
+        from providers.openai_compatible import preflight
+
+        return preflight(config)
     executable = config.get("executable") or {
         "codex-cli": "codex",
         "claude-cli": "claude",
