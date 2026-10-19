@@ -30,6 +30,8 @@ def test_complete_character_cli_workflow_with_fake_providers(tmp_path, monkeypat
         calls.append(stage)
         if stage == 'character_extract':
             output = {'is_correction': True, 'context_sufficient': True, 'context_excerpt': messages[0][1], 'corrected_assistant_response': messages[1][1], 'user_correction': messages[2][1], 'trait_ids': ['trait-01'], 'agreement': 'agrees', 'rationale': 'The original answer supplied no test evidence.'}
+        elif stage == 'character_generate' and 'situation' in schema['properties']:
+            output = dict(situation='The user asks for proof.', preferred='Run the test and report its output.', avoid='Trust me.', feedback='Report test evidence.', limits='State what the test covers.')
         elif stage in ('character_generate', 'character_eval_response'):
             output = {'response': 'Run the test and report its output.'}
         elif 'scores' in schema['properties']:
@@ -49,11 +51,10 @@ def test_complete_character_cli_workflow_with_fake_providers(tmp_path, monkeypat
     assert command('character', 'generate', '--limit', '1')['generated'] == 1
     assert command('character', 'judge', '--limit', '1')['judged'] == 1
     pair = command('character', 'list')[0]
-    command('character', 'accept', pair['id'], '--expected-sha', pair['content_sha256'], '--reason', 'I reviewed the exact response and its evidence.')
-    accepted = command('character', 'show', pair['id'])
-    body = tmp_path / 'short.json'
-    body.write_text(json.dumps(dict(situation='The user asks for proof.', preferred='Run the test and report its output.', avoid='Trust me.', feedback='Report test evidence.', limits='State what the test covers.')))
-    draft = command('character', 'short', 'draft', pair['id'], '--expected-pair-sha', accepted['content_sha256'], '--body-file', str(body))
+    acceptance = command('character', 'accept', pair['id'], '--expected-sha', pair['content_sha256'], '--reason', 'I reviewed the exact response and its evidence.')
+    draft = acceptance['short_draft']
+    assert draft['status'] == 'draft'
+    assert command('character', 'render', '--preview')['manifest']['pair_ids'] == []
     command('character', 'short', 'approve', draft['id'], '--expected-sha', draft['content_sha256'], '--reason', 'Reviewed the exact short wording.')
     command('character', 'render')
     command('character', 'export', '--format', 'dpo-jsonl')

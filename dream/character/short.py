@@ -1,8 +1,14 @@
 """Short startup examples with separate human approval and exact source binding."""
 from datetime import datetime, timezone
+from dataclasses import asdict, is_dataclass
+from pathlib import Path
+import sqlite3
 import uuid
 
+import backend
+from model_types import validate_output
 from character import storage
+from character.types import canonical_json, content_hash
 from character.constitution import load_constitution
 from character.review import accepted_pairs
 from character.safety import policy_for, check_constitution, policy_fingerprint
@@ -10,6 +16,9 @@ from character.safety import policy_for, check_constitution, policy_fingerprint
 TABLE = 'character_short_examples'
 FIELDS = ('situation', 'preferred', 'avoid', 'feedback', 'limits')
 MAX_BODY_CODEPOINTS = 2500
+PROMPT = Path(__file__).resolve().parent.parent / 'prompts' / 'character-short-v1.md'
+SCHEMA = {'type':'object', 'properties':{key:{'type':'string'} for key in FIELDS},
+          'required':list(FIELDS), 'additionalProperties':False}
 
 
 def validate_body(body):
@@ -57,7 +66,7 @@ def show_example(conn, config, identity):
     return row
 
 
-def draft_example(conn, config, pair_id, *, expected_pair_sha, body, expected_sha=None):
+def draft_example(conn, config, pair_id, *, expected_pair_sha, body, expected_sha=None, generation=None):
     validate_body(body)
     doc, policy = _context(config)
     fingerprint = policy_fingerprint(policy)
@@ -81,11 +90,56 @@ def draft_example(conn, config, pair_id, *, expected_pair_sha, body, expected_sh
                    constitution_sha256=doc.sha256, constitution_version=doc.version,
                    created_at=existing['created_at'] if existing else datetime.now(timezone.utc).isoformat(),
                    updated_at=datetime.now(timezone.utc).isoformat())
+        if generation is not None:
+            row['generation'] = generation
         if not storage._text_allowed(row, current_policy):
             raise ValueError('short example conflicts with policy')
         if existing:
             return storage.update_record(writer, TABLE, row, expected_sha=expected_sha)
         return storage.insert_record(writer, TABLE, row)
+
+
+def generate_example(conn, config, pair_id, *, expected_pair_sha):
+    """Prepare unapproved wording without undoing the prior human acceptance."""
+    if not config.data['character']['enabled']:
+        return {'skipped':'character disabled'}
+    try:
+        doc, policy = _context(config)
+        fingerprint = policy_fingerprint(policy)
+        pair = _source(conn, config, pair_id, expected_pair_sha, doc)
+        existing = next((r for r in storage.records(conn, TABLE) if r['work_key'] == pair_id), None)
+        if existing is not None and existing['pair_sha256'] == expected_pair_sha:
+            return {'skipped':'short example already exists for this source', 'id':existing['id']}
+        template = PROMPT.read_text(encoding='utf-8')
+        system = template + policy.context() + '\nApproved constitution:\n' + doc.text
+        prompt = canonical_json({'messages':pair['prompt_messages'], 'preferred_answer':pair['chosen'],
+                                 'avoided_answer':pair['rejected'], 'human_feedback':pair['acceptance_reason'],
+                                 'trait_ids':pair['trait_ids']})
+        started = datetime.now(timezone.utc).isoformat()
+        answer = backend.generate('character_generate', prompt, SCHEMA, config=config, system_prompt=system)
+        finished = datetime.now(timezone.utc).isoformat()
+        validate_output(answer.output, SCHEMA)
+        validate_body(answer.output)
+        current_doc, current_policy = _context(config)
+        if (current_doc.sha256 != doc.sha256 or policy_fingerprint(current_policy) != fingerprint
+                or PROMPT.read_text(encoding='utf-8') != template):
+            raise ValueError('short generation inputs changed')
+        generation = dict(stage='character_generate', provider=config.stage('character_generate')['provider'],
+                          configured_model=config.stage('character_generate').get('model'),
+                          reported_model=getattr(answer,'model',None), options=dict(config.stage('character_generate')),
+                          started_at=started, finished_at=finished, duration_ms=getattr(answer,'duration_ms',None),
+                          usage=asdict(answer.usage) if is_dataclass(getattr(answer,'usage',None)) else None,
+                          prompt_sha256=content_hash({'system':system,'prompt':prompt,'schema':SCHEMA}))
+        return draft_example(conn, config, pair_id, expected_pair_sha=expected_pair_sha,
+                             expected_sha=existing['content_sha256'] if existing else None,
+                             body=answer.output, generation=generation)
+    except (ValueError, RuntimeError, TimeoutError, OSError, sqlite3.Error) as exc:
+        return draft_failure(pair_id, expected_pair_sha, exc)
+
+
+def draft_failure(pair_id, expected_pair_sha, error):
+    return {'failures':[{'pair_id':pair_id, 'error':type(error).__name__}],
+            'retry':'dream character short generate '+pair_id+' --expected-pair-sha '+expected_pair_sha}
 
 
 def review_example(conn, config, identity, action, *, expected_sha, reason):

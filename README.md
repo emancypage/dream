@@ -431,6 +431,7 @@ dream character edit PAIR_ID --expected-sha HASH --body-file /tmp/chosen.txt --r
 dream character short draft PAIR_ID --expected-pair-sha HASH --body-file /tmp/short.json
 dream character short list
 dream character short show SHORT_ID
+dream character short generate PAIR_ID --expected-pair-sha HASH
 dream character short approve SHORT_ID --expected-sha SHORT_HASH --reason "Reviewed the exact short wording"
 dream character short reject SHORT_ID --expected-sha SHORT_HASH --reason "This changes my meaning"
 dream character render --preview
@@ -456,13 +457,29 @@ Draft them only from accepted pairs. The full pair, answers, judgments, and prio
 review records stay unchanged. The source pair ID, revision, and hash are recorded
 automatically. Full-record DPO export continues to use the full accepted answers.
 
+When `character.enabled = true`, accepting a full pair automatically requests a
+short draft through the configured `character_generate` provider and model. The
+model receives the conversation, the selected answer, the other answer, and the
+human's acceptance reason. Right-answer choices use the historical answer as the
+preferred text. The draft records its model and prompt identity and remains
+unapproved until a separate human review. When character generation is disabled,
+acceptance still works and reports that short drafting was skipped.
+
+Acceptance is saved before the model call. If drafting fails, the command returns
+a nonzero exit code with the accepted pair and the failure in its JSON output.
+Retry only the draft with `short generate`, using the accepted pair's current hash.
+This command also prepares drafts for already accepted pairs. It leaves an existing
+short version for the same source unchanged. A new source revision needs a new
+draft and human approval. Model failures, invalid output, and source or policy
+changes cannot approve a draft or undo the full-pair decision.
+
 Show the complete short wording and hash to the human before approving it. An
 accepted full pair does not approve its short version. `short approve` records a
 separate human decision bound to the exact short hash. To change a short version,
 run `short draft` again with its current `--expected-sha` and the current source
 `--expected-pair-sha`. Changing the wording returns it to draft status. Source or
 constitution changes make it stale. Policy exclusions apply through source lineage.
-These commands make no model calls. Database migration adds the short-example table
+Manual drafting and short review make no model calls. Database migration adds the short-example table
 after backing up the existing database.
 
 `render` writes a character block and manifest under the state directory. It uses

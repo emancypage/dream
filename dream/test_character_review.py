@@ -119,8 +119,12 @@ def test_cli_accept_right_records_selection(env,monkeypatch,capsys):
     args=parser.parse_args(['character','accept','p','--answer','right','--expected-sha',p['content_sha256'],'--reason','Right is better','--acknowledge-flags'])
     args.config=c
     args.db=c.db_path
-    db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    from test_character_short import BODY
+    import sqlite3
+    monkeypatch.setattr(j.backend,'generate',lambda *a,**k:SimpleNamespace(output=BODY))
+    db.close()
     assert cli.run(args)==0
+    db=sqlite3.connect(c.db_path)
     assert json.loads(capsys.readouterr().out)['accepted_answer']=='right'
     assert r.accepted_pairs(db,c)[0]['chosen']=='Long'
 

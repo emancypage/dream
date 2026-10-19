@@ -51,6 +51,9 @@ def register(subparsers):
     short_commands.add_parser('list')
     command = short_commands.add_parser('show')
     command.add_argument('id')
+    command = short_commands.add_parser('generate', help='Retry model drafting for an accepted pair')
+    command.add_argument('pair_id')
+    command.add_argument('--expected-pair-sha', required=True)
     command = short_commands.add_parser('draft')
     command.add_argument('pair_id')
     command.add_argument('--expected-pair-sha', required=True)
@@ -101,14 +104,15 @@ def run(args):
     cfg = args.config
     cfg = replace(cfg, data={**cfg.data, 'storage': {**cfg.data['storage'], 'db_path': str(args.db)}})
     action = args.character_cmd
-    if (action in ('generate', 'judge') or action == 'eval' and not args.report) and not cfg.data['character']['enabled']:
+    if (action in ('generate', 'judge') or action == 'short' and args.short_cmd == 'generate'
+            or action == 'eval' and not args.report) and not cfg.data['character']['enabled']:
         print(json.dumps({'skipped': 'character disabled'}))
         return 0
     conn = None
     try:
         guard_path(cfg.db_path, cfg)
         mutation = (action in ('generate', 'judge', 'accept', 'reject', 'defer', 'edit')
-                    or action == 'short' and args.short_cmd in ('draft', 'approve', 'reject')
+                    or action == 'short' and args.short_cmd in ('draft', 'generate', 'approve', 'reject')
                     or action == 'eval' and not args.report)
         if mutation:
             _initialize_for_mutation(cfg)
@@ -133,12 +137,26 @@ def run(args):
                 result = review_pair(conn, cfg, args.id, action, expected_sha=args.expected_sha,
                                      reason=args.reason, body=body, acknowledge_flags=args.acknowledge_flags,
                                      **selection)
+                if action == 'accept':
+                    from character.short import generate_example, draft_failure
+                    conn.close()
+                    conn = None
+                    try:
+                        conn = open_db_readonly(cfg.db_path)
+                        draft = generate_example(conn, cfg, args.id, expected_pair_sha=result['content_sha256'])
+                    except (OSError, sqlite3.Error) as exc:
+                        draft = draft_failure(args.id, result['content_sha256'], exc)
+                    result = dict(result, short_draft=draft)
+                    if draft.get('failures'):
+                        result['failures'] = draft['failures']
         elif action == 'short':
-            from character.short import list_examples, show_example, draft_example, review_example
+            from character.short import list_examples, show_example, draft_example, review_example, generate_example
             if args.short_cmd == 'list':
                 result = list_examples(conn, cfg)
             elif args.short_cmd == 'show':
                 result = show_example(conn, cfg, args.id)
+            elif args.short_cmd == 'generate':
+                result = generate_example(conn, cfg, args.pair_id, expected_pair_sha=args.expected_pair_sha)
             elif args.short_cmd == 'draft':
                 body = json.loads(Path(args.body_file).read_text(encoding='utf-8'))
                 result = draft_example(conn, cfg, args.pair_id, expected_pair_sha=args.expected_pair_sha,
