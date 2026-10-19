@@ -10,8 +10,8 @@ import dream
 import eval_build
 from config import load_config
 from model_types import ProviderError
-from recall_documents import stable_document_id
-from recall_eval import evaluate_fixture_file
+from recall_documents import stable_document_id, synchronize_recall_documents
+from recall_eval import calibrate_fixture_file, evaluate_fixture_file
 from retention_policy import POLICY_FILE
 
 
@@ -45,12 +45,6 @@ def store(tmp_path, monkeypatch):
     (root / "private.md").write_text("Excluded by path: the old staging host lives in room 12.", encoding="utf-8")
     (root / "marked.md").write_text("Notes about the retired-marker deployment.", encoding="utf-8")
     (root / "MEMORY.md").write_text("- [API](api.md) — database\n- [Web](web.md) — releases\n", encoding="utf-8")
-    (root / POLICY_FILE).write_text(json.dumps({
-        "instructions": POLICY_INSTRUCTIONS,
-        "memory_paths": ["private.md"],
-        "project_slugs": ["private-project"],
-        "text_markers": ["retired-marker"],
-    }), encoding="utf-8")
     conn = dream.open_db(tmp_path / "dream.db")
     conn.execute("INSERT INTO sessions(session_id,project_slug,jsonl_path,jsonl_mtime,total_chars) "
                  "VALUES ('ordinary-session','ordinary-project','/fixture/a',1,1000)")
@@ -63,6 +57,14 @@ def store(tmp_path, monkeypatch):
                  ("private-session", json.dumps({"summary": "Excluded by project: the vault rotation plan"}),
                   "Excluded by project: the vault rotation plan", "private-key"))
     conn.commit()
+    # Index first, then tighten the policy: the builder must re-apply it to stale rows.
+    synchronize_recall_documents(conn, root, include_raw_transcripts=False, constitution_path=None)
+    (root / POLICY_FILE).write_text(json.dumps({
+        "instructions": POLICY_INSTRUCTIONS,
+        "memory_paths": ["private.md"],
+        "project_slugs": ["private-project"],
+        "text_markers": ["retired-marker"],
+    }), encoding="utf-8")
     cfg = load_config(tmp_path / "absent.toml", {"storage": {"memory_root": str(root), "db_path": str(tmp_path / "dream.db")}})
     calls = []
 
@@ -87,8 +89,8 @@ def test_fixture_has_public_shape_and_language_tags(store):
     assert ids == {api_id, stable_document_id("approved_memory", "memory:web.md"),
                    stable_document_id("approved_memory", "memory:MEMORY.md"), summary_id}
     for document in fixture["documents"]:
-        assert {"id", "source_kind", "trust_level", "project_slug", "source_path",
-                "source_updated_at", "source_version", "text"} <= set(document)
+        assert {"id", "content_sha256", "source_kind", "trust_level", "project_slug", "source_path",
+                "source_updated_at", "indexed_at", "source_version", "text"} == set(document)
     summary = next(document for document in fixture["documents"] if document["id"] == summary_id)
     assert summary["project_slug"] == "ordinary-project"
     assert summary["trust_level"] == "model_distilled"
@@ -100,10 +102,11 @@ def test_fixture_has_public_shape_and_language_tags(store):
     assert len({query["id"] for query in fixture["queries"]}) == len(fixture["queries"])
     for query in fixture["queries"]:
         assert query["event"] == "prompt"
-        assert query["expected_ids"] and set(query["expected_ids"]) <= ids
-        assert stable_document_id("approved_memory", "memory:MEMORY.md") not in query["expected_ids"]
+        assert "expected_ids" not in query
+        assert query["relevant"] and set(query["relevant"]) <= ids
+        assert stable_document_id("approved_memory", "memory:MEMORY.md") not in query["relevant"]
     api_questions = [query["query"] for query in fixture["queries"]
-                     if query["expected_ids"] == [api_id] and query["language"] == "en"]
+                     if query["relevant"] == [api_id] and query["language"] == "en"]
     # Duplicates, policy matches and secret-bearing questions are dropped, then capped.
     assert api_questions == ["Which database does that project use?", "What runs the tests?", "How are releases shipped?"]
     assert fixture["generator"]["languages"] == ["en", "pl"]
@@ -133,6 +136,19 @@ def test_provider_is_the_distill_stage_with_a_question_schema(store):
         assert "pl (Polish)" in call.prompt
 
 
+def test_documents_are_copied_verbatim_so_calibration_upsert_is_a_no_op(store):
+    output = store.tmp / "private.json"
+    fixture = eval_build.build_eval_fixture(store.conn, store.root, config=store.cfg, output=output)
+    columns = ("id, content_sha256, source_kind, trust_level, project_slug, source_path, "
+               "source_updated_at, indexed_at, source_version, text")
+    rows = {row[0]: row for row in store.conn.execute(f"SELECT {columns} FROM recall_documents")}
+    for document in fixture["documents"]:
+        assert tuple(document[key] for key in columns.split(", ")) == rows[document["id"]]
+    before = store.conn.execute("SELECT * FROM recall_documents ORDER BY id").fetchall()
+    calibrate_fixture_file(output, store.conn, "lexical")
+    assert store.conn.execute("SELECT * FROM recall_documents ORDER BY id").fetchall() == before
+
+
 def test_excluded_documents_are_skipped_and_never_sent(store):
     fixture = eval_build.build_eval_fixture(store.conn, store.root, config=store.cfg, output=store.tmp / "private.json")
     sent = "\n".join(call.prompt for call in store.calls)
@@ -147,6 +163,7 @@ def test_excluded_documents_are_skipped_and_never_sent(store):
 
 def test_documents_are_scrubbed_before_they_reach_the_provider(store):
     (store.root / "token.md").write_text(f"Deploy with API_TOKEN=abc123secret from {store.home}/deploy", encoding="utf-8")
+    synchronize_recall_documents(store.conn, store.root, include_raw_transcripts=False, constitution_path=None)
     eval_build.build_eval_fixture(store.conn, store.root, config=store.cfg, output=store.tmp / "private.json")
     sent = "\n".join(call.prompt for call in store.calls)
     assert "abc123secret" not in sent
@@ -157,7 +174,7 @@ def test_limit_samples_both_document_kinds_and_keeps_full_corpus(store):
     fixture = eval_build.build_eval_fixture(store.conn, store.root, config=store.cfg, output=store.tmp / "private.json", limit=2)
     assert len(store.calls) == 2
     kinds = {document["id"]: document["source_kind"] for document in fixture["documents"]}
-    asked = {query["expected_ids"][0] for query in fixture["queries"]}
+    asked = {query["relevant"][0] for query in fixture["queries"]}
     assert {kinds[doc_id] for doc_id in asked} == {"approved_memory", "distilled_summary"}
     assert len(fixture["documents"]) == 4
     assert fixture["generator"]["sampled_documents"] == 2
@@ -173,7 +190,7 @@ def test_provider_failure_skips_only_that_document(store, monkeypatch):
     monkeypatch.setattr(eval_build, "generate", flaky)
     fixture = eval_build.build_eval_fixture(store.conn, store.root, config=store.cfg, output=store.tmp / "private.json")
     assert fixture["generator"]["failed_documents"] == 1
-    assert len({query["expected_ids"][0] for query in fixture["queries"]}) == 2
+    assert len({query["relevant"][0] for query in fixture["queries"]}) == 2
 
 
 def test_fixture_is_written_privately_to_the_default_path(store):
@@ -254,6 +271,15 @@ def test_eval_build_cli_refuses_repository_output(store, capsys):
     assert dream.cmd_eval_build(_cli_args(store, limit=1, output=str(target))) == 2
     assert "outside the repository" in capsys.readouterr().err
     assert not store.calls and not target.exists()
+
+
+def test_eval_build_cli_refuses_an_empty_recall_index(store, capsys):
+    store.conn.execute("DELETE FROM recall_documents")
+    store.conn.commit()
+    assert dream.cmd_eval_build(_cli_args(store, limit=5)) == 1
+    assert "recall index" in capsys.readouterr().err
+    assert not store.calls
+    assert not (store.tmp / "cli" / "private.json").exists()
 
 
 def test_eval_build_cli_reports_provider_failures(store, monkeypatch):

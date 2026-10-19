@@ -1,8 +1,10 @@
 """Build a private, held-out recall fixture from the user's own memory store.
 
-Approved memory files and distilled summaries form the corpus. The provider
-configured for the ``distill`` stage writes natural questions for a sample of
-those documents in each requested language; each question expects the
+The corpus is the current ``approved_memory`` and ``distilled_summary`` rows of
+``recall_documents``, copied verbatim so ``recall-calibrate``'s upsert of the
+fixture documents leaves the live index unchanged. The provider configured for
+the ``distill`` stage writes natural questions for a sample of those documents
+in each requested language; each question's ``relevant`` list holds the
 document it was written from. Documents the local retention policy excludes
 never reach the provider or the fixture, and document text is scrubbed before
 it is sent. The fixture has the public fixture's ``{documents, queries}``
@@ -20,7 +22,6 @@ import tempfile
 from pathlib import Path
 
 from backend import generate
-from recall_documents import _collect_distilled, _collect_memory_files
 from recall_scrub import scrub_text
 from retention_policy import RetentionPolicy, load_retention_policy
 
@@ -35,6 +36,10 @@ _RESERVED_LANGUAGES = frozenset({"all", "untagged"})
 _LANGUAGE_CODE = re.compile(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*")
 _SAMPLED_KINDS = ("approved_memory", "distilled_summary")
 _INDEX_FILE = "MEMORY.md"
+_DOCUMENT_COLUMNS = (
+    "id", "content_sha256", "source_kind", "trust_level", "project_slug",
+    "source_path", "source_updated_at", "indexed_at", "source_version", "text",
+)
 
 PROMPT = """You write held-out evaluation questions for a personal memory search engine.
 
@@ -105,19 +110,24 @@ def _retained(row: dict, policy: RetentionPolicy, memory_root: Path, constitutio
 def collect_eval_documents(conn, memory_root, *, config, policy: RetentionPolicy | None = None) -> tuple[list[dict], list[dict]]:
     """Return ``(corpus, candidates)``: every retained document, and the ones to ask about in sampling order.
 
-    Candidates alternate between approved memories and distilled summaries in
-    stable-ID order so a small limit still covers both kinds. MEMORY.md stays
-    in the corpus as a realistic distractor but is never asked about.
+    Rows come from the live recall index; the retention policy is applied again
+    because it may have changed since the last synchronization. Candidates
+    alternate between approved memories and distilled summaries in stable-ID
+    order so a small limit still covers both kinds. MEMORY.md stays in the
+    corpus as a realistic distractor but is never asked about.
     """
     memory_root = Path(memory_root)
     policy = policy if policy is not None else load_retention_policy(memory_root)
     constitution_path = config.data["character"]["constitution_path"]
-    now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-    memory_rows = _collect_memory_files(memory_root)
-    for row in memory_rows:
-        row["source_updated_at"] = now
-    rows = [row for row in (*memory_rows, *_collect_distilled(conn)) if _retained(row, policy, memory_root, constitution_path)]
-    corpus = sorted(rows, key=lambda row: (row["source_kind"], row["source_path"]))
+    rows = [
+        dict(zip(_DOCUMENT_COLUMNS, row))
+        for row in conn.execute(
+            f"SELECT {', '.join(_DOCUMENT_COLUMNS)} FROM recall_documents "
+            "WHERE source_kind IN ('approved_memory', 'distilled_summary')"
+        ).fetchall()
+    ]
+    rows = [row for row in rows if _retained(row, policy, memory_root, constitution_path)]
+    corpus = sorted(rows, key=lambda row: (row["source_kind"], row["source_path"], row["id"]))
     by_kind = [
         sorted((row for row in corpus if row["source_kind"] == kind and row["source_path"] != _INDEX_FILE),
                key=lambda row: row["id"])
@@ -161,10 +171,7 @@ def _clean_questions(values, limit: int, policy: RetentionPolicy) -> list[str]:
 
 
 def _fixture_document(row: dict) -> dict:
-    return {key: row[key] for key in (
-        "id", "content_sha256", "source_kind", "trust_level", "project_slug",
-        "source_path", "source_updated_at", "source_version", "text",
-    )}
+    return {key: row[key] for key in _DOCUMENT_COLUMNS}
 
 
 def write_private_json(path: Path, data: dict) -> None:
@@ -231,7 +238,7 @@ def build_eval_fixture(conn, memory_root, *, config, questions_per_file=3, langu
                     "event": "prompt",
                     "query": question,
                     "language": language,
-                    "expected_ids": [row["id"]],
+                    "relevant": [row["id"]],
                     "forbidden": [],
                 })
     fixture = {

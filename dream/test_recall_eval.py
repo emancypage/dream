@@ -91,9 +91,9 @@ def _language_fixture(tmp_path):
              "text": "The web project uses npm and a deployment checklist."},
         ],
         "queries": [
-            {"id": "q-en-1", "event": "prompt", "query": "postgresql migrations", "language": "en", "expected_ids": ["doc-api"]},
-            {"id": "q-en-2", "event": "prompt", "query": "npm deployment checklist", "language": "en", "expected_ids": ["doc-web"]},
-            {"id": "q-pl-1", "event": "prompt", "query": "jaka baza danych", "language": "pl", "expected_ids": ["doc-api"]},
+            {"id": "q-en-1", "event": "prompt", "query": "postgresql migrations", "language": "en", "relevant": ["doc-api"]},
+            {"id": "q-en-2", "event": "prompt", "query": "npm deployment checklist", "language": "en", "relevant": ["doc-web"]},
+            {"id": "q-pl-1", "event": "prompt", "query": "jaka baza danych", "language": "pl", "relevant": ["doc-api"]},
         ],
     }), encoding="utf-8")
     return fixture
@@ -147,16 +147,16 @@ def test_untagged_public_queries_are_grouped(tmp_path):
     assert report.breakdown_dict()["lexical"]["all"]["forbidden_count"] == 0
 
 
-def test_relevant_and_expected_ids_are_both_accepted(tmp_path):
+def test_expected_ids_is_read_as_an_alias_for_relevant(tmp_path):
     from dream import open_db
     fixture = _language_fixture(tmp_path)
     data = json.loads(fixture.read_text(encoding="utf-8"))
     for query in data["queries"]:
-        query["relevant"] = query.pop("expected_ids")
-    legacy = tmp_path / "legacy.json"
-    legacy.write_text(json.dumps(data), encoding="utf-8")
+        query["expected_ids"] = query.pop("relevant")
+    alias = tmp_path / "alias.json"
+    alias.write_text(json.dumps(data), encoding="utf-8")
     left = evaluate_fixture_file(fixture, open_db(tmp_path / "a.db"), _settings())
-    right = evaluate_fixture_file(legacy, open_db(tmp_path / "b.db"), _settings())
+    right = evaluate_fixture_file(alias, open_db(tmp_path / "b.db"), _settings())
     assert (left.recall_at_1, left.recall_at_5, left.mrr) == (right.recall_at_1, right.recall_at_5, right.mrr)
     assert left.recall_at_5 > 0
 

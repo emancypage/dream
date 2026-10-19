@@ -1082,8 +1082,12 @@ def cmd_eval_build(args: argparse.Namespace) -> int:
     # Read-only, and tolerant of a nightly writer's active WAL.
     conn = _open_curation_readonly(Path(args.db))
     try:
+        _corpus, candidates = collect_eval_documents(conn, memory_root, config=args.config)
+        if not candidates:
+            print("eval-build: the recall index has no approved memories or distilled summaries to ask about; "
+                  "run the nightly pipeline (dream distill) first.", file=sys.stderr)
+            return 1
         if args.limit is None and not args.yes:
-            _corpus, candidates = collect_eval_documents(conn, memory_root, config=args.config)
             print(f"Would ask the configured distill provider for questions about {len(candidates)} documents "
                   f"(one call each). Pass --limit N to cap, or --yes to proceed.")
             return 2
