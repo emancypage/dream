@@ -57,3 +57,146 @@ def test_recall_eval_cli_uses_ephemeral_database(tmp_path, capsys):
         assert json.loads(capsys.readouterr().out)["query_count"] == 3
     finally:
         db_dir.chmod(0o755)
+
+
+class KeywordEmbedder:
+    fingerprint = "keyword-v1"
+    remote_data_egress = False
+
+    def __init__(self):
+        self.calls = 0
+
+    def embed(self, texts):
+        self.calls += 1
+        return [[1.0, 0.0] if "postgres" in text.casefold() else [0.0, 1.0] for text in texts]
+
+
+class BrokenEmbedder:
+    fingerprint = "broken-v1"
+    remote_data_egress = False
+
+    def embed(self, texts):
+        raise RuntimeError("offline")
+
+
+def _language_fixture(tmp_path):
+    fixture = tmp_path / "heldout.json"
+    fixture.write_text(json.dumps({
+        "documents": [
+            {"id": "doc-api", "source_kind": "approved_memory", "trust_level": "user_approved", "project_slug": None,
+             "source_path": "api.md", "source_updated_at": "2026-01-01T00:00:00Z", "source_version": "v1",
+             "text": "The API project uses PostgreSQL migrations and pytest."},
+            {"id": "doc-web", "source_kind": "approved_memory", "trust_level": "user_approved", "project_slug": None,
+             "source_path": "web.md", "source_updated_at": "2026-01-01T00:00:00Z", "source_version": "v1",
+             "text": "The web project uses npm and a deployment checklist."},
+        ],
+        "queries": [
+            {"id": "q-en-1", "event": "prompt", "query": "postgresql migrations", "language": "en", "expected_ids": ["doc-api"]},
+            {"id": "q-en-2", "event": "prompt", "query": "npm deployment checklist", "language": "en", "expected_ids": ["doc-web"]},
+            {"id": "q-pl-1", "event": "prompt", "query": "jaka baza danych", "language": "pl", "expected_ids": ["doc-api"]},
+        ],
+    }), encoding="utf-8")
+    return fixture
+
+
+_REPORT_FIELDS = {
+    "recall_at_1", "recall_at_3", "recall_at_5", "mrr", "injected_result_precision", "forbidden_count",
+    "empty_result_correctness", "duplicate_count", "codepoints", "p50_latency_ms", "p95_latency_ms",
+    "calibration_version", "query_count",
+}
+_SLICE_FIELDS = {"recall_at_1", "recall_at_5", "mrr", "forbidden_count", "p95_latency_ms", "query_count", "fallback_count"}
+
+
+def test_report_breaks_down_by_language_and_mode(tmp_path):
+    from dream import open_db
+    embedder = KeywordEmbedder()
+    report = evaluate_fixture_file(_language_fixture(tmp_path), open_db(tmp_path / "dream.db"), _settings(), embedder=embedder)
+    breakdown = report.breakdown_dict()
+    assert set(breakdown) == {"lexical", "lexical_plus_embedder"}
+    assert embedder.calls > 0
+    for mode in breakdown.values():
+        assert set(mode) == {"all", "en", "pl"}
+        assert all(set(values) == _SLICE_FIELDS for values in mode.values())
+    lexical = breakdown["lexical"]
+    assert lexical["en"]["query_count"] == 2 and lexical["pl"]["query_count"] == 1
+    assert lexical["en"]["recall_at_1"] == 1.0 and lexical["en"]["recall_at_5"] == 1.0 and lexical["en"]["mrr"] == 1.0
+    assert lexical["pl"]["recall_at_5"] == 0.0
+    assert lexical["all"]["query_count"] == 3
+    assert breakdown["lexical_plus_embedder"]["all"]["fallback_count"] == 0
+    # Top-level fields are unchanged and still describe the lexical mode.
+    assert set(report.to_dict()) == _REPORT_FIELDS
+    assert report.recall_at_5 == pytest.approx(2 / 3)
+
+
+def test_breakdown_without_embedder_has_only_lexical_mode(tmp_path):
+    from dream import open_db
+    report = evaluate_fixture_file(_language_fixture(tmp_path), open_db(tmp_path / "dream.db"), _settings())
+    assert set(report.breakdown_dict()) == {"lexical"}
+
+
+def test_embedder_failure_is_counted_not_hidden(tmp_path):
+    from dream import open_db
+    report = evaluate_fixture_file(_language_fixture(tmp_path), open_db(tmp_path / "dream.db"), _settings(), embedder=BrokenEmbedder())
+    assert report.breakdown_dict()["lexical_plus_embedder"]["all"]["fallback_count"] == 3
+
+
+def test_untagged_public_queries_are_grouped(tmp_path):
+    from dream import open_db
+    report = evaluate_fixture_file(Path(__file__).parent / "fixtures/recall/public.json", open_db(tmp_path / "dream.db"), _settings())
+    assert set(report.breakdown_dict()["lexical"]) == {"all", "untagged"}
+    assert report.breakdown_dict()["lexical"]["all"]["forbidden_count"] == 0
+
+
+def test_relevant_and_expected_ids_are_both_accepted(tmp_path):
+    from dream import open_db
+    fixture = _language_fixture(tmp_path)
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    for query in data["queries"]:
+        query["relevant"] = query.pop("expected_ids")
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps(data), encoding="utf-8")
+    left = evaluate_fixture_file(fixture, open_db(tmp_path / "a.db"), _settings())
+    right = evaluate_fixture_file(legacy, open_db(tmp_path / "b.db"), _settings())
+    assert (left.recall_at_1, left.recall_at_5, left.mrr) == (right.recall_at_1, right.recall_at_5, right.mrr)
+    assert left.recall_at_5 > 0
+
+
+def test_calibration_refuses_any_fixture_under_repository_fixtures(tmp_path):
+    from dream import open_db
+    conn = open_db(tmp_path / "dream.db")
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    for candidate in (fixtures / "recall" / "heldout.json", fixtures / "private-eval.json"):
+        with pytest.raises(ValueError, match="public evaluation fixtures cannot be used for calibration"):
+            calibrate_fixture_file(candidate, conn, "lexical")
+        assert not candidate.exists()
+    link = tmp_path / "heldout-link.json"
+    link.symlink_to(fixtures / "recall" / "public.json")
+    with pytest.raises(ValueError, match="public evaluation fixtures cannot be used for calibration"):
+        calibrate_fixture_file(link, conn, "lexical")
+
+
+def test_recall_eval_cli_by_language_adds_breakdown_only_on_request(tmp_path, capsys):
+    import argparse
+
+    from config import load_config
+    from dream import cmd_recall_eval
+
+    fixture = _language_fixture(tmp_path)
+    config = load_config(tmp_path / "missing.toml")
+    assert cmd_recall_eval(argparse.Namespace(fixtures=fixture, db=tmp_path / "dream.db", config=config)) == 0
+    plain = json.loads(capsys.readouterr().out)
+    assert set(plain) == _REPORT_FIELDS
+    assert cmd_recall_eval(argparse.Namespace(fixtures=fixture, db=tmp_path / "dream.db", config=config, by_language=True)) == 0
+    detailed = json.loads(capsys.readouterr().out)
+    assert {key: detailed[key] for key in _REPORT_FIELDS if "latency" not in key} == {key: plain[key] for key in _REPORT_FIELDS if "latency" not in key}
+    assert set(detailed["breakdown"]["lexical"]) == {"all", "en", "pl"}
+    assert detailed["breakdown"]["lexical"]["pl"]["recall_at_5"] == 0.0
+
+
+def test_recall_eval_parser_accepts_by_language(tmp_path, capsys, monkeypatch):
+    import dream
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    rc = dream.main(["--config", str(tmp_path / "missing.toml"), "recall-eval", "--fixtures", str(_language_fixture(tmp_path)), "--by-language"])
+    assert rc == 0
+    assert "breakdown" in json.loads(capsys.readouterr().out)

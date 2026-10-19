@@ -1068,7 +1068,42 @@ def cmd_recall_eval(args: argparse.Namespace) -> int:
     _migrate(conn)
     report = evaluate_fixture_file(args.fixtures, conn, args.config.recall_settings())
     conn.close()
-    print(json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True))
+    result = report.to_dict()
+    if getattr(args, "by_language", False):
+        result["breakdown"] = report.breakdown_dict()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_eval_build(args: argparse.Namespace) -> int:
+    from eval_build import build_eval_fixture, collect_eval_documents, default_output_path
+    output = Path(args.output).expanduser() if args.output else default_output_path()
+    memory_root = args.config.memory_root
+    # Read-only, and tolerant of a nightly writer's active WAL.
+    conn = _open_curation_readonly(Path(args.db))
+    try:
+        if args.limit is None and not args.yes:
+            _corpus, candidates = collect_eval_documents(conn, memory_root, config=args.config)
+            print(f"Would ask the configured distill provider for questions about {len(candidates)} documents "
+                  f"(one call each). Pass --limit N to cap, or --yes to proceed.")
+            return 2
+        try:
+            fixture = build_eval_fixture(
+                conn, memory_root, config=args.config, questions_per_file=args.questions_per_file,
+                languages=args.languages, limit=args.limit, output=output,
+            )
+        except ValueError as exc:
+            print(f"eval-build: {exc}", file=sys.stderr)
+            return 2
+    finally:
+        conn.close()
+    generator = fixture["generator"]
+    print(f"Wrote {len(fixture['queries'])} queries for {generator['sampled_documents']} documents "
+          f"({len(fixture['documents'])} in the corpus) to {output}")
+    print("This fixture holds private memory text: keep it out of the repository.")
+    if generator["failed_documents"]:
+        print(f"{generator['failed_documents']} documents failed at the provider and have no questions.", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -1213,6 +1248,24 @@ def cmd_context(args: argparse.Namespace) -> int:
         return _context_failure(args, exc, explain=explain)
 
 
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        number = 0
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return number
+
+
+def _language_codes(value: str) -> tuple[str, ...]:
+    from eval_build import validate_languages
+    try:
+        return validate_languages(part for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="dream", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", help="TOML configuration path (env: DREAM_CONFIG)")
@@ -1306,7 +1359,18 @@ def main(argv: list[str] | None = None) -> int:
 
     peval = sub.add_parser("recall-eval", help="Evaluate a recall fixture")
     peval.add_argument("--fixtures", required=True)
+    peval.add_argument("--by-language", action="store_true",
+                       help="Add Recall@1/@5, MRR, forbidden results and p95 latency per mode and language")
     peval.set_defaults(func=cmd_recall_eval)
+    pbuild = sub.add_parser("eval-build", help="Build a private held-out recall fixture with the distill provider")
+    pbuild.add_argument("--limit", type=_positive_int, help="Ask about at most N documents")
+    pbuild.add_argument("--questions-per-file", type=_positive_int, default=3,
+                        help="Questions per document and language (default 3)")
+    pbuild.add_argument("--languages", type=_language_codes, default=("en", "pl"),
+                        help="Comma-separated language codes (default en,pl)")
+    pbuild.add_argument("--output", help="Fixture path (default ~/.config/dream/eval/private.json)")
+    pbuild.add_argument("--yes", "-y", action="store_true", help="Proceed without --limit")
+    pbuild.set_defaults(func=cmd_eval_build)
     pcal = sub.add_parser("recall-calibrate", help="Calibrate recall thresholds")
     pcal.add_argument("--fixtures", required=True)
     pcal.add_argument("--mode", required=True)
