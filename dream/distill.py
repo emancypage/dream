@@ -216,9 +216,9 @@ def _drop_unchanged_local_routes(conn: sqlite3.Connection, rows: list, stage: di
     Such rows record provider "openai-compatible" and the server-reported
     model, which never equal the stage's provider name and model, so the
     column comparison flags every session. Compare the recorded stage settings
-    (provider_options) with the current stage instead. Rows without
-    provider_options keep the column comparison. A model changed only inside
-    [providers.<name>] is not detected.
+    (provider_options) with the current stage instead. Rows recorded by another
+    provider type, or without provider_options, keep the column comparison. A
+    model changed only inside [providers.<name>] is not detected.
     """
     recorded = {
         row[0]: (row[1], row[2])
@@ -229,6 +229,7 @@ def _drop_unchanged_local_routes(conn: sqlite3.Connection, rows: list, stage: di
                 OR COALESCE(d.parser_version, '') <> COALESCE(s.parser_version, '')
                 OR COALESCE(d.prompt_version, '') <> ?
             FROM distilled d JOIN sessions s ON s.session_id = d.session_id
+            WHERE d.provider = 'openai-compatible'
             """,
             (prompt_version(),),
         )

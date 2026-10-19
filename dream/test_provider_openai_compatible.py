@@ -428,7 +428,7 @@ def test_generate_refuses_non_loopback_url_without_egress_consent(server):
     assert server.requests == []
 
 
-@pytest.mark.parametrize("suffix", ["/#@evil.com", "/?@evil.com"])
+@pytest.mark.parametrize("suffix", ["/#@evil.com", "/?@evil.com", "?", "#"])
 def test_generate_refuses_base_url_with_query_or_fragment(server, suffix):
     with pytest.raises(ProviderError, match="base_url"):
         openai_compatible.generate(_request(timeout_seconds=1), _settings(server, base_url=server.base_url + suffix))
@@ -509,6 +509,10 @@ def test_unrouted_provider_is_still_validated(tmp_path):
     ('type = "openai-compatible"\nbase_url = "http://user:pass@127.0.0.1:8080"\n', "base_url"),
     ('type = "openai-compatible"\nbase_url = "http://127.0.0.1:8080/#@evil.com"\n', "base_url"),
     ('type = "openai-compatible"\nbase_url = "http://127.0.0.1:8080/?@evil.com"\n', "base_url"),
+    ('type = "openai-compatible"\nbase_url = "http://127.0.0.1:8080?"\n', "base_url"),
+    ('type = "openai-compatible"\nbase_url = "http://127.0.0.1:8080/?"\n', "base_url"),
+    ('type = "openai-compatible"\nbase_url = "http://127.0.0.1:8080#"\n', "base_url"),
+    ('type = "openai-compatible"\nbase_url = "http://127.0.0.1:8080/v1#"\n', "base_url"),
     ('type = "openai-compatible"\nbase_url = "http://127.0.0.1"\nmodel = ""\n', "model"),
     ('type = "openai-compatible"\nbase_url = "http://127.0.0.1"\napi_key_env = 5\n', "api_key_env"),
     ('type = "openai-compatible"\nbase_url = "http://127.0.0.1"\napi_key = "sk-inline"\n', "unknown"),
@@ -701,6 +705,19 @@ def test_refresh_without_recorded_stage_settings_keeps_column_comparison(tmp_pat
         "INSERT INTO distilled(session_id, provider, model, prompt_version, provider_options, notes_json) "
         "VALUES ('s1', 'openai-compatible', 'qwen3-32b-q4_k_m.gguf', ?, NULL, '{}')",
         (prompt_version(),),
+    )
+
+    assert _pending(conn, config) == ["s1"]
+    assert _pending(conn, config, refresh=False) == []
+
+
+def test_refresh_requeues_row_recorded_by_another_provider_type_under_same_name(tmp_path, monkeypatch, server):
+    # [providers.local] used to be codex-cli; the stage settings are identical.
+    config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+    conn.execute(
+        "INSERT INTO distilled(session_id, provider, model, prompt_version, provider_options, notes_json) "
+        "VALUES ('s1', 'codex', NULL, ?, ?, '{}')",
+        (prompt_version(), json.dumps(config.stage("distill"), sort_keys=True)),
     )
 
     assert _pending(conn, config) == ["s1"]

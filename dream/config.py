@@ -169,6 +169,9 @@ def has_url_extras(url: str) -> bool:
     """True when a URL carries userinfo, a query or a fragment (all can disguise the host)."""
     from urllib.parse import urlsplit
 
+    # An empty query or fragment ("...:8080?") parses as absent but corrupts the endpoint path.
+    if "?" in url or "#" in url:
+        return True
     try:
         parts = urlsplit(url)
         return bool(parts.username is not None or parts.password is not None or parts.query or parts.fragment)
