@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>One Night of Dream</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500;1,600&family=Figtree:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: night sky hero with a moving moon, a clickable hypnogram as the timeline, then one stage panel (text left, animated flow right). Single dark world by choice. */
+:root{
+  color-scheme: dark;
+  --sky:#0a0e22; --sky2:#121a3a; --panel:#151c3d; --line:#2a3566;
+  --moon:#f3e8c4; --text:#dfe3f5; --muted:#9aa3cc;
+  --wake:#f0b45c; --rem:#ef8fb1; --n1:#7fd1c7; --n2:#7ea6f2; --n3:#a48af0;
+  --check:#7fd1c7; --model:#b9a6ff; --store:#f3e8c4; --person:#f0b45c; --out:#ef8fb1; --dim:#59628f;
+  --display:"Cormorant Garamond", Georgia, "Times New Roman", serif;
+  --body:"Figtree", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono:"JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+*{box-sizing:border-box}
+body{background:var(--sky);color:var(--text);font-family:var(--body);font-size:15px;line-height:1.55;margin:0}
+.wrap{max-width:1120px;margin:0 auto;padding-inline:20px;padding-block:0 48px}
+#sky{position:absolute;inset:0;width:100%;height:100%;display:block}
+header{position:relative;overflow:hidden;background:linear-gradient(180deg,#05071a 0%,var(--sky) 100%)}
+.hero{position:relative;z-index:1;max-width:1120px;margin:0 auto;padding:56px 20px 108px}
+.eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+h1{font-family:var(--display);font-weight:500;font-size:clamp(40px,7vw,76px);line-height:1;margin:10px 0 14px;text-wrap:balance;color:var(--moon)}
+h1 em{font-style:italic;color:var(--n3)}
+.lede{max-width:62ch;color:var(--text);font-size:16.5px;margin:0}
+.lede b{color:var(--moon);font-weight:600}
+
+/* hypnogram */
+.hyp{margin-top:6px;background:rgba(21,28,61,.55);border:1px solid var(--line);border-radius:14px;padding:14px 14px 6px}
+.hyp-top{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-bottom:6px}
+.hyp-title{font-family:var(--display);font-style:italic;font-size:21px;color:var(--moon)}
+.hyp-note{font-size:12.5px;color:var(--muted)}
+.hyp-scroll{overflow-x:auto}
+#hyp{display:block;width:100%;min-width:760px;height:auto}
+#hyp .seg{cursor:pointer}
+#hyp .seg:focus{outline:none}
+#hyp .seg:focus-visible rect.hit{stroke:var(--moon);stroke-width:1.5}
+.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:14px 0 0}
+button{font:inherit;font-size:14px;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:7px 15px;cursor:pointer}
+button:hover{border-color:var(--muted)}
+button:focus-visible{outline:2px solid var(--moon);outline-offset:2px}
+button.primary{background:var(--moon);color:#141a35;border-color:var(--moon);font-weight:600}
+.prog{flex:1;min-width:120px;height:3px;background:var(--line);border-radius:2px;overflow:hidden}
+.prog i{display:block;height:100%;width:0;background:var(--moon)}
+.kbd{font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+
+/* stage panel */
+.stage{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);gap:28px;margin-top:26px;align-items:start}
+@media (max-width:860px){.stage{grid-template-columns:1fr}}
+.st-meta{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.chip{font-family:var(--mono);font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;border:1px solid currentColor;border-radius:999px;padding:3px 10px}
+.time{font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+h2{font-family:var(--display);font-weight:600;font-size:clamp(30px,4vw,42px);line-height:1.05;margin:12px 0 10px;color:var(--moon);text-wrap:balance}
+h3{font-size:12px;font-family:var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:22px 0 8px;font-weight:500}
+.what p{margin:0 0 8px;max-width:60ch}
+.where{display:flex;flex-direction:column;gap:6px}
+.where code{display:block;font-family:var(--mono);font-size:12.5px;background:#0d1330;border:1px solid var(--line);border-radius:8px;padding:7px 10px;color:var(--moon);overflow-x:auto;white-space:pre}
+.where span{font-size:13px;color:var(--muted)}
+.sleep{margin-top:22px;border-radius:14px;padding:16px 18px;background:linear-gradient(135deg,rgba(164,138,240,.16),rgba(126,166,242,.06));border:1px solid rgba(164,138,240,.35)}
+.sleep .lbl{font-family:var(--display);font-style:italic;font-size:20px;color:var(--n3);margin-bottom:4px}
+.sleep p{margin:0;max-width:60ch}
+.scene{background:#0d1330;border:1px solid var(--line);border-radius:14px;padding:10px;position:relative}
+.scene svg{display:block;width:100%;height:auto}
+.scene-cap{font-size:12.5px;color:var(--muted);padding:6px 6px 2px}
+.fade{animation:fade .5s ease both}
+@keyframes fade{from{opacity:.25;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+/* overview */
+.overview{margin-top:44px}
+.overview h2{font-size:30px}
+.ov{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px;margin-top:12px}
+.ov button{border-radius:12px;text-align:left;padding:12px 14px;display:flex;flex-direction:column;gap:3px;background:var(--panel)}
+.ov button.on{border-color:var(--moon)}
+.ov .n{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.ov .t{font-weight:600}
+.ov .s{font-size:12.5px;color:var(--muted)}
+.foot{margin-top:36px;font-size:12.5px;color:var(--muted);max-width:75ch}
+@media (prefers-reduced-motion:reduce){.fade{animation:none}}
+</style>
+</head>
+<body>
+
+<header>
+  <canvas id="sky" aria-hidden="true"></canvas>
+  <div class="hero">
+    <div class="eyebrow">dream · nightly memory and character pipeline</div>
+    <h1>One night of <em>Dream</em></h1>
+    <p class="lede">During the day you talk to coding agents. At <b>04:00</b> your computer goes to sleep the way a brain does. It replays the day, keeps what matters, invents practice scenes, and forgets on purpose. The next morning, new sessions <b>remember</b>.</p>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="hyp" aria-label="Hypnogram timeline">
+    <div class="hyp-top">
+      <div class="hyp-title">Hypnogram of one Dream night</div>
+      <div class="hyp-note">A hypnogram is the chart a sleep lab draws of your sleep stages. Click any block.</div>
+    </div>
+    <div class="hyp-scroll"><svg id="hyp" viewBox="0 0 1000 250" role="group" aria-label="Stages"></svg></div>
+    <div class="controls">
+      <button id="prev" aria-label="Previous step">◀ Back</button>
+      <button id="play" class="primary">▶ Play the night</button>
+      <button id="next" aria-label="Next step">Next ▶</button>
+      <div class="prog" aria-hidden="true"><i id="bar"></i></div>
+      <span class="kbd">← → keys · space</span>
+    </div>
+  </section>
+
+  <section class="stage" aria-live="polite">
+    <div id="text"></div>
+    <div>
+      <div class="scene"><svg id="scene" viewBox="0 0 720 300" role="img"></svg>
+        <div class="scene-cap" id="cap"></div></div>
+    </div>
+  </section>
+
+  <section class="overview">
+    <h2>The whole night on one page</h2>
+    <div class="ov" id="ov"></div>
+    <p class="foot">Only 04:00 is a real schedule (from <code>dream.timer</code>, plus up to 15 minutes of random delay). The stage times after it are drawn for reading, not measured. The stages run one after another in <code>dream.service</code>. If one stage fails, the next ones still run, and the run is marked as failed health.</p>
+  </section>
+</main>
+
+<script>
+const C = {wake:'--wake',rem:'--rem',n1:'--n1',n2:'--n2',n3:'--n3'};
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const LEVEL = {wake:0, rem:1, n1:2, n2:3, n3:4};
+const LEVEL_NAME = ['Awake','REM','N1 light','N2 light','N3 deep'];
+
+const STEPS = [
+ {id:'day', short:'Day', level:'wake', time:'09:00 – 23:59', stage:'Awake',
+  title:'Daytime: you live the day',
+  what:['You work with Codex, Open Code, or Claude Code. Every chat is saved to disk as you go.',
+        'Nothing in Dream runs yet. The day only collects raw experience.'],
+  where:[['~/.codex/sessions/**/*.jsonl','Codex transcripts'],['~/.local/share/opencode/opencode.db','Open Code sessions'],['~/.claude/projects/**/*.jsonl','Claude transcripts, off by default']],
+  sleep:['Short-term memory','While you are awake, the hippocampus records events fast. These new memories are fragile. Without sleep, many of them fade.'],
+  scene:{nodes:[['you',90,150,'You','daytime work','person'],['cx',320,70,'Codex CLI','chat + tools','model'],['oc',320,150,'Open Code','chat + tools','model'],['cl',320,230,'Claude Code','optional','model'],['js',575,95,'JSONL transcripts','one file per session','store'],['db',575,210,'opencode.db','SQLite','store']],
+   edges:[['you','cx','ask'],['you','oc','ask'],['you','cl','ask'],['cx','js','turn'],['cl','js','turn'],['oc','db','turn']]},
+  cap:'Each message you send becomes a turn in a transcript file.'},
+
+ {id:'bed', short:'04:00', level:'n1', time:'04:00 (+ up to 15 min)', stage:'Falling asleep',
+  title:'Lights out: the timer fires',
+  what:['A systemd timer starts dream.service at 04:00. If the laptop was off, it runs right after the next boot.',
+        'The service starts a metrics run, then runs six stages in order. Each stage goes through dream-stage --continue-on-error, so one bad stage does not stop the night.'],
+  where:[['dream/systemd/dream.timer','OnCalendar 04:00, Persistent=true, RandomizedDelaySec=900'],['dream/systemd/dream.service','the list of stages'],['dream-metrics start','marks the run as started']],
+  sleep:['The sleep gate','Your body clock opens a window when sleep comes easily. Persistent=true is like going to bed late when you missed bedtime: the sleep still happens. The random delay is like real life. Nobody falls asleep at the exact same minute.'],
+  scene:{nodes:[['tm',95,150,'dream.timer','04:00 + ≤15 min','check'],['sv',310,150,'dream.service','oneshot','check'],['mt',560,70,'dream-metrics','start','store'],['st',560,230,'dream-stage','×6, continue on error','check']],
+   edges:[['tm','sv','wake'],['sv','mt','start'],['sv','st','run']]},
+  cap:'One oneshot service, six stages, one metrics run around them.'},
+
+ {id:'ingest', short:'Ingest', level:'n1', time:'~04:00', stage:'N1 · light sleep',
+  title:'Ingest: replay the day',
+  what:['dream ingest reads every enabled source. It keeps only the visible user and assistant turns. Tool calls and hidden text are dropped.',
+        'The turns go into a local SQLite database with a full-text index (FTS5). This stage makes no model calls.',
+        'If one source fails, the others still enter the index. The failed one keeps its old version and is retried next night.'],
+  where:[['dream ingest',''],['~/.claude/dream.db','the Dream database'],['dream/sources/','codex_jsonl.py, opencode_sqlite.py, claude_jsonl.py']],
+  sleep:['Replay begins','In light sleep the senses go quiet and the brain starts to replay the day. The noise of the outside world is shut out, like the filter that drops tool noise and keeps what was said.'],
+  scene:{nodes:[['a',90,70,'codex-jsonl','Codex sessions','store'],['b',90,150,'opencode-sqlite','Open Code','store'],['c',90,230,'claude-jsonl','disabled by default','dim'],['f',340,150,'Filter','user + assistant only','check'],['x',340,262,'Dropped','tool calls, hidden text','dim'],['d',590,150,'dream.db','SQLite + FTS5','store']],
+   edges:[['a','f','msg'],['b','f','msg'],['c','f','msg'],['f','d','turn'],['f','x','noise']]},
+  cap:'No model is called. Everything stays on your disk.'},
+
+ {id:'distill', short:'Distill', level:'n2', time:'~04:05', stage:'N2 · light sleep',
+  title:'Distill: mark what to keep',
+  what:['dream distill sends each changed session to the distill model, one call per session. The default route is Codex with low reasoning effort.',
+        'The model returns structured findings: decisions, preferences, projects, references, open threads, and facts about the user.',
+        'The nightly run handles at most 50 sessions. A session that did not change is not sent again.'],
+  where:[['dream distill --yes --limit 50',''],['dream/prompts/distill.md','the prompt'],['[stages.distill] in ~/.config/dream/config.toml','provider and effort']],
+  sleep:['Sleep spindles','N2 sleep has short bursts of brain waves called spindles. Studies link them to tagging which new memories to keep. Distill is the tagging step.'],
+  scene:{nodes:[['d',95,150,'dream.db','changed sessions','store'],['m',325,150,'Codex','distill · low effort','model'],['o1',590,35,'decisions','','out'],['o2',590,82,'preferences','','out'],['o3',590,129,'projects','','out'],['o4',590,176,'references','','out'],['o5',590,223,'open_threads','','out'],['o6',590,270,'user_facts','','out']],
+   edges:[['d','m','session'],['m','o1',''],['m','o2',''],['m','o3',''],['m','o4',''],['m','o5',''],['m','o6','']], small:true},
+  cap:'This is the first step that sends transcript text to a model provider.'},
+
+ {id:'consolidate', short:'Consolidate', level:'n3', time:'~04:15', stage:'N3 · deep sleep',
+  title:'Consolidate: move it to long-term memory',
+  what:['dream consolidate gives the high-effort model two things: new distilled notes, and the current memory store.',
+        'The model writes suggestions: new memory files or edits to existing ones. It does not write memory directly.',
+        'A ledger records which notes were used. Progress follows that ledger, not timestamps, so no note is lost or used twice.'],
+  where:[['dream consolidate',''],['.suggestions/','preview files for review'],['dream/prompts/consolidate.md','the prompt']],
+  sleep:['Slow-wave sleep','Deep sleep has big, slow brain waves. One leading theory, systems consolidation, says memories replay from the hippocampus to the cortex here. That is where they last for years.'],
+  scene:{nodes:[['n',95,85,'Distilled notes','not yet consumed','store'],['k',95,215,'Current memory','memory/*.md','store'],['m',335,150,'Codex','consolidate · high','model'],['s',590,85,'Suggestions','.suggestions/','out'],['l',590,215,'Ledger','notes marked as used','check']],
+   edges:[['n','m','facts'],['k','m','context'],['m','s','idea'],['m','l','ids']]},
+  cap:'The deepest model call of the night. It sees what you already remember.'},
+
+ {id:'curate', short:'Curate', level:'n2', time:'~04:25', stage:'N2 · light sleep',
+  title:'Curate: keep, merge, or let go',
+  what:['A review model reads each pending suggestion. It chooses accept, merge, reject, or defer, and gives a reason.',
+        'The host code has the final word. It checks the file hash has not changed, the path stays inside the memory folder, and protected files are untouched. It makes a backup before every live write.',
+        'MEMORY.md only gets new index lines added. If a file changed during the night, the suggestion waits for the next run.'],
+  where:[['dream suggestions curate-configured',''],['[stages.review]','which model reviews'],['memory/MEMORY.md','one line per memory']],
+  sleep:['Pruning','The synaptic homeostasis idea (Tononi and Cirelli) says sleep weakens many connections made during the day. The strong, useful ones then stand out. Rejected suggestions are the weak links.'],
+  scene:{nodes:[['s',85,150,'Suggestions','pending','out'],['r',260,150,'Review model','decides + reason','model'],['h',450,150,'Host checks','SHA · path · backup','check'],['f',635,85,'Memory files','*.md','store'],['i',635,215,'MEMORY.md','append-only index','store'],['x',450,262,'Reject / defer','kept for later','dim']],
+   edges:[['s','r','idea'],['r','h','accept'],['r','x','no'],['h','f','write'],['h','i','line']]},
+  cap:'The model proposes. The host enforces.'},
+
+ {id:'generate', short:'Generate', level:'rem', time:'~04:35', stage:'REM · dreaming',
+  title:'Character generate: dream up practice scenes',
+  what:['This stage builds answer pairs: one answer that fits your character, and one that does not.',
+        'Real pairs come from moments when you corrected an agent. Synthetic pairs come from seed situations for each trait in your constitution.',
+        'The constitution is your own file of traits. Only you write it and approve it. At most 10 work items run per night.'],
+  where:[['dream character generate --source all --limit 10',''],['~/.config/dream/character/constitution.md','your traits'],['dream/prompts/character-*.md','extract, response, expand']],
+  sleep:['REM dreams','Most vivid dreams come in REM sleep. The threat simulation theory (Revonsuo) says dreams rehearse situations that have not happened yet. Here the night invents scenes to practise good answers.'],
+  scene:{nodes:[['c',95,80,'Corrections','you fixed an answer','person'],['t',95,220,'Constitution','your traits','person'],['m',335,150,'Codex','character generate','model'],['a',590,85,'Chosen answer','fits the traits','out'],['b',590,215,'Rejected answer','what to avoid','dim']],
+   edges:[['c','m','moment'],['t','m','trait'],['m','a','good'],['m','b','bad']]},
+  cap:'No weights are trained. Pairs are data for review and context.'},
+
+ {id:'judge', short:'Judge', level:'rem', time:'~04:45', stage:'REM · dreaming',
+  title:'Character judge: a second dreamer checks',
+  what:['A judge model scores each pair against the constitution. It writes a verdict, a rationale, and flags for any conflict.',
+        'The judge must come from a different model family than the one that wrote the pair. By default the writer is Codex (OpenAI) and the judge is Claude (Anthropic).',
+        'A verdict never accepts a pair. It only prepares the pair for you.'],
+  where:[['dream character judge --limit 10',''],['[stages.character_judge] provider = "claude"',''],['dream/character/judge.py','family independence check']],
+  sleep:['Lucid dreaming','In a lucid dream, part of you watches the dream and knows it is a dream. The judge is that watcher. It is a different mind from the one that made the scene.'],
+  scene:{nodes:[['p',95,150,'Answer pair','chosen vs rejected','out'],['j',330,150,'Claude','other model family','model'],['v',580,80,'Verdict','rationale + flags','check'],['q',580,225,'Review queue','waits for you','person']],
+   edges:[['p','j','pair'],['j','v','vote'],['v','q','ready']]},
+  cap:'Two model families, so one model does not grade its own work.'},
+
+ {id:'wake', short:'Wake', level:'wake', time:'~05:00', stage:'Waking up',
+  title:'Waking up: the sleep tracker report',
+  what:['When the stages end, dream-metrics writes the result of each stage: success or failure.',
+        'An exporter turns this into Prometheus metrics. Grafana shows the nights over time, including pending short reviews.',
+        'If any stage failed, the run reports failed health, even though the other stages finished.'],
+  where:[['dream-metrics success / finalize','ExecStartPost and ExecStopPost'],['dream/systemd/dream-exporter.service','Prometheus exporter'],['dream/monitoring_dashboard.py','Grafana dashboard']],
+  sleep:['Sleep tracking','A sleep tracker on your wrist logs the stages of each night. You look at it in the morning to see if you slept well. Grafana is that screen.'],
+  scene:{nodes:[['s',95,150,'6 stages','ok / failed each','check'],['m',310,150,'dream-metrics','success / finalize','store'],['p',540,85,'dream-exporter','Prometheus','model'],['g',540,215,'Grafana','night report','out']],
+   edges:[['s','m','result'],['m','p','file'],['p','g','scrape']]},
+  cap:'Failures stay visible. The night does not pretend it slept well.'},
+
+ {id:'review', short:'Review', level:'wake', time:'Morning', stage:'Awake',
+  title:'Morning review: write the dream down',
+  what:['You open the review queue. You read both answers, the verdict, and the flags. Then you accept, reject, defer, or edit.',
+        'Every decision needs the current hash of the pair and a reason. There is no batch accept. No nightly job can accept for you.',
+        'After you accept a pair, Dream drafts a short example from it. You review that short example too. A new session reminds you when short examples wait.'],
+  where:[['dream character list',''],['dream character accept ID --expected-sha HASH --reason "…"',''],['dream character short list','short examples waiting for you'],['dream character render','writes block.md for context']],
+  sleep:['The dream journal','Most dreams fade within minutes of waking. People keep a notebook by the bed to catch them. Here nothing changes your character until you write the decision yourself.'],
+  scene:{nodes:[['y',85,150,'You','morning review','person'],['q',275,70,'character show','pair + verdicts','store'],['a',275,230,'accept','--expected-sha + reason','check'],['s',475,150,'Short example','auto draft','out'],['b',640,150,'block.md','rendered character','store']],
+   edges:[['y','q','read'],['y','a','decide'],['a','s','draft'],['s','b','approve']]},
+  cap:'The model proposes, the host enforces, and the human decides.'},
+
+ {id:'recall', short:'Recall', level:'wake', time:'Next session', stage:'Awake',
+  title:'Recall: the day remembers the night',
+  what:['When a new session starts, the SessionStart hook adds the trusted character block and a small index of memory.',
+        'On your first prompt, the UserPromptSubmit hook searches dream.db. It ranks hits by text match, paths, projects, and recency (reciprocal rank fusion, k = 60).',
+        'The hook opens the database read-only. It has a time limit of 1.0 s at start and 1.5 s on the prompt. If anything fails, it adds nothing and the session goes on.'],
+  where:[['dream context session-start','SessionStart hook'],['dream context prompt','UserPromptSubmit hook'],['dream hooks install','writes the hook commands'],['[Dream recall — untrusted reference data]','how recalled text is labelled']],
+  sleep:['Cue-dependent memory','A smell or a word can bring back a whole memory, like Proust and his madeleine cake. Your first prompt is the cue. Dream finds what matches it.'],
+  scene:{nodes:[['s',80,85,'New session','SessionStart · 1.0 s','person'],['p',80,220,'First prompt','UserPromptSubmit · 1.5 s','person'],['r',265,155,'Search dream.db','read-only · RRF','check'],['c',455,70,'Trusted character','constitution + pairs','store'],['u',455,240,'Dream recall','untrusted reference','out'],['g',635,155,'Agent','reads as context','model']],
+   edges:[['s','c','start'],['s','r','index'],['p','r','cue'],['r','u','hits'],['c','g',''],['u','g','']]},
+  cap:'Recall never writes to the database and never blocks your session.'},
+
+ {id:'forget', short:'Forget', level:'wake', time:'Any time', stage:'Awake',
+  title:'Forgetting on purpose',
+  what:['You can tell Dream to forget a topic. Put a .dream-retention.json file in the memory folder with instructions, file names, project names, or text markers.',
+        'Every stage respects it: distill skips those projects, and suggestions, writes, and recall filter them out.',
+        'dream retention shows what would be removed. dream retention --apply backs it up first, then removes it. Your original transcripts stay unchanged.'],
+  where:[['memory/.dream-retention.json','your rules, never changed by Dream'],['dream retention','preview'],['dream retention --apply','back up, then remove']],
+  sleep:['Directed forgetting','In memory studies, people told to forget a word remember it less later. Real brains do this only partly. Dream does it with exact rules, plus a written instruction for paraphrases.'],
+  scene:{nodes:[['f',100,150,'.dream-retention.json','what to forget','person'],['e',335,75,'Every stage','distill · curate · recall','check'],['c',335,225,'retention --apply','preview first','check'],['g',585,75,'Filtered out','never recalled','dim'],['b',585,225,'Backup','outside memory root','store']],
+   edges:[['f','e','rule'],['f','c','rule'],['e','g','block'],['c','b','copy']]},
+  cap:'Deterministic checks catch exact matches. The prose rule covers meaning.'}
+];
+
+/* ---------- sky ---------- */
+const sky = document.getElementById('sky'), sctx = sky.getContext('2d');
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+let stars = [], skyW = 0, skyH = 0, moonT = 0, moonTarget = 0;
+function sizeSky(){
+  const r = sky.getBoundingClientRect(), d = devicePixelRatio || 1;
+  skyW = r.width; skyH = r.height; sky.width = skyW*d; sky.height = skyH*d; sctx.setTransform(d,0,0,d,0,0);
+  stars = Array.from({length: Math.round(skyW*skyH/2600)}, () => ({x:Math.random()*skyW, y:Math.random()*skyH, r:Math.random()*1.2+.2, p:Math.random()*6.28, s:.5+Math.random()*1.5}));
+}
+function drawSky(t){
+  sctx.clearRect(0,0,skyW,skyH);
+  const night = nightness(moonT);
+  for(const s of stars){
+    const a = (reduce?0.7:0.45+0.45*Math.sin(t/900*s.s+s.p)) * (0.25+0.75*night);
+    sctx.globalAlpha = a; sctx.fillStyle = '#e8ecff'; sctx.beginPath(); sctx.arc(s.x,s.y,s.r,0,6.283); sctx.fill();
+  }
+  sctx.globalAlpha = 1;
+  // moon (night) or sun (day) along an arc
+  const x = skyW*(0.06 + 0.88*moonT), y = skyH - 24 - 58*Math.sin(Math.PI*moonT);
+  const isNight = night > .5, body = isNight ? '#f3e8c4' : '#f0b45c';
+  const g = sctx.createRadialGradient(x,y,4,x,y,70); g.addColorStop(0, isNight?'rgba(243,232,196,.35)':'rgba(240,180,92,.35)'); g.addColorStop(1,'rgba(0,0,0,0)');
+  sctx.fillStyle = g; sctx.beginPath(); sctx.arc(x,y,70,0,6.283); sctx.fill();
+  sctx.fillStyle = body; sctx.beginPath(); sctx.arc(x,y,18,0,6.283); sctx.fill();
+  if(isNight){ sctx.fillStyle = '#0a0e22'; sctx.beginPath(); sctx.arc(x+8,y-5,15,0,6.283); sctx.fill(); }
+  // Zzz while sleeping
+  if(night > .5 && !reduce){
+    sctx.font = 'italic 600 18px "Cormorant Garamond", Georgia, serif'; sctx.fillStyle = '#b9a6ff';
+    for(let i=0;i<3;i++){ const ph = ((t/2400)+i/3)%1; sctx.globalAlpha = (1-ph)*.8;
+      sctx.fillText('z', x+26+ph*40+i*4, y-14-ph*46); }
+    sctx.globalAlpha = 1;
+  }
+}
+function nightness(t){ const a = 1/STEPS.length*1, b = 1/STEPS.length*8; return (t>=a*.9 && t<=b) ? 1 : 0; }
+
+/* ---------- hypnogram ---------- */
+const hyp = document.getElementById('hyp'), NS = 'http://www.w3.org/2000/svg';
+const X0 = 92, X1 = 990, Y = lv => 30 + lv*40, segW = (X1-X0)/STEPS.length;
+function el(tag, attrs, parent){ const e = document.createElementNS(NS, tag); for(const k in attrs) e.setAttribute(k, attrs[k]); if(parent) parent.appendChild(e); return e; }
+function buildHyp(){
+  // night shading
+  el('rect',{x:X0+segW*1,y:12,width:segW*7,height:182,fill:'rgba(164,138,240,.07)',rx:6},hyp);
+  el('text',{x:X0+segW*1+8,y:24,fill:css('--muted'),'font-size':11,'font-family':'JetBrains Mono, monospace'},hyp).textContent='night run · dream.service';
+  LEVEL_NAME.forEach((n,i)=>{
+    el('line',{x1:X0,x2:X1,y1:Y(i),y2:Y(i),stroke:css('--line'),'stroke-dasharray':'2 5'},hyp);
+    el('text',{x:X0-10,y:Y(i)+4,'text-anchor':'end',fill:css('--muted'),'font-size':12,'font-family':'Figtree, sans-serif'},hyp).textContent=n;
+  });
+  let d = '';
+  STEPS.forEach((s,i)=>{ const y = Y(LEVEL[s.level]), x = X0+segW*i; d += (i? `L${x},${y}`:`M${x},${y}`) + `L${x+segW},${y}`; });
+  el('path',{d,fill:'none',stroke:css('--muted'),'stroke-width':1.5,'stroke-linejoin':'round',opacity:.6},hyp);
+  STEPS.forEach((s,i)=>{
+    const g = el('g',{class:'seg',tabindex:0,role:'button','aria-label':`Step ${i+1}: ${s.title}`},hyp);
+    const y = Y(LEVEL[s.level]), x = X0+segW*i;
+    el('rect',{class:'hit',x:x+1,y:8,width:segW-2,height:236,fill:'transparent',rx:6},g);
+    el('rect',{class:'bar',x:x+3,y:y-6,width:segW-6,height:12,rx:6,fill:css(C[s.level]),opacity:.55},g);
+    el('text',{x:x+segW/2,y:222,'text-anchor':'middle',fill:css('--text'),'font-size':12,'font-family':'Figtree, sans-serif'},g).textContent=s.short;
+    el('text',{x:x+segW/2,y:238,'text-anchor':'middle',fill:css('--muted'),'font-size':10,'font-family':'JetBrains Mono, monospace'},g).textContent=String(i+1).padStart(2,'0');
+    g.addEventListener('click',()=>{ stop(); go(i); });
+    g.addEventListener('keydown',e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); stop(); go(i); } });
+  });
+  el('line',{id:'cursor',x1:0,x2:0,y1:12,y2:204,stroke:css('--moon'),'stroke-width':1,opacity:.5},hyp);
+  el('circle',{id:'dot',r:7,fill:css('--moon')},hyp);
+  el('circle',{id:'halo',r:16,fill:'none',stroke:css('--moon'),opacity:.4},hyp);
+}
+let dotX = X0, dotY = Y(0), cur = 0;
+function placeDot(){
+  const s = STEPS[cur], tx = X0+segW*cur+segW/2, ty = Y(LEVEL[s.level]);
+  dotX += (tx-dotX)*(reduce?1:.09); dotY += (ty-dotY)*(reduce?1:.09);
+  hyp.querySelector('#dot').setAttribute('cx',dotX); hyp.querySelector('#dot').setAttribute('cy',dotY);
+  const h = hyp.querySelector('#halo'); h.setAttribute('cx',dotX); h.setAttribute('cy',dotY);
+  h.setAttribute('r', 12 + (reduce?0:4*Math.sin(performance.now()/300)));
+  const c = hyp.querySelector('#cursor'); c.setAttribute('x1',dotX); c.setAttribute('x2',dotX);
+}
+
+/* ---------- scene ---------- */
+const scene = document.getElementById('scene');
+const TONE = {person:'--person',model:'--model',store:'--store',check:'--check',out:'--out',dim:'--dim'};
+let particles = [], sceneStart = 0;
+function drawScene(s){
+  scene.innerHTML = ''; particles = [];
+  const defs = el('defs',{},scene);
+  const mk = el('marker',{id:'arr',viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:6,markerHeight:6,orient:'auto-start-reverse'},defs);
+  el('path',{d:'M0,0 L10,5 L0,10 z',fill:css('--line')},mk);
+  const W = 150, H = s.scene.small ? 36 : 54;
+  const nodes = {}; s.scene.nodes.forEach(n=>nodes[n[0]]={x:n[1],y:n[2],label:n[3],sub:n[4],tone:n[5]});
+  const edgeLayer = el('g',{},scene), nodeLayer = el('g',{},scene), pLayer = el('g',{},scene);
+  s.scene.edges.forEach(([a,b,tag],i)=>{
+    const A = nodes[a], B = nodes[b];
+    let x1,y1,x2,y2;
+    if(Math.abs(B.x-A.x) < 20){ x1=A.x; x2=B.x; y1=A.y+(B.y>A.y?H/2:-H/2); y2=B.y+(B.y>A.y?-H/2:H/2); }
+    else { x1=A.x+(B.x>A.x?W/2:-W/2); x2=B.x+(B.x>A.x?-W/2:W/2)-(B.x>A.x?2:-2); y1=A.y; y2=B.y; }
+    const mx = (x1+x2)/2, d = Math.abs(B.x-A.x)<20 ? `M${x1},${y1} L${x2},${y2}` : `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`;
+    const p = el('path',{d,fill:'none',stroke:css('--line'),'stroke-width':1.6,'marker-end':'url(#arr)'},edgeLayer);
+    const col = css(TONE[B.tone]);
+    for(let k=0;k<2;k++){
+      const g = el('g',{opacity:0},pLayer);
+      el('circle',{r:4.5,fill:col},g);
+      if(tag && k===0) el('text',{y:-8,'text-anchor':'middle',fill:col,'font-size':10.5,'font-family':'JetBrains Mono, monospace'},g).textContent = tag;
+      particles.push({g,p,len:p.getTotalLength(),delay:i*0.55 + k*1.6});
+    }
+  });
+  s.scene.nodes.forEach(([id])=>{
+    const n = nodes[id], col = css(TONE[n.tone]);
+    const g = el('g',{transform:`translate(${n.x-W/2},${n.y-H/2})`},nodeLayer);
+    el('rect',{width:W,height:H,rx:10,fill:'#151c3d',stroke:col,'stroke-width':n.tone==='dim'?1:1.4,'stroke-dasharray':n.tone==='dim'?'4 4':'none'},g);
+    const t = el('text',{x:W/2,y:n.sub?H/2-3:H/2+5,'text-anchor':'middle',fill:n.tone==='dim'?css('--muted'):css('--text'),'font-size':13.5,'font-weight':600,'font-family':'Figtree, sans-serif'},g); t.textContent = n.label;
+    if(n.sub){ el('text',{x:W/2,y:H/2+14,'text-anchor':'middle',fill:col,'font-size':10.5,'font-family':'JetBrains Mono, monospace',opacity:.9},g).textContent = n.sub; }
+  });
+  scene.setAttribute('aria-label', s.cap);
+  sceneStart = performance.now();
+}
+function animScene(t){
+  const el_ = (t - sceneStart)/1000;
+  for(const q of particles){
+    if(reduce){ const pt = q.p.getPointAtLength(q.len*.5); q.g.setAttribute('transform',`translate(${pt.x},${pt.y})`); q.g.setAttribute('opacity', q.g.childNodes.length>1?1:0); continue; }
+    const cyc = 3.2, local = el_ - q.delay;
+    if(local < 0){ q.g.setAttribute('opacity',0); continue; }
+    const f = (local % cyc)/1.9;
+    if(f > 1){ q.g.setAttribute('opacity',0); continue; }
+    const e = f<.5 ? 2*f*f : 1-Math.pow(-2*f+2,2)/2;
+    const pt = q.p.getPointAtLength(q.len*e);
+    q.g.setAttribute('transform',`translate(${pt.x},${pt.y})`);
+    q.g.setAttribute('opacity', Math.min(1, f*6, (1-f)*6));
+  }
+}
+
+/* ---------- text ---------- */
+const textBox = document.getElementById('text');
+function esc(s){ return s.replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function drawText(s,i){
+  const col = css(C[s.level]);
+  textBox.innerHTML = `
+    <div class="st-meta"><span class="chip" style="color:${col}">${esc(s.stage)}</span><span class="time">step ${i+1} of ${STEPS.length} · ${esc(s.time)}</span></div>
+    <h2>${esc(s.title)}</h2>
+    <h3>What happens</h3><div class="what">${s.what.map(p=>`<p>${esc(p)}</p>`).join('')}</div>
+    <h3>Where</h3><div class="where">${s.where.map(([c,n])=>`<div><code>${esc(c)}</code>${n?`<span>${esc(n)}</span>`:''}</div>`).join('')}</div>
+    <div class="sleep"><div class="lbl">In real sleep · ${esc(s.sleep[0])}</div><p>${esc(s.sleep[1])}</p></div>`;
+  textBox.classList.remove('fade'); void textBox.offsetWidth; textBox.classList.add('fade');
+  document.getElementById('cap').textContent = s.cap;
+}
+
+/* ---------- overview ---------- */
+const ov = document.getElementById('ov');
+STEPS.forEach((s,i)=>{
+  const b = document.createElement('button');
+  b.innerHTML = `<span class="n" style="color:${css(C[s.level])}">${String(i+1).padStart(2,'0')} · ${esc(s.stage)}</span><span class="t">${esc(s.title)}</span><span class="s">${esc(s.time)}</span>`;
+  b.addEventListener('click',()=>{ stop(); go(i); document.querySelector('.hyp').scrollIntoView({behavior:reduce?'auto':'smooth'}); });
+  ov.appendChild(b);
+});
+
+/* ---------- control ---------- */
+function go(i){
+  cur = (i + STEPS.length) % STEPS.length;
+  const s = STEPS[cur];
+  drawText(s,cur); drawScene(s);
+  moonTarget = (cur+.5)/STEPS.length;
+  hyp.querySelectorAll('.seg').forEach((g,k)=>{ g.querySelector('.bar').setAttribute('opacity', k===cur?1:.4); });
+  [...ov.children].forEach((b,k)=>b.classList.toggle('on',k===cur));
+  stepStart = performance.now();
+  try{ localStorage.setItem('dream-night-step', cur); }catch(e){}
+}
+const DUR = 11000; let playing = false, stepStart = 0;
+const playBtn = document.getElementById('play'), bar = document.getElementById('bar');
+function play(){ playing = true; stepStart = performance.now(); playBtn.textContent = '❚❚ Pause'; }
+function stop(){ playing = false; playBtn.textContent = '▶ Play the night'; bar.style.width = '0'; }
+playBtn.onclick = () => playing ? stop() : play();
+document.getElementById('prev').onclick = () => { stop(); go(cur-1); };
+document.getElementById('next').onclick = () => { stop(); go(cur+1); };
+addEventListener('keydown', e => {
+  if(e.target.closest && e.target.closest('.seg')) return;
+  if(e.key==='ArrowRight'){ stop(); go(cur+1); }
+  else if(e.key==='ArrowLeft'){ stop(); go(cur-1); }
+  else if(e.key===' ' && e.target===document.body){ e.preventDefault(); playing?stop():play(); }
+});
+
+function frame(t){
+  moonT += (moonTarget - moonT)*(reduce?1:.04);
+  drawSky(t); placeDot(); animScene(t);
+  if(playing){
+    const f = (t - stepStart)/DUR; bar.style.width = Math.min(100,f*100)+'%';
+    if(f >= 1){ if(cur === STEPS.length-1){ stop(); } else { go(cur+1); } }
+  }
+  requestAnimationFrame(frame);
+}
+buildHyp(); sizeSky(); addEventListener('resize', sizeSky);
+let start = 0; try{ const v = parseInt(localStorage.getItem('dream-night-step'),10); if(v>=0 && v<STEPS.length) start = v; }catch(e){}
+go(start); moonT = moonTarget; dotX = X0+segW*start+segW/2; dotY = Y(LEVEL[STEPS[start].level]);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
