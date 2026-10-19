@@ -1166,8 +1166,7 @@ def cmd_context(args: argparse.Namespace) -> int:
         character_text = ""
         character_diagnostic = None
         character_settings = args.config.data["character"]
-        if (event_name == "SessionStart" and character_settings["enabled"]
-                and character_settings["hook_injection"]):
+        if event_name == "SessionStart" and character_settings["hook_injection"]:
             try:
                 from character.render import render_block
                 character_text = render_block(conn, args.config)["text"]

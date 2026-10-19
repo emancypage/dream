@@ -457,6 +457,10 @@ ranking. The hook makes no model calls and writes no database state. Its total
 context limit can be smaller than the file-rendering budget. A character block
 which cannot fit is omitted with a diagnostic; the constitution is never cut.
 The flag defaults to false. Review any changed hook definition before trusting it.
+Injection is independent of `character.enabled`, which controls generation,
+judging, and model-based evaluation. Set `hook_injection = true` and
+`enabled = false` to use an approved constitution in sessions while those model
+stages stay disabled.
 
 Session-start context defaults to an 18,000-byte budget when character injection
 is enabled. This budget holds the complete character block and recalled memory.

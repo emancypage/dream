@@ -1,4 +1,5 @@
 from recall_context import compose_hook_context
+import pytest
 
 def test_complete_character_and_typed_recall():
     text,reason=compose_hook_context('memory','rules',1000,1000)
@@ -13,14 +14,15 @@ def test_conservative_unicode_bytes_bound():
     assert len(text.encode('utf-8'))<=60 and text.startswith('rules')
 
 
-def test_compact_hook_separates_trusted_and_recall(tmp_path,monkeypatch,capsys):
+@pytest.mark.parametrize('generation_enabled', [True, False])
+def test_compact_hook_separates_trusted_and_recall(tmp_path,monkeypatch,capsys,generation_enabled):
     import io,json
     from types import SimpleNamespace
     import dream
     from config import load_config
     from recall_types import RecallDiagnostics,RecallResult
     from character import render
-    cfg=load_config(tmp_path/'none',{'storage':{'db_path':str(tmp_path/'db'),'memory_root':str(tmp_path/'memory')},'character':{'enabled':True,'hook_injection':True,'constitution_path':str(tmp_path/'rules'),'state_root':str(tmp_path/'state')}})
+    cfg=load_config(tmp_path/'none',{'storage':{'db_path':str(tmp_path/'db'),'memory_root':str(tmp_path/'memory')},'character':{'enabled':generation_enabled,'hook_injection':True,'constitution_path':str(tmp_path/'rules'),'state_root':str(tmp_path/'state')}})
     monkeypatch.setattr(dream.sys,'stdin',io.StringIO(json.dumps({'session_id':'compact-session','cwd':str(tmp_path),'source':'compact'})))
     monkeypatch.setattr(dream,'open_db_readonly',lambda path:object())
     monkeypatch.setattr(dream,'claim_hook_event',lambda *a:'token')
