@@ -68,6 +68,62 @@ def test_accepted_decorations_do_not_change_hash(env,monkeypatch):
     assert visible['acceptance_reason']=='Human checked' and visible['judgments']
     assert visible['content_sha256']==accepted['content_sha256']
 
+def test_accept_right_exports_human_choice_and_keeps_original_evidence(env,monkeypatch):
+    import json
+    from character import export,render
+    j,r,c,db,p=judged(env,monkeypatch)
+    monkeypatch.setattr(export,'load_constitution',r.load_constitution)
+    monkeypatch.setattr(render,'load_constitution',r.load_constitution)
+    with pytest.raises(ValueError,match='acknowledgement'):
+        r.review_pair(db,c,'p','accept',expected_sha=p['content_sha256'],reason='Prefer right',answer='right')
+    accepted=r.review_pair(db,c,'p','accept',expected_sha=p['content_sha256'],reason='Prefer right',answer='right',acknowledge_flags=True)
+    shown=r.show_pair(db,c,'p')
+    assert shown['chosen']=='Short' and shown['rejected']=='Long'
+    assert shown['accepted_answer']=='right'
+    event=shown['review_events'][0]
+    assert event['answer']=='right' and event['acknowledged_flags']==['against_selected']
+    visible=r.accepted_pairs(db,c)[0]
+    assert visible['chosen']=='Long' and visible['rejected']=='Short'
+    assert visible['judgments'] and visible['content_sha256']==accepted['content_sha256']
+    row=json.loads(export.export_pairs(db,c)['text'])
+    assert row['chosen']=='Long' and row['rejected']=='Short'
+    assert row['metadata']['review_event']['answer']=='right'
+    block=render.render_block(db,c)['text']
+    assert 'Preferred\n> Long\nAvoid\n> Short' in block
+    edited=r.review_pair(db,c,'p','edit',expected_sha=accepted['content_sha256'],body='New answer',reason='Improve')
+    assert 'accepted_answer' not in edited
+    assert not r.accepted_pairs(db,c)
+
+def test_accept_right_still_requires_current_hash_and_judgment(env,monkeypatch):
+    j,r,c,db,p=env
+    with pytest.raises(ValueError,match='judgment'):
+        r.review_pair(db,c,'p','accept',expected_sha=p['content_sha256'],reason='Right',answer='right',acknowledge_flags=True)
+    judged(env,monkeypatch)
+    with pytest.raises(ValueError,match='changed'):
+        r.review_pair(db,c,'p','accept',expected_sha='stale',reason='Right',answer='right',acknowledge_flags=True)
+
+def test_accept_right_with_matching_judge_needs_no_override(env,monkeypatch):
+    j,r,c,db,p=env
+    seq=iter([verdict('B','violates','supports'),verdict()])
+    monkeypatch.setattr(j.backend,'generate',lambda *a,**k:SimpleNamespace(output=next(seq)))
+    assert j.judge_pairs(db,c,limit=1)['judged']==1
+    r.review_pair(db,c,'p','accept',expected_sha=p['content_sha256'],reason='Right',answer='right')
+    assert r.accepted_pairs(db,c)[0]['chosen']=='Long'
+
+def test_cli_accept_right_records_selection(env,monkeypatch,capsys):
+    import argparse,json
+    from character import cli
+    j,r,c,db,p=judged(env,monkeypatch)
+    parser=argparse.ArgumentParser()
+    cli.register(parser.add_subparsers())
+    args=parser.parse_args(['character','accept','p','--answer','right','--expected-sha',p['content_sha256'],'--reason','Right is better','--acknowledge-flags'])
+    args.config=c
+    args.db=c.db_path
+    db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    assert cli.run(args)==0
+    assert json.loads(capsys.readouterr().out)['accepted_answer']=='right'
+    assert r.accepted_pairs(db,c)[0]['chosen']=='Long'
+
 def test_draft_read_views_do_not_require_approval(env,monkeypatch):
     j,r,c,db,p=env; document=r.load_constitution(c)
     def load(config,*,require_approved=True):

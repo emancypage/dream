@@ -65,19 +65,23 @@ def accepted_pairs(conn,config,document=None):
     accepted=[]
     for pair in _pairs(conn,config,doc):
         if pair.get('status')!='accepted' or pair.get('accepted_revision')!=pair['revision'] or pair.get('accepted_candidate_sha256')!=candidate_hash(pair): continue
-        event=next((e for e in events if e.get('pair_id')==pair['id'] and e.get('action')=='accept' and e.get('origin')=='human_cli' and e.get('accepted_revision')==pair['revision'] and e.get('candidate_sha256')==candidate_hash(pair)),None)
+        event=next((e for e in events if e.get('pair_id')==pair['id'] and e.get('action')=='accept' and e.get('origin')=='human_cli' and e.get('accepted_revision')==pair['revision'] and e.get('candidate_sha256')==candidate_hash(pair) and e.get('answer')==pair.get('accepted_answer')),None)
         if event is None: continue
         try:
             check_source_parent(conn,config,pair,doc)
         except ValueError:
             continue
         judgments=_judgments(conn,config,pair,doc,exact=False)
-        accepted.append(dict(pair,acceptance_reason=event['reason'],review_event=event,judgments=judgments,historical_overlap_warning=any(j.get('historical_overlap_warning') for j in judgments),same_family_override=any(j.get('same_family_override') for j in judgments)))
+        oriented=dict(pair)
+        if pair.get('accepted_answer')=='right':
+            oriented.update(chosen=pair['rejected'],rejected=pair['chosen'])
+        accepted.append(dict(oriented,acceptance_reason=event['reason'],review_event=event,judgments=judgments,historical_overlap_warning=any(j.get('historical_overlap_warning') for j in judgments),same_family_override=any(j.get('same_family_override') for j in judgments)))
     return accepted
 
 
-def review_pair(conn,config,id,action,*,expected_sha,reason='',body=None,acknowledge_flags=False):
+def review_pair(conn,config,id,action,*,expected_sha,reason='',body=None,acknowledge_flags=False,answer='left'):
     if action not in ('accept','reject','defer','edit'): raise ValueError('invalid review action')
+    if answer not in ('left','right') or action!='accept' and answer!='left': raise ValueError('invalid answer selection')
     if action in ('accept','reject','edit') and (not isinstance(reason,str) or not reason.strip()): raise ValueError('human reason required')
     if action=='edit' and (not isinstance(body,str) or not body.strip() or len(body)>config.data['character']['max_response_codepoints']): raise ValueError('valid chosen body required')
     doc,policy=_context(config); fingerprint=policy_fingerprint(policy)
@@ -101,15 +105,16 @@ def review_pair(conn,config,id,action,*,expected_sha,reason='',body=None,acknowl
             if not judgments: raise ValueError('current complete judgment required')
             if pair.get('conflict'): flags.append('conflict')
             if any(j['normalized_result']=='inconsistent' for j in judgments): flags.append('inconsistent')
-            if any(j['normalized_result']!='chosen' for j in judgments): flags.append('against_chosen')
+            selected='chosen' if answer=='left' else 'rejected'
+            if any(j['normalized_result']!=selected for j in judgments): flags.append('against_chosen' if answer=='left' else 'against_selected')
             if flags and not acknowledge_flags: raise ValueError('explicit flag acknowledgement required')
         updated=dict(pair,revision=pair['revision']+1,status={'accept':'accepted','reject':'rejected','defer':'deferred','edit':'edited'}[action])
-        for key in ('accepted_revision','accepted_candidate_sha256','accepted_at'): updated.pop(key,None)
+        for key in ('accepted_revision','accepted_candidate_sha256','accepted_at','accepted_answer'): updated.pop(key,None)
         if action=='edit':
             if body.strip()==pair['rejected'].strip(): raise ValueError('equal responses')
             updated.update(chosen=body,edited=True,judgment_ids=[])
-        if action=='accept': updated.update(accepted_revision=updated['revision'],accepted_candidate_sha256=candidate_hash(updated),accepted_at=datetime.now(timezone.utc).isoformat())
+        if action=='accept': updated.update(accepted_revision=updated['revision'],accepted_candidate_sha256=candidate_hash(updated),accepted_at=datetime.now(timezone.utc).isoformat(),accepted_answer=answer)
         updated=storage.update_record(writer,'character_pairs',updated,expected_sha=expected_sha)
-        storage.insert_record(writer,'character_review_events',dict(id='review-'+uuid.uuid4().hex,revision=1,pair_id=id,pair_revision=pair['revision'],pair_sha256=expected_sha,candidate_sha256=candidate_hash(updated),accepted_revision=updated['revision'] if action=='accept' else None,action=action,reason=reason,origin='human_cli',old_status=pair['status'],new_status=updated['status'],acknowledged_flags=flags if acknowledge_flags else [],created_at=datetime.now(timezone.utc).isoformat(),constitution_sha256=doc.sha256,constitution_version=doc.version,prompt_version=pair.get('prompt_version'),provenance=pair.get('provenance',{})))
+        storage.insert_record(writer,'character_review_events',dict(id='review-'+uuid.uuid4().hex,revision=1,pair_id=id,pair_revision=pair['revision'],pair_sha256=expected_sha,candidate_sha256=candidate_hash(updated),accepted_revision=updated['revision'] if action=='accept' else None,answer=answer if action=='accept' else None,action=action,reason=reason,origin='human_cli',old_status=pair['status'],new_status=updated['status'],acknowledged_flags=flags if acknowledge_flags else [],created_at=datetime.now(timezone.utc).isoformat(),constitution_sha256=doc.sha256,constitution_version=doc.version,prompt_version=pair.get('prompt_version'),provenance=pair.get('provenance',{})))
         storage.mark_stale(writer,doc)
         return updated

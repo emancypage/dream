@@ -424,6 +424,7 @@ dream character judge --limit 10
 dream character list
 dream character show PAIR_ID
 dream character accept PAIR_ID --expected-sha HASH --reason "Reviewed against the constitution"
+dream character accept PAIR_ID --answer right --expected-sha HASH --reason "Prefer the historical answer" --acknowledge-flags
 dream character defer PAIR_ID --expected-sha HASH
 dream character reject PAIR_ID --expected-sha HASH --reason "The answer lacks evidence"
 dream character edit PAIR_ID --expected-sha HASH --body-file /tmp/chosen.txt --reason "Corrected the example"

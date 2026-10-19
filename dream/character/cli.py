@@ -39,6 +39,9 @@ def register(subparsers):
         command.add_argument('--expected-sha', required=True)
         command.add_argument('--reason', default='' if name == 'defer' else None, required=name != 'defer')
         command.add_argument('--acknowledge-flags', action='store_true')
+        if name == 'accept':
+            command.add_argument('--answer', choices=('left', 'right'), default='left',
+                                 help='Preferred answer: left is proposed, right is historical')
         if name == 'edit':
             command.add_argument('--body-file', required=True)
     command = commands.add_parser('render')
@@ -110,8 +113,10 @@ def run(args):
                 result = show_pair(conn, cfg, args.id)
             else:
                 body = Path(args.body_file).read_text(encoding='utf-8') if action == 'edit' else None
+                selection = {'answer': args.answer} if action == 'accept' else {}
                 result = review_pair(conn, cfg, args.id, action, expected_sha=args.expected_sha,
-                                     reason=args.reason, body=body, acknowledge_flags=args.acknowledge_flags)
+                                     reason=args.reason, body=body, acknowledge_flags=args.acknowledge_flags,
+                                     **selection)
         elif action in ('render', 'export'):
             if action == 'render':
                 from character.render import render_block
