@@ -375,12 +375,18 @@ def test_build_embedder_from_settings():
 # --- recall through the fake server ----------------------------------------
 
 
-def calibrate_embedder_mode(conn, threshold=0.0, version="emb-test"):
-    """Hook and agent paths use the dense list only once the embedder mode is calibrated."""
+FINGERPRINT = f"openai-compatible:{MODEL}:{DIMENSION}"
+
+
+def calibrate_embedder_mode(conn, threshold=0.0, fingerprint=FINGERPRINT, fixture_sha256="fixture"):
+    """Hook and agent paths use the dense list only once the embedder mode is calibrated for this model."""
+    from recall_select import embedder_calibration_version
+    version = embedder_calibration_version(fixture_sha256, "lexical_plus_embedder", fingerprint)
     conn.execute(
         "INSERT OR REPLACE INTO recall_calibrations(mode, calibration_version, threshold, fixture_sha256) "
-        "VALUES ('lexical_plus_embedder', ?, ?, 'fixture')", (version, threshold))
+        "VALUES ('lexical_plus_embedder', ?, ?, ?)", (version, threshold, fixture_sha256))
     conn.commit()
+    return version
 
 
 def _memory_store(tmp_path, files, *, calibrated=True):
@@ -480,7 +486,8 @@ def test_enabled_embedder_without_stored_vectors_reports_and_stays_lexical(tmp_p
     assert result.diagnostics.fallback_reason == "embedder-no-vectors"
     assert result.mode == "lexical"
     assert result.rendered_context == lexical.rendered_context
-    assert embedding_server.posted_inputs() == ["postgresql migrations release"]
+    # Nothing is stored under the fingerprint, so the query is never sent.
+    assert embedding_server.requests == []
 
 
 def test_vectors_under_another_fingerprint_are_never_compared(tmp_path, embedding_server):
@@ -519,12 +526,12 @@ def test_embedder_mode_uses_its_own_calibration_row(tmp_path, embedding_server):
     conn, _memory = _memory_store(tmp_path, _ENGLISH, calibrated=False)
     embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False)
     conn.execute("INSERT INTO recall_calibrations(mode, calibration_version, threshold, fixture_sha256) VALUES ('lexical', 'lex-v1', 0.0, 'f')")
-    conn.execute("INSERT INTO recall_calibrations(mode, calibration_version, threshold, fixture_sha256) VALUES ('lexical_plus_embedder', 'emb-v1', 0.3, 'f')")
+    version = calibrate_embedder_mode(conn, threshold=0.3)
     conn.commit()
     result = run_context(conn, _prompt("jaka baza danych"), recall_settings(embedder_settings()), embedder=make_embedder(embedding_server.url),
                          allow_cache_writes=False, constitution_path=None)
     assert result.mode == "lexical_plus_embedder"
-    assert result.calibration_version == "emb-v1" == result.diagnostics.calibration_version
+    assert result.calibration_version == version == result.diagnostics.calibration_version
     assert [candidate.document.source_path for candidate in result.selected] == ["api.md"]
     assert all(candidate.score >= 0.3 for candidate in result.selected)
 
@@ -560,6 +567,7 @@ def test_database_without_vector_blob_column_fails_open(tmp_path, embedding_serv
     assert lexical.selected
     assert result.rendered_context == lexical.rendered_context
     assert result.mode == "lexical" and result.diagnostics.fallback_reason == "embedder-no-vectors"
+    assert embedding_server.requests == []
     readonly.close()
 
 
@@ -928,3 +936,197 @@ def test_query_text_is_scrubbed_before_it_reaches_the_embedder(tmp_path, embeddi
                 embedder=make_embedder(embedding_server.url), allow_cache_writes=False, constitution_path=None)
     (sent,) = embedding_server.posted_inputs()
     assert "sk-live-query-secret" not in sent and "postgres" in sent
+
+
+# --- wall-clock bound, stale calibrations, quiet failures ---------------------
+
+
+def _drip_server(stop, mode, interval=0.1):
+    """A raw socket server that answers too slowly, one byte or one header line at a time."""
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(5)
+    server.settimeout(0.05)
+    body = json.dumps({"model": MODEL, "data": [{"index": 0, "embedding": [0.1] * DIMENSION}]}).encode()
+
+    def handle(client):
+        try:
+            client.recv(65536)
+            if mode == "body-drip":
+                client.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body))
+                for byte in body:
+                    if stop.is_set():
+                        break
+                    client.sendall(bytes([byte]))
+                    time.sleep(interval)
+            else:
+                client.sendall(b"HTTP/1.1 200 OK\r\n")
+                for index in range(60):
+                    if stop.is_set():
+                        break
+                    time.sleep(interval)
+                    client.sendall(b"X-Pad-%d: y\r\n" % index)
+                client.sendall(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+        except OSError:
+            pass
+        finally:
+            client.close()
+
+    def loop():
+        while not stop.is_set():
+            try:
+                client, _address = server.accept()
+            except (socket.timeout, OSError):
+                continue
+            threading.Thread(target=handle, args=(client,), daemon=True).start()
+
+    threading.Thread(target=loop, daemon=True).start()
+    return f"http://127.0.0.1:{server.getsockname()[1]}", server
+
+
+@pytest.fixture
+def drip_server():
+    stop = threading.Event()
+    servers = []
+
+    def start(mode):
+        url, server = _drip_server(stop, mode)
+        servers.append(server)
+        return url
+
+    try:
+        yield start
+    finally:
+        stop.set()
+        for server in servers:
+            server.close()
+
+
+@pytest.mark.parametrize("mode", ["body-drip", "header-drip"])
+@pytest.mark.parametrize("call", ["embed", "embed_documents"])
+def test_a_dripping_server_cannot_stretch_the_wall_clock_bound(drip_server, mode, call):
+    url = drip_server(mode)
+    embedder = make_embedder(url, timeout_seconds=0.3, batch_timeout_seconds=0.3)
+    started = time.perf_counter()
+    with pytest.raises(EmbedderUnavailable, match="timed out"):
+        getattr(embedder, call)(["postgres"])
+    assert time.perf_counter() - started < 0.3 + 0.3
+
+
+def test_preflight_is_bounded_by_the_wall_clock_timeout(tmp_path, drip_server):
+    from config import load_config
+    from recall_context import embedder_preflight
+    path = tmp_path / "config.toml"
+    path.write_text("\n".join(["[recall.embedder]", "enabled = true", 'type = "openai-compatible"',
+                               f'base_url = "{drip_server("header-drip")}"', f'model = "{MODEL}"',
+                               f"dimension = {DIMENSION}", "timeout_seconds = 0.3"]) + "\n", encoding="utf-8")
+    started = time.perf_counter()
+    ok, detail = embedder_preflight(load_config(path))
+    assert not ok and detail.startswith("unreachable") and "timed out" in detail
+    assert time.perf_counter() - started < 0.6
+
+
+def _off_config(tmp_path):
+    from config import load_config
+    path = tmp_path / "off.toml"
+    path.write_text(f'[recall]\ndiagnostic_path = "{tmp_path / "diag-off.jsonl"}"\n', encoding="utf-8")
+    return load_config(path)
+
+
+def _timed_hook(monkeypatch, capsys, tmp_path, config, db_path, memory, prompt, tag):
+    monkeypatch.setenv("DREAM_RECALL_STATE_ROOT", str(tmp_path / f"state-{tag}"))
+    started = time.perf_counter()
+    rc, out = _run_hook(monkeypatch, capsys, config, db_path, memory, prompt)
+    return rc, out, time.perf_counter() - started
+
+
+@pytest.mark.parametrize("mode", ["body-drip", "header-drip"])
+def test_prompt_hook_with_a_dripping_server_is_bounded_and_equals_embedder_off(tmp_path, embedding_server, drip_server, monkeypatch, capsys, mode):
+    memory, _db_dir, db_path = _hook_store(tmp_path, embedding_server)
+    rc_off, off, _elapsed = _timed_hook(monkeypatch, capsys, tmp_path, _off_config(tmp_path), db_path, memory, "postgresql migrations", "off")
+    config = _cli_config(tmp_path, drip_server(mode), timeout_seconds=0.3)
+    rc, out, elapsed = _timed_hook(monkeypatch, capsys, tmp_path, config, db_path, memory, "postgresql migrations", "drip")
+    assert rc_off == rc == 0
+    assert out == off and json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    assert elapsed < 0.3 + 0.3
+
+
+@pytest.mark.parametrize("behaviour", ["refused", "slow", "status-500", "wrong-dimension", "malformed", "model-mismatch",
+                                       "wrong-count", "non-finite", "huge", "redirect"])
+def test_prompt_hook_output_equals_embedder_off_for_every_server_failure(tmp_path, embedding_server, monkeypatch, capsys, behaviour):
+    memory, _db_dir, db_path = _hook_store(tmp_path, embedding_server)
+    rc_off, off, _elapsed = _timed_hook(monkeypatch, capsys, tmp_path, _off_config(tmp_path), db_path, memory, "postgresql migrations", "off")
+    url = refused_url() if behaviour == "refused" else embedding_server.url
+    embedding_server.behave(behaviour, delay=3.0)
+    rc, out, elapsed = _timed_hook(monkeypatch, capsys, tmp_path, _cli_config(tmp_path, url, timeout_seconds=0.3),
+                                   db_path, memory, "postgresql migrations", "on")
+    assert rc_off == rc == 0 and out == off
+    assert elapsed < 0.3 + 0.5
+
+
+def test_calibration_from_another_model_is_stale_and_never_contacts_the_server(tmp_path, embedding_server, capsys):
+    conn, _memory = _memory_store(tmp_path, _ENGLISH, calibrated=False)
+    embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False)
+    conn.close()
+    assert _calibrate_cli(tmp_path, _cli_config(tmp_path, embedding_server.url), _private_fixture(tmp_path), tmp_path / "dream.db") == 0
+    capsys.readouterr()
+    model_b = FakeEmbeddingServer(model="model-b").start()
+    try:
+        embedder_b = OpenAICompatibleEmbedder(model_b.url, "model-b", DIMENSION, 1.5)
+        from dream import open_db
+        live = open_db(tmp_path / "dream.db")
+        embed_recall_documents(live, embedder_b, include_raw_transcripts=False)  # the nightly write path after the switch
+        model_b.requests.clear()
+        settings_b = recall_settings(embedder_settings(model="model-b", base_url=model_b.url))
+        for query in (_prompt("jaka baza danych"), _prompt("postgresql migrations release")):
+            lexical = run_context(live, query, recall_settings(), constitution_path=None)
+            result = run_context(live, query, settings_b, embedder=embedder_b, constitution_path=None)
+            assert result.diagnostics.fallback_reason == "embedder-calibration-stale"
+            assert result.mode == "lexical" and result.calibration_version is None
+            assert result.rendered_context == lexical.rendered_context
+        assert model_b.requests == []
+    finally:
+        model_b.stop()
+
+
+def test_unmigrated_database_with_an_embedder_calibration_never_contacts_the_server(tmp_path, embedding_server, monkeypatch, capsys):
+    import hashlib as _hashlib
+    memory, _db_dir, db_path = _hook_store(tmp_path, embedding_server)
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE recall_embeddings DROP COLUMN vector_blob")
+    conn.execute("ALTER TABLE recall_embeddings DROP COLUMN dimension")
+    conn.commit()
+    conn.close()
+    before = _hashlib.sha256(db_path.read_bytes()).hexdigest()
+    rc_off, off, _elapsed = _timed_hook(monkeypatch, capsys, tmp_path, _off_config(tmp_path), db_path, memory, "jaka baza danych postgresql", "off")
+    rc, out, _elapsed = _timed_hook(monkeypatch, capsys, tmp_path, _cli_config(tmp_path, embedding_server.url), db_path, memory,
+                                    "jaka baza danych postgresql", "on")
+    assert rc_off == rc == 0 and out == off
+    assert embedding_server.requests == []
+    assert _hashlib.sha256(db_path.read_bytes()).hexdigest() == before
+    assert sorted(path.name for path in db_path.parent.iterdir()) == ["dream.db"]
+
+
+def test_run_context_never_writes_vectors_by_default(tmp_path, embedding_server):
+    import inspect
+    assert inspect.signature(run_context).parameters["allow_cache_writes"].default is False
+    conn, _memory = _memory_store(tmp_path, _ENGLISH)
+    embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False)
+    conn.execute("DELETE FROM recall_embeddings WHERE document_id IN (SELECT id FROM recall_documents WHERE source_path='web.md')")
+    conn.commit()
+    embedding_server.requests.clear()
+    run_context(conn, _prompt("npm deployment checklist"), recall_settings(embedder_settings()),
+                embedder=make_embedder(embedding_server.url), constitution_path=None)
+    assert conn.execute("SELECT COUNT(*) FROM recall_embeddings").fetchone()[0] == 2
+    assert embedding_server.posted_inputs() == ["npm deployment checklist"]
+
+
+def test_a_down_embedder_writes_one_diagnostic_per_window(tmp_path, embedding_server, monkeypatch, capsys):
+    memory, _db_dir, db_path = _hook_store(tmp_path, embedding_server)
+    config = _cli_config(tmp_path, refused_url())
+    for index in range(3):
+        rc, _out, _elapsed = _timed_hook(monkeypatch, capsys, tmp_path, config, db_path, memory, "postgresql migrations", f"run-{index}")
+        assert rc == 0
+    lines = [json.loads(line) for line in (tmp_path / "diagnostics.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [line["fallback_reason"] for line in lines] == ["embedder-unavailable"]

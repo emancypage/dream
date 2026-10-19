@@ -235,6 +235,7 @@ def test_openai_compatible_embedder_keys_are_applied(tmp_path):
         ("timeout_seconds = 0", "recall.embedder.timeout_seconds"),
         ('timeout_seconds = "1.5"', "recall.embedder.timeout_seconds"),
         ("timeout_seconds = nan", "recall.embedder.timeout_seconds"),
+        ("timeout_seconds = 3.5", "recall.embedder.timeout_seconds"),
         ("dense_candidates = 0", "recall.embedder.dense_candidates"),
         ('api_key_env = "not a name"', "recall.embedder.api_key_env"),
     ],

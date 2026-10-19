@@ -13,10 +13,10 @@ from pathlib import Path
 
 from recall_events import POLICY_VERSION
 from recall_adapters import AdapterError, EmbedderUnavailable, apply_optional_adapters, build_embedder, embed_query, embedder_fallback_reason
-from recall_embeddings import dense_candidates, embedding_text
+from recall_embeddings import dense_candidates, embedding_text, has_vectors
 from recall_render import render_context
 from recall_query import rank_lexical
-from recall_select import calibration_for, select_recall_candidates
+from recall_select import calibration_for, embedder_calibration_version, select_recall_candidates
 from recall_types import RecallCandidate, RecallDiagnostics, RecallQuery, RecallResult
 from storage import open_db_readonly
 from retention_policy import load_retention_policy
@@ -44,9 +44,17 @@ def parse_hook_payload(event_name: str, payload: dict) -> RecallQuery:
 
 def _load_calibrations(conn):
     return {
-        mode: {"threshold": threshold, "calibration_version": version}
-        for mode, version, threshold in conn.execute("SELECT mode, calibration_version, threshold FROM recall_calibrations").fetchall()
+        mode: {"threshold": threshold, "calibration_version": version, "fixture_sha256": fixture_sha256}
+        for mode, version, threshold, fixture_sha256 in conn.execute(
+            "SELECT mode, calibration_version, threshold, fixture_sha256 FROM recall_calibrations").fetchall()
     }
+
+
+def _calibration_is_current(row, fingerprint: str) -> bool:
+    if not isinstance(row, dict):
+        return False
+    expected = embedder_calibration_version(str(row.get("fixture_sha256") or ""), EMBEDDER_MODE, fingerprint)
+    return row.get("calibration_version") == expected
 
 
 EMBEDDER_MODE = "lexical_plus_embedder"
@@ -71,23 +79,34 @@ def _without_embedder(settings):
 def _dense_list(conn, query: RecallQuery, settings, embedder, calibrations, *, require_calibration: bool):
     """Return ``(dense, query_vector, fallback_reason)`` for an enabled embedder.
 
-    The query text is embedded at most once. Unless the embedder mode has
-    its own calibration row, the dense list is dropped before any network
-    call: fused scores are on another scale than the lexical threshold, and
-    without a threshold every prompt would inject up to its budget. Every
-    failure leaves ``dense`` None, so ranking stays lexical.
+    The query text is embedded at most once, and only after every local
+    check passed. Unless the embedder mode has a calibration row computed for
+    the current embedder fingerprint, the dense list is dropped before any
+    network call: fused scores are on another scale than the lexical
+    threshold, a threshold from another model does not fit this one, and
+    without a threshold every prompt would inject up to its budget. A store
+    without vectors for the fingerprint is not queried either. Every failure
+    leaves ``dense`` None, so ranking stays lexical.
     """
     if embedder is None:
         return None, None, "embedder-unavailable"
-    if require_calibration and EMBEDDER_MODE not in calibrations:
-        return None, None, "embedder-uncalibrated"
-    if not query.query_text.strip():
-        return None, None, None
     try:
         fingerprint = str(embedder.fingerprint)
+    except Exception as exc:
+        return None, None, embedder_fallback_reason(exc)
+    if require_calibration:
+        if EMBEDDER_MODE not in calibrations:
+            return None, None, "embedder-uncalibrated"
+        if not _calibration_is_current(calibrations[EMBEDDER_MODE], fingerprint):
+            return None, None, "embedder-calibration-stale"
+    if not query.query_text.strip():
+        return None, None, None
+    kinds = ("approved_memory", "distilled_summary") + (("raw_transcript",) if query.allow_raw_transcript else ())
+    try:
+        if not has_vectors(conn, fingerprint, kinds):
+            return None, None, "embedder-no-vectors"
         # Scrubbed like the stored documents: not even a loopback server sees a credential.
         query_vector = embed_query(embedder, embedding_text(query.query_text))
-        kinds = ("approved_memory", "distilled_summary") + (("raw_transcript",) if query.allow_raw_transcript else ())
         dense = dense_candidates(conn, query_vector, fingerprint, kinds, limit=settings.embedder.dense_candidates)
     except Exception as exc:
         return None, None, embedder_fallback_reason(exc)
@@ -126,7 +145,7 @@ def retrieve(conn, query: RecallQuery, settings, calibrations, *, embedder=None,
     return Retrieval(tuple(candidates), selected, mode, fallback or adapter_fallback, version)
 
 
-def run_context(conn, query: RecallQuery, settings, explain: bool = False, *, embedder=None, reranker=None, allow_cache_writes: bool = True, memory_root=None, constitution_path) -> RecallResult:
+def run_context(conn, query: RecallQuery, settings, explain: bool = False, *, embedder=None, reranker=None, allow_cache_writes: bool = False, memory_root=None, constitution_path) -> RecallResult:
     started = time.perf_counter()
     policy = load_retention_policy(memory_root)
     from character.safety import is_constitution_source
@@ -213,6 +232,24 @@ def hook_success_json(hook_event_name: str, context: str) -> str:
             "additionalContext": context,
         },
     }, ensure_ascii=False, separators=(",", ":"))
+
+
+def recent_diagnostic(settings, fallback_reason: str, window_seconds: float = 600.0) -> bool:
+    """Whether the last diagnostic line, written within the window, has this fallback reason.
+
+    Lets a hook report a down embedder once per window instead of once per prompt.
+    """
+    path = Path(settings.diagnostic_path).expanduser()
+    try:
+        status = path.stat()
+        if time.time() - status.st_mtime > window_seconds:
+            return False
+        with path.open("rb") as handle:
+            handle.seek(max(0, status.st_size - 9000))
+            lines = handle.read().splitlines()
+        return bool(lines) and json.loads(lines[-1]).get("fallback_reason") == fallback_reason
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 def append_diagnostic(settings, diagnostic: dict) -> None:

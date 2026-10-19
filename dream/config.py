@@ -50,6 +50,7 @@ _ADAPTER_KEYS = {"enabled", "type", "remote_data_egress"}
 # The embedder alone gains connection keys; the reranker keeps the three above.
 _EMBEDDER_KEYS = _ADAPTER_KEYS | {"base_url", "model", "dimension", "timeout_seconds", "dense_candidates", "api_key_env"}
 _EMBEDDER_TYPES = ("none", "openai-compatible")
+_EMBEDDER_MAX_TIMEOUT_SECONDS = 3.0
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _RECALL_DEFAULTS: dict[str, Any] = {
     "enabled": True,
@@ -371,8 +372,10 @@ def _validate_embedder_connection(raw: dict[str, Any], optional_errors: list[str
     if "dimension" in raw and not positive_int(raw["dimension"], 4096):
         optional_errors.append("recall.embedder.dimension must be an integer between 1 and 4096")
     timeout = raw.get("timeout_seconds")
-    if "timeout_seconds" in raw and (type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0):
-        optional_errors.append("recall.embedder.timeout_seconds must be a positive number")
+    # A query embed must leave room inside the 5 s hook timeout.
+    if "timeout_seconds" in raw and (type(timeout) not in (int, float) or not math.isfinite(timeout)
+                                     or not 0 < timeout <= _EMBEDDER_MAX_TIMEOUT_SECONDS):
+        optional_errors.append(f"recall.embedder.timeout_seconds must be a positive number of at most {_EMBEDDER_MAX_TIMEOUT_SECONDS:g} seconds")
     if "dense_candidates" in raw and not positive_int(raw["dense_candidates"]):
         optional_errors.append("recall.embedder.dense_candidates must be a positive integer")
     if "api_key_env" in raw and (not isinstance(raw["api_key_env"], str) or not _ENV_NAME.fullmatch(raw["api_key_env"])):

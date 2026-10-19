@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 
 from recall_types import RecallCandidate, RecallQuery, RecallSettings
@@ -18,6 +19,15 @@ def _threshold(calibrations, mode: str) -> float | None:
     if isinstance(value, Mapping) and value.get("threshold") is not None:
         return float(value["threshold"])
     return None
+
+
+def embedder_calibration_version(fixture_sha256: str, mode: str, fingerprint: str) -> str:
+    """Calibration version of an embedder mode: it belongs to one fixture and one model.
+
+    Hook and agent paths recompute it for the current embedder fingerprint, so
+    a threshold calibrated under another model is never applied.
+    """
+    return hashlib.sha256(f"{fixture_sha256}:{mode}:{fingerprint}:calibration-v1".encode("utf-8")).hexdigest()
 
 
 def _version(calibrations, mode: str) -> str | None:

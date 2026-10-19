@@ -47,7 +47,7 @@ from backend import active_backend, generate, preflight  # noqa: E402
 from config import load_config  # noqa: E402
 from curate import CURATION_SCHEMA, build_curation_prompt, parse_curation_output  # noqa: E402
 from recall_documents import embed_recall_documents, synchronize_recall_documents  # noqa: E402
-from recall_context import append_diagnostic, configured_embedder, parse_hook_payload, recall_preflight, run_context, hook_success_json  # noqa: E402
+from recall_context import append_diagnostic, configured_embedder, parse_hook_payload, recall_preflight, recent_diagnostic, run_context, hook_success_json  # noqa: E402
 from recall_hook_state import claim_hook_event, finish_hook_event, successful_session_start_ids  # noqa: E402
 from recall_hooks import install_hooks, uninstall_hooks  # noqa: E402
 from storage import open_db_readonly  # noqa: E402
@@ -1456,8 +1456,10 @@ def cmd_context(args: argparse.Namespace) -> int:
         fallback_reason = result.diagnostics.fallback_reason or ("embedder-misconfigured" if embedder_problem else None)
         if embedder_problem or str(fallback_reason).startswith(("embedder-unavailable", "embedder-error")):
             try:
-                append_diagnostic(settings, {"event": query.hook_event, "fallback_reason": fallback_reason,
-                                             "embedder_problem": (embedder_problem or "")[:400] or None})
+                # One line per reason every ten minutes while the embedder stays down.
+                if not recent_diagnostic(settings, fallback_reason):
+                    append_diagnostic(settings, {"event": query.hook_event, "fallback_reason": fallback_reason,
+                                                 "embedder_problem": (embedder_problem or "")[:400] or None})
             except Exception:
                 pass
         character_text = ""

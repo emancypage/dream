@@ -70,6 +70,25 @@ def has_vector_blob(conn) -> bool:
     return "vector_blob" in {row[1] for row in conn.execute("PRAGMA table_info(recall_embeddings)")}
 
 
+def has_vectors(conn, fingerprint: str, allowed_kinds) -> bool:
+    """Whether any current document of an allowed kind has a vector under ``fingerprint``.
+
+    Read paths check this before embedding a query, so an unmigrated or
+    not yet embedded store never causes a request to the embedding server.
+    """
+    kinds = tuple(dict.fromkeys(allowed_kinds))
+    if not kinds or not has_vector_blob(conn):
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM recall_embeddings e "
+        "JOIN recall_documents d ON d.id = e.document_id AND d.content_sha256 = e.content_sha256 "
+        "WHERE e.adapter_fingerprint = ? AND (e.vector_blob IS NOT NULL OR e.vector_json != '[]') "
+        "AND d.source_kind IN (" + ",".join("?" for _ in kinds) + ") LIMIT 1",
+        (fingerprint, *kinds),
+    ).fetchone()
+    return row is not None
+
+
 def _json_vector(raw, dimension: int | None = None):
     try:
         values = json.loads(raw) if raw else []

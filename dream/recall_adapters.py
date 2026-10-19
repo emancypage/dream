@@ -6,10 +6,10 @@ import http.client
 import json
 import math
 import os
-import time
-import urllib.error
+import socket
+import ssl
+import threading
 import urllib.parse
-import urllib.request
 from dataclasses import replace
 from typing import Protocol, Sequence, runtime_checkable
 
@@ -54,8 +54,8 @@ def _is_loopback_url(url) -> bool:
     return isinstance(url, str) and not has_url_extras(url) and is_loopback_url(url)
 
 
-def _embeddings_endpoint(base_url) -> str:
-    """Validate a base URL and return its ``/v1/embeddings`` endpoint."""
+def _embeddings_endpoint(base_url) -> urllib.parse.SplitResult:
+    """Validate a base URL and return its ``/v1/embeddings`` endpoint, split."""
     if not isinstance(base_url, str) or not base_url:
         raise AdapterError("embedder base_url must be a non-empty string")
     try:
@@ -72,12 +72,7 @@ def _embeddings_endpoint(base_url) -> str:
     path = parts.path.rstrip("/")
     if not path.endswith("/v1"):
         path += "/v1"
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path + "/embeddings", "", ""))
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None  # urllib then raises HTTPError for the 3xx answer
+    return parts._replace(path=path + "/embeddings")
 
 
 def _short(value, limit: int = 80) -> str:
@@ -90,22 +85,65 @@ def _short(value, limit: int = 80) -> str:
 BATCH_TIMEOUT_FLOOR_SECONDS = 60.0
 
 
+def _abort(connection) -> None:
+    """Wake a worker blocked on the socket and drop the connection."""
+    sock = getattr(connection, "sock", None)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    try:
+        connection.close()
+    except Exception:
+        pass
+
+
+def _read_bounded(response, limit: int, *, raise_on_overflow: bool = True) -> bytes:
+    """Read at most ``limit`` bytes in small reads; reject a larger body."""
+    declared = response.getheader("Content-Length")
+    if raise_on_overflow and declared and declared.isdigit() and int(declared) > limit:
+        raise AdapterError("embedding response is too large")
+    chunks: list[bytes] = []
+    total = 0
+    while total <= limit:
+        chunk = response.read1(min(65536, limit + 1 - total))
+        if not chunk:
+            break
+        total += len(chunk)
+        chunks.append(chunk)
+    if total > limit:
+        if raise_on_overflow:
+            raise AdapterError("embedding response is too large")
+        return b"".join(chunks)[:limit]
+    return b"".join(chunks)
+
+
+def _redacted_excerpt(raw: bytes, token) -> str:
+    text = raw.decode("utf-8", errors="replace")
+    if token:
+        text = text.replace(token, "<redacted>")
+    return _short(text, 200).strip()
+
+
 class OpenAICompatibleEmbedder:
     """Embeddings from a local OpenAI-compatible server (llama-server, Ollama).
 
-    One POST per call to ``<base_url>/v1/embeddings`` with the standard
-    library only: no proxies, no redirects, no retries, a bounded response
-    and a socket timeout for connect and every read, plus an overall deadline
-    checked between reads. ``embed`` (queries, preflight) uses
-    ``timeout_seconds``; ``embed_documents`` (the nightly write path) uses
-    ``batch_timeout_seconds``, by default the same. Any failure raises
+    One POST per call to ``<base_url>/v1/embeddings`` over ``http.client``:
+    no proxies, no redirects, no retries and a bounded response. The timeout
+    is a wall-clock bound on the whole exchange (connect, headers and body):
+    the request runs in a daemon thread, and when the deadline passes its
+    connection is shut down and ``EmbedderUnavailable`` is raised, so a server
+    that drips bytes cannot stretch a hook. ``embed`` (queries, preflight)
+    uses ``timeout_seconds``; ``embed_documents`` (the nightly write path)
+    uses ``batch_timeout_seconds``, by default the same. Any failure raises
     ``AdapterError``; transport failures raise its ``EmbedderUnavailable``
     subclass.
     """
 
     def __init__(self, base_url, model, dimension, timeout_seconds, api_key_env=None, *, remote_data_egress: bool = False,
                  batch_timeout_seconds=None):
-        self._url = _embeddings_endpoint(base_url)
+        self._endpoint = _embeddings_endpoint(base_url)
         if not isinstance(model, str) or not model:
             raise AdapterError("embedder model must be a non-empty string")
         if type(dimension) is not int or not 0 < dimension <= MAX_DIMENSION:
@@ -126,7 +164,6 @@ class OpenAICompatibleEmbedder:
         self._batch_timeout = float(batch_timeout_seconds) if batch_timeout_seconds is not None else self._timeout
         self._api_key_env = api_key_env
         self._remote = not loopback
-        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
         self.server_model: str | None = None
 
     @property
@@ -164,52 +201,54 @@ class OpenAICompatibleEmbedder:
         token = os.environ.get(self._api_key_env) if self._api_key_env else None
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        request = urllib.request.Request(self._url, data=body, headers=headers, method="POST")
-        limit = self._response_limit(len(items))
-        deadline = time.monotonic() + timeout
-        try:
-            with self._opener.open(request, timeout=timeout) as response:
-                raw = self._read(response, limit, deadline)
-        except urllib.error.HTTPError as exc:
-            excerpt = self._error_excerpt(exc, token)
-            exc.close()
-            raise EmbedderUnavailable(f"embedding server answered HTTP {exc.code}" + (f": {excerpt}" if excerpt else "")) from None
-        except urllib.error.URLError as exc:
-            reason = exc.reason
-            raise EmbedderUnavailable(f"embedding server unreachable: {type(reason).__name__}: {_short(str(reason))}") from None
-        except (TimeoutError, OSError, http.client.HTTPException) as exc:
-            raise EmbedderUnavailable(f"embedding server unreachable: {type(exc).__name__}") from None
-        return self._parse(raw, len(items))
+        connection = self._connection(timeout)
+        outcome: dict = {}
 
-    @staticmethod
-    def _read(response, limit: int, deadline: float) -> bytes:
-        declared = response.headers.get("Content-Length")
-        if declared and declared.isdigit() and int(declared) > limit:
-            raise AdapterError("embedding response is too large")
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            if time.monotonic() > deadline:
-                raise EmbedderUnavailable("embedding server timed out")
-            chunk = response.read(min(65536, limit + 1 - total))
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > limit:
-                raise AdapterError("embedding response is too large")
-            chunks.append(chunk)
-        return b"".join(chunks)
+        def exchange() -> None:
+            try:
+                outcome["raw"] = self._exchange(connection, body, headers, self._response_limit(len(items)), token)
+            except BaseException as exc:  # handed to the caller's thread
+                outcome["error"] = exc
 
-    @staticmethod
-    def _error_excerpt(exc, token) -> str:
+        worker = threading.Thread(target=exchange, name="dream-embedder", daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
+            _abort(connection)
+            raise EmbedderUnavailable("embedding server timed out")
+        if "error" in outcome:
+            raise outcome["error"]
+        return self._parse(outcome["raw"], len(items))
+
+    def _connection(self, timeout: float) -> http.client.HTTPConnection:
+        parts = self._endpoint
+        if parts.scheme == "https":
+            return http.client.HTTPSConnection(parts.hostname, parts.port, timeout=timeout,
+                                               context=ssl.create_default_context())
+        return http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
+
+    def _exchange(self, connection, body: bytes, headers: dict, limit: int, token) -> bytes:
+        """One request on a fresh connection; transport failures become EmbedderUnavailable."""
         try:
-            raw = exc.read(513)
-        except Exception:
-            return ""
-        text = raw[:512].decode("utf-8", errors="replace")
-        if token:
-            text = text.replace(token, "<redacted>")
-        return _short(text, 200).strip()
+            connection.request("POST", self._endpoint.path, body=body, headers=headers)
+            response = connection.getresponse()
+            if not 200 <= response.status < 300:
+                # Redirects are never followed: any non-2xx answer is unavailability.
+                # Read past the excerpt by the key's length so an echoed key is redacted whole.
+                raw = _read_bounded(response, 512 + len(token or ""), raise_on_overflow=False)
+                excerpt = _redacted_excerpt(raw, token)
+                raise EmbedderUnavailable(f"embedding server answered HTTP {response.status}" + (f": {excerpt}" if excerpt else ""))
+            return _read_bounded(response, limit)
+        except AdapterError:
+            raise
+        except (TimeoutError, socket.timeout):
+            raise EmbedderUnavailable("embedding server timed out") from None
+        except http.client.HTTPException as exc:
+            raise EmbedderUnavailable(f"embedding server sent an invalid HTTP response: {type(exc).__name__}") from None
+        except OSError as exc:
+            raise EmbedderUnavailable(f"embedding server unreachable: {type(exc).__name__}: {_short(exc.strerror or str(exc))}") from None
+        finally:
+            connection.close()
 
     def _parse(self, raw: bytes, count: int) -> list[list[float]]:
         try:

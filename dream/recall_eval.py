@@ -14,6 +14,7 @@ from recall_context import EMBEDDER_MODE, retrieve
 from recall_documents import embed_recall_documents
 from recall_query import rank_lexical
 from recall_render import render_context
+from recall_select import embedder_calibration_version
 from recall_types import CalibrationRecord, RecallQuery, RecallSettings
 
 # Every fixture under the repository's fixtures directory is public by definition.
@@ -334,6 +335,8 @@ def calibrate_fixture_file(path, conn, mode: str, *, embedder=None, require_usab
         if best[2].mrr <= 0:
             raise ValueError("refusing --apply: no relevant document was retrieved at any threshold")
     canonical_hash = hashlib.sha256(_canonical(data)).hexdigest()
-    label = f"{mode}:{embedder.fingerprint}" if embedder is not None else mode
-    version = hashlib.sha256(f"{canonical_hash}:{label}:calibration-v1".encode("utf-8")).hexdigest()
+    if embedder is not None:
+        version = embedder_calibration_version(canonical_hash, mode, str(embedder.fingerprint))
+    else:
+        version = hashlib.sha256(f"{canonical_hash}:{mode}:calibration-v1".encode("utf-8")).hexdigest()
     return CalibrationRecord(mode, version, best[1] if best else 0.0, canonical_hash, dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"))

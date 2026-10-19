@@ -365,7 +365,8 @@ def test_dense_hook_is_off_without_an_embedder_and_fails_open(tmp_path):
         def embed(self, texts):
             raise RuntimeError("server down")
 
-    assert C._dense_for_subset(conn, "kw03", BrokenEmbedder()) is None
+    # Nothing is embedded under "broken": no request, and ranking stays lexical.
+    assert not C._dense_for_subset(conn, "kw03", BrokenEmbedder())
     selected = _select(
         conn, root, _batch("kw03 moved"), ConsolidateSettings(mode="subset", subset_files=2), embedder=BrokenEmbedder()
     )

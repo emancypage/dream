@@ -398,9 +398,11 @@ def _dense_for_subset(conn: sqlite3.Connection, query_text: str, embedder, *, li
         return None
     try:
         from recall_adapters import embed_query
-        from recall_embeddings import dense_candidates, embedding_text
+        from recall_embeddings import dense_candidates, embedding_text, has_vectors
         fingerprint = embedder.fingerprint
         fingerprint = fingerprint() if callable(fingerprint) else fingerprint
+        if not has_vectors(conn, str(fingerprint), ("approved_memory",)):
+            return []  # nothing embedded yet: no request to the server
         vector = embed_query(embedder, embedding_text(query_text))
         return dense_candidates(conn, vector, str(fingerprint), ("approved_memory",), limit=limit)
     except Exception as exc:
