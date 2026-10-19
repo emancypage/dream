@@ -18,6 +18,12 @@ model = "gpt-5.6-luna"
 reasoning_effort = "high"
 timeout_seconds = 1800
 
+# Weekly staleness audit (`dream audit`, dream-audit.timer) over the whole store in chunks.
+[stages.audit]
+provider = "codex"
+reasoning_effort = "high"
+timeout_seconds = 1800
+
 [providers.codex]
 type = "codex-cli"
 auth = "chatgpt-subscription"
@@ -62,6 +68,12 @@ enabled = false
 [review]
 mode = "suggest-only"
 backup_keep = 14
+
+# "full" sends the whole store nightly (and audits it); "subset" sends MEMORY.md plus
+# the subset_files most related topic files and leaves the audit to `dream audit`.
+[consolidate]
+mode = "full"
+subset_files = 15
 
 [recall]
 enabled = true

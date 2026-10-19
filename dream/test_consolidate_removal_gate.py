@@ -48,3 +48,12 @@ def test_remove_of_already_missing_file_passes_through():
         root = Path(d)
         sugs = [Suggestion(kind="remove", target_path="gone.md", body="", rationale="r", source_sessions=[])]
         assert _drop_fresh_removals(sugs, root) == sugs
+
+
+def test_patch_suggestions_are_never_held_back():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        _touch_days_ago(root / "fresh.md", 1)
+        sugs = [Suggestion(kind="patch", target_path="fresh.md", body="y", rationale="r",
+                           source_sessions=[], find="x")]
+        assert _drop_fresh_removals(sugs, root) == sugs

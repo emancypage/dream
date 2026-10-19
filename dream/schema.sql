@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS distilled (
 CREATE TABLE IF NOT EXISTS suggestions (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
-    kind          TEXT NOT NULL,             -- 'new' | 'update' | 'remove' | 'index'
+    kind          TEXT NOT NULL,             -- 'new' | 'update' | 'remove' | 'index' | 'patch'
     target_path   TEXT NOT NULL,             -- relative under ~/.claude/memory or project memory
     body          TEXT NOT NULL,             -- proposed file content (full, not diff — diff computed at review time)
     rationale     TEXT,                       -- why this change
@@ -96,7 +96,8 @@ CREATE TABLE IF NOT EXISTS suggestions (
     sug_file      TEXT,                       -- filename of the preview .md under .suggestions/; review deletes it on resolve
     base_sha256   TEXT,
     target_existed INTEGER,
-    consolidation_run_id TEXT
+    consolidation_run_id TEXT,
+    find_text     TEXT                        -- 'patch' only: the exact span that body replaces
 );
 
 CREATE INDEX IF NOT EXISTS idx_suggestions_status ON suggestions(status);

@@ -7,6 +7,7 @@ Subcommands:
   estimate      Show how many sessions would be distilled + subscription-limit draw
   distill       Run the configured distillation stage and store JSON notes
   consolidate   Run the configured consolidation stage and propose updates
+  audit         Weekly staleness audit over the whole store (remove/patch only)
   search        FTS5 search over all ingested transcripts
   review        Walk pending suggestions, accept/reject interactively
   status        Show DB stats
@@ -40,6 +41,7 @@ sys.path.insert(0, str(ROOT))
 from ingest import discover_jsonl, home_project_slug, ingest_file, ingest_configured_sources  # noqa: E402
 from distill import distill_session, sessions_needing_distill  # noqa: E402
 from consolidate import consolidate as run_consolidate  # noqa: E402
+from consolidate import PatchError, patch_text, run_audit, states_deletion  # noqa: E402
 from search import search as fts_search, session_summary  # noqa: E402
 from backend import active_backend, generate, preflight  # noqa: E402
 from config import load_config  # noqa: E402
@@ -111,6 +113,7 @@ def _backup_before_schema_migration(conn: sqlite3.Connection, path: Path) -> Pat
         "source" not in _table_columns(conn, "sessions")
         or "distillation_key" not in _table_columns(conn, "distilled")
         or "base_sha256" not in _table_columns(conn, "suggestions")
+        or "find_text" not in _table_columns(conn, "suggestions")
     )
     migrations = _table_columns(conn, "schema_migrations")
     version = conn.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0] if migrations else 0
@@ -153,6 +156,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "base_sha256": "TEXT",
             "target_existed": "INTEGER",
             "consolidation_run_id": "TEXT",
+            "find_text": "TEXT",
         },
     }
     with conn:
@@ -428,16 +432,35 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
         model=args.model,
         max_sessions=args.max_sessions,
         config=args.config,
+        mode=getattr(args, "mode", None),
     )
+    return _print_suggestions(memory_root, suggestions)
+
+
+def _print_suggestions(memory_root: Path, suggestions) -> int:
     if not suggestions:
         print("No suggestions produced.")
         return 0
     print(f"\nWrote {len(suggestions)} suggestions to {memory_root}/.suggestions/")
     for s in suggestions:
-        kind_color = {"new": "green", "update": "yellow", "remove": "red", "index": "blue"}.get(s.kind, "grey")
+        kind_color = {"new": "green", "update": "yellow", "remove": "red", "index": "blue",
+                      "patch": "magenta"}.get(s.kind, "grey")
         print(f"  [{_color(s.kind, kind_color):>14}] {s.target_path}  — {s.rationale[:80]}")
     print(f"\nRun `dream review` to walk through them.")
     return 0
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    """Weekly staleness audit; in full mode the nightly consolidation already audits."""
+    if args.config.consolidate_settings().mode == "full" and not getattr(args, "force", False):
+        print("consolidate.mode is full: the nightly consolidation already audits the whole store; "
+              "skipping. Pass --force to audit anyway.")
+        return 0
+    conn = open_db(args.db)
+    memory_root = Path(args.memory)
+    print(f"Auditing {memory_root} for stale memories")
+    suggestions = run_audit(conn, memory_root, model=args.model, config=args.config)
+    return _print_suggestions(memory_root, suggestions)
 
 
 def cmd_search(args: argparse.Namespace) -> int:
@@ -481,6 +504,43 @@ def _file_sha256(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
 
 
+def apply_patch(target: Path, find: str, replace: str, *, expected_sha: str | None,
+                allow_empty: bool = False) -> str:
+    """Write one accepted `patch` suggestion; the only writer for patches.
+
+    Refuses (PatchError, nothing written) unless the target exists with the
+    expected SHA-256, is NFC, and contains the NFC-normalized `find` exactly
+    once. An empty replacement needs ``allow_empty`` (a stated deletion).
+    Callers run the containment, protected-file and retention checks and take
+    the backup first, exactly as for `update`. Returns the written text.
+    """
+    target = Path(target)
+    if not expected_sha:
+        raise PatchError("patch requires a base SHA precondition")
+    if not target.exists():
+        raise PatchError(f"patch target does not exist: {target.name}")
+    data = target.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected_sha:
+        raise PatchError("target changed since the suggestion was made")
+    patched = patch_text(data.decode("utf-8"), find, replace, allow_empty=allow_empty)
+    target.write_text(patched, encoding="utf-8", newline="")
+    return patched
+
+
+def _patch_fields(conn: sqlite3.Connection, sug_id) -> tuple[str | None, str]:
+    """Return (find_text, rationale) of a suggestion; (None, "") on a pre-patch schema."""
+    columns = _table_columns(conn, "suggestions")
+    if "find_text" not in columns:
+        return None, ""
+    rationale = "rationale" if "rationale" in columns else "''"
+    row = conn.execute(f"SELECT find_text, {rationale} FROM suggestions WHERE id=?", (sug_id,)).fetchone()
+    return (row[0], row[1] or "") if row else (None, "")
+
+
+def _find_text(conn: sqlite3.Connection, sug_id) -> str | None:
+    return _patch_fields(conn, sug_id)[0]
+
+
 def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
                       sug_id, kind, target_path, new_content, sug_file,
                       sync_recall: bool = True, *, constitution_path) -> bool:
@@ -496,7 +556,8 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
     resolved_target = tgt.resolve()
     contained = resolved_target.is_relative_to(resolved_root)
     from character.safety import is_memory_control_source
-    protected = kind == "remove" and resolved_target == resolved_root / "MEMORY.md"
+    # MEMORY.md is never deleted, and never patched: index lines are only appended.
+    protected = kind in ("remove", "patch") and resolved_target == resolved_root / "MEMORY.md"
     if is_memory_control_source(tgt, memory_root=memory_root, constitution_path=constitution_path):
         _reject_suggestion(conn, sug_dir, sug_id, sug_file)
         print(f"  rejected #{sug_id}: the constitution is human-controlled")
@@ -527,12 +588,31 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
     if conflict:
         print(f"  conflict #{sug_id} ({target_path}): target changed since suggestion")
         return False
+    if kind == "patch" and contained and not protected:
+        find, rationale = _patch_fields(conn, sug_id)
+        allow_empty = states_deletion(rationale)
+        try:
+            patched = patch_text(tgt.read_bytes().decode("utf-8") if tgt.exists() else "",
+                                 find or "", new_content or "", allow_empty=allow_empty)
+        except (PatchError, OSError, UnicodeDecodeError) as exc:
+            print(f"  deferred #{sug_id}: {exc}")
+            return False
+        if policy.excludes(source_path=target_path, text=patched):
+            _reject_suggestion(conn, sug_dir, sug_id, sug_file)
+            print(f"  rejected #{sug_id}: excluded by local memory retention policy")
+            return False
     if contained and not protected:
         tgt.parent.mkdir(parents=True, exist_ok=True)
         if kind == "remove" and tgt.exists():
             tgt.unlink()
         elif kind in ("new", "update", "index"):
             tgt.write_text(new_content, encoding="utf-8")
+        elif kind == "patch":
+            try:
+                apply_patch(tgt, find or "", new_content or "", expected_sha=base_sha, allow_empty=allow_empty)
+            except PatchError as exc:
+                print(f"  deferred #{sug_id}: {exc}")
+                return False
         status = "accepted"
     else:
         print(f"  refusing #{sug_id} ({target_path}): unsafe target, marking rejected")
@@ -572,7 +652,7 @@ def _safe_suggestion_target(memory_root: Path, target_path: str) -> Path | None:
     return target if target.is_relative_to(root) else None
 
 
-def _curation_target_snapshot(memory_root: Path, row: tuple) -> dict[str, Any]:
+def _curation_target_snapshot(memory_root: Path, row: tuple, find_text: str | None = None) -> dict[str, Any]:
     """Build the model-facing snapshot without reading an unsafe target path."""
     sug_id, kind, target_path, body, rationale, sources, sug_file, base_sha, existed = row
     target = _safe_suggestion_target(memory_root, target_path)
@@ -590,6 +670,7 @@ def _curation_target_snapshot(memory_root: Path, row: tuple) -> dict[str, Any]:
             "current_body": "",
             "current_sha256": None,
             "conflict": True,
+            "find_text": find_text,
         }
 
     target_existed = target.exists()
@@ -613,6 +694,7 @@ def _curation_target_snapshot(memory_root: Path, row: tuple) -> dict[str, Any]:
         "current_body": current_body,
         "current_sha256": current_sha,
         "conflict": conflict,
+        "find_text": find_text,
     }
 
 
@@ -688,7 +770,7 @@ def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions, *, const
             unsafe.append(sug_id)
             print(f"conflict #{sug_id}: unsafe target path; rejected by host safety check")
             continue
-        if kind == "remove" and target == memory_root.resolve() / "MEMORY.md":
+        if kind in ("remove", "patch") and target == memory_root.resolve() / "MEMORY.md":
             _reject_suggestion(conn, memory_root / ".suggestions", sug_id, sug_file)
             rejected.append(sug_id)
             unsafe.append(sug_id)
@@ -718,7 +800,9 @@ def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions, *, const
             print(f"conflict #{sug_id} ({target_path}): initial conflict; accept deferred")
             continue
         proposed_body = snapshot["body"] if decision.decision == "accept" else decision.body
-        new_content = _resolved_body(kind, old, proposed_body)
+        # A merge supplies a complete body, so a merged patch applies as an update.
+        apply_kind = "update" if kind == "patch" and decision.decision == "merge" else kind
+        new_content = _resolved_body(apply_kind, old, proposed_body)
         if backup is None:
             backup = _backup_memory(memory_root)
         with conn:
@@ -726,13 +810,19 @@ def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions, *, const
                 "UPDATE suggestions SET base_sha256=?, target_existed=? WHERE id=?",
                 (expected["sha256"], int(expected["existed"]), sug_id),
             )
+            if apply_kind != kind:
+                # Store the full merged body too: a pending update must never hold a patch span.
+                conn.execute(
+                    "UPDATE suggestions SET kind='update', find_text=NULL, body=? WHERE id=?",
+                    (proposed_body, sug_id),
+                )
         try:
             applied_ok = _apply_suggestion(
                 conn,
                 memory_root,
                 memory_root / ".suggestions",
                 sug_id,
-                kind,
+                apply_kind,
                 target_path,
                 new_content,
                 sug_file,
@@ -784,7 +874,10 @@ def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, ro
         return 0
 
     try:
-        snapshots = [_curation_target_snapshot(memory_root, row) for row in rows]
+        snapshots = [
+            _curation_target_snapshot(memory_root, row, _find_text(conn, row[0]) if row[1] == "patch" else None)
+            for row in rows
+        ]
         prompt = build_curation_prompt(snapshots, memory_root)
         result = generate("review", prompt, CURATION_SCHEMA, config=args.config)
         decisions = parse_curation_output(result.output, {row[0] for row in rows})
@@ -866,6 +959,8 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
                 "current_sha256": _file_sha256(path),
                 "conflict": conflict,
             })
+            if kind == "patch":
+                items[-1]["find"] = _find_text(conn, sug_id)
         print(json.dumps({"suggestions": items}, ensure_ascii=False, indent=2))
         return 0
 
@@ -918,6 +1013,10 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
                 "UPDATE suggestions SET body=?, base_sha256=?, target_existed=? WHERE id=?",
                 (body, _file_sha256(path), int(path.exists()), sug_id),
             )
+            if kind == "patch":
+                # The merge body is the complete file, so the patch becomes an update.
+                conn.execute("UPDATE suggestions SET kind='update', find_text=NULL WHERE id=?", (sug_id,))
+        kind = "update" if kind == "patch" else kind
     new_content = _resolved_body(kind, old, body)
     backup = _backup_memory(memory_root)
     print(f"Backup: {backup}")
@@ -985,14 +1084,23 @@ def cmd_review(args: argparse.Namespace) -> int:
         print(f"sources:   {sources}")
         print(_color("-" * 78, "grey"))
 
+        shown = new_content
+        if kind == "patch":
+            find = _find_text(conn, sug_id)
+            print(f"find: {find}")
+            try:
+                shown = patch_text(old, find or "", body or "", allow_empty=states_deletion(rationale))
+            except PatchError as exc:
+                print(_color(f"(patch cannot apply as proposed: {exc}; accepting defers it)", "red"))
+                shown = None
         if kind == "remove":
             print(_color("(would delete this file)", "red"))
-        else:
-            # Diff against what we'll actually write (merged result for index), so the
-            # preview never lies about the outcome.
+        elif shown is not None:
+            # Diff against what we'll actually write (merged result for index, patched
+            # file for patch), so the preview never lies about the outcome.
             diff = difflib.unified_diff(
                 old.splitlines(keepends=True),
-                new_content.splitlines(keepends=True),
+                shown.splitlines(keepends=True),
                 fromfile=f"a/{target_path}",
                 tofile=f"b/{target_path}",
                 n=3,
@@ -1014,8 +1122,8 @@ def cmd_review(args: argparse.Namespace) -> int:
         if choice == "q":
             break
         if choice == "a":
-            _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target_path, new_content, sug_file, constitution_path=args.config.data['character']['constitution_path'])
-            print(_color("  accepted.", "green"))
+            if _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target_path, new_content, sug_file, constitution_path=args.config.data['character']['constitution_path']):
+                print(_color("  accepted.", "green"))
         elif choice == "r":
             conn.execute("UPDATE suggestions SET status='rejected', reviewed_at=CURRENT_TIMESTAMP WHERE id=?", (sug_id,))
             conn.commit()
@@ -1318,7 +1426,16 @@ def main(argv: list[str] | None = None) -> int:
     pc.add_argument("--since", help="Optional legacy timestamp lower bound")
     pc.add_argument("--max-sessions", type=int, default=200)
     pc.add_argument("--model", default=None, help="Temporary model override")
+    pc.add_argument("--mode", choices=["full", "subset"], default=None,
+                    help="Override consolidate.mode for this run")
     pc.set_defaults(func=cmd_consolidate)
+
+    pa = sub.add_parser("audit", help="Weekly staleness audit over the whole store (remove/patch suggestions)")
+    pa.add_argument("--memory")
+    pa.add_argument("--model", default=None, help="Temporary model override")
+    pa.add_argument("--force", action="store_true",
+                    help="Audit even when consolidate.mode is full (the nightly run already audits)")
+    pa.set_defaults(func=cmd_audit)
 
     ps = sub.add_parser("search", help="FTS5 search over transcripts")
     ps.add_argument("query")

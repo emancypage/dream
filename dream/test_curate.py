@@ -831,3 +831,128 @@ def test_curate_merge_can_refresh_an_old_conflict_after_recheck(tmp_path, monkey
     assert statuses(db_path)[1] == "accepted"
     assert (root / "merge.md").read_text(encoding="utf-8") == "merged after conflict"
     assert list(tmp_path.glob("memory-backups/*"))
+
+
+def _patch_fixture(tmp_path, find="old fact", body="new fact", target="topic.md",
+                   content="intro\nold fact\noutro\n"):
+    root = tmp_path / "memory"
+    root.mkdir()
+    path = root / target
+    path.write_text(content, encoding="utf-8")
+    db_path = tmp_path / "dream.db"
+    config = load_config(
+        tmp_path / "missing-config.toml",
+        overrides={
+            "storage": {"db_path": str(db_path), "memory_root": str(root)},
+            "review": {"mode": "auto-apply"},
+        },
+    )
+    conn = open_db(db_path)
+    conn.execute(
+        "INSERT INTO suggestions(kind, target_path, body, rationale, source_sessions, status, "
+        "base_sha256, target_existed, find_text) VALUES ('patch', ?, ?, 'fact changed', 'session-a', "
+        "'pending', ?, 1, ?)",
+        (target, body, _sha(path), find),
+    )
+    conn.commit()
+    conn.close()
+    return root, db_path, config
+
+
+def _curate_with(monkeypatch, decision, body="", captured=None):
+    def fake_review(stage, prompt, schema, **kwargs):
+        if captured is not None:
+            captured["prompt"] = prompt
+        return SimpleNamespace(
+            output={"decisions": [_decision(1, decision, "checked", body=body)]},
+            provider="codex", model="gpt-5.6-luna",
+        )
+
+    monkeypatch.setattr(dream, "generate", fake_review, raising=False)
+
+
+def test_curate_accept_applies_a_patch_with_a_backup(tmp_path, monkeypatch):
+    root, db_path, config = _patch_fixture(tmp_path)
+    captured = {}
+    _curate_with(monkeypatch, "accept", captured=captured)
+    assert run_curate(root, db_path, config) == 0
+    assert (root / "topic.md").read_text(encoding="utf-8") == "intro\nnew fact\noutro\n"
+    assert statuses(db_path) == {1: "accepted"}
+    assert list(tmp_path.glob("memory-backups/*"))
+    assert '"patch_find": "old fact"' in captured["prompt"]
+    assert '"target_kind": "patch"' in captured["prompt"]
+
+
+def test_curate_merge_on_a_patch_applies_the_full_body_as_an_update(tmp_path, monkeypatch):
+    root, db_path, config = _patch_fixture(tmp_path, find="o")
+    _curate_with(monkeypatch, "merge", body="intro\nmerged fact\noutro\n")
+    assert run_curate(root, db_path, config) == 0
+    assert (root / "topic.md").read_text(encoding="utf-8") == "intro\nmerged fact\noutro\n"
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("SELECT status, kind, find_text, body FROM suggestions").fetchone() == (
+            "accepted", "update", None, "intro\nmerged fact\noutro\n")
+    finally:
+        conn.close()
+
+
+def test_curate_merge_on_a_patch_never_leaves_the_span_as_an_update_body(tmp_path, monkeypatch):
+    root, db_path, config = _patch_fixture(tmp_path, find="o")
+    _curate_with(monkeypatch, "merge", body="intro\nmerged fact\noutro\n")
+
+    def failing_apply(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(dream, "_apply_suggestion", failing_apply)
+    assert run_curate(root, db_path, config) == 1
+    assert (root / "topic.md").read_text(encoding="utf-8") == "intro\nold fact\noutro\n"
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("SELECT status, kind, find_text, body FROM suggestions").fetchone() == (
+            "pending", "update", None, "intro\nmerged fact\noutro\n")
+    finally:
+        conn.close()
+
+
+def test_curate_defers_an_ambiguous_patch_without_writing(tmp_path, monkeypatch, capsys):
+    root, db_path, config = _patch_fixture(tmp_path, find="o")
+    _curate_with(monkeypatch, "accept")
+    assert run_curate(root, db_path, config) == 0
+    assert (root / "topic.md").read_text(encoding="utf-8") == "intro\nold fact\noutro\n"
+    assert statuses(db_path) == {1: "pending"}
+    out = capsys.readouterr().out
+    assert "deferred #1:" in out
+    assert "deferred IDs: [1]" in out
+
+
+def test_curate_rejects_a_patch_of_memory_md(tmp_path, monkeypatch):
+    index = "- [Topic](topic.md) — old fact\n"
+    root, db_path, config = _patch_fixture(tmp_path, target="MEMORY.md", content=index)
+    _curate_with(monkeypatch, "accept")
+    assert run_curate(root, db_path, config) == 1
+    assert (root / "MEMORY.md").read_text(encoding="utf-8") == index
+    assert statuses(db_path) == {1: "rejected"}
+    assert not list(tmp_path.glob("memory-backups/*"))
+
+
+def test_curation_prompt_describes_patches_only_when_a_patch_is_pending():
+    row = {"id": 7, "kind": "update", "target_path": "topic.md", "body": "b", "rationale": "r",
+           "source_sessions": [], "current_body": "c", "current_sha256": "s", "base_sha256": "s",
+           "target_existed": True, "conflict": False}
+    plain = build_curation_prompt([row], Path("/memory/root"))
+    assert "patch_find" not in plain
+    assert "For a patch row" not in plain
+    patched = build_curation_prompt(
+        [row, {**row, "id": 8, "kind": "patch", "find_text": "old fact"}], Path("/memory/root"))
+    assert patched.count('"patch_find"') == 1
+    assert '"patch_find": "old fact"' in patched
+    assert "For a patch row" in patched
+    assert "exactly once" in patched
+
+
+def test_curation_prompt_bounds_the_patch_find_field():
+    with pytest.raises(ValueError, match="suggestion ID 8.*patch_find"):
+        build_curation_prompt(
+            [{"id": 8, "kind": "patch", "find_text": "x" * (MAX_CURATION_FIELD_CHARS + 1)}],
+            Path("/memory/root"),
+        )

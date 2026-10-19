@@ -15,7 +15,7 @@ from recall_types import AdapterSettings, RecallSettings
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "dream" / "config.toml"
 
-_TOP_KEYS = {"storage", "stages", "providers", "sources", "review", "recall", "character"}
+_TOP_KEYS = {"storage", "stages", "providers", "sources", "review", "recall", "character", "consolidate"}
 _STORAGE_KEYS = {"db_path", "memory_root"}
 _STAGE_KEYS = {"provider", "model", "reasoning_effort", "timeout_seconds"}
 _PROVIDER_KEYS = {"type", "auth", "executable", "extra_args"}
@@ -57,10 +57,25 @@ _RECALL_DEFAULTS: dict[str, Any] = {
     "calibration_path": "~/.config/dream/recall-calibration.json",
 }
 _DEFAULT_ADAPTER = AdapterSettings(enabled=False, type="none", remote_data_egress=False)
+_CONSOLIDATE_KEYS = {"mode", "subset_files"}
+_CONSOLIDATE_MODES = {"full", "subset"}
 
 
 class ConfigError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class ConsolidateSettings:
+    """How the nightly consolidation reads the memory store.
+
+    ``full`` sends the whole store (today's behaviour, and the rollback);
+    ``subset`` sends MEMORY.md plus at most ``subset_files`` related topic files
+    and leaves the staleness audit to the weekly ``dream audit``.
+    """
+
+    mode: str = "full"
+    subset_files: int = 15
 
 
 @dataclass(frozen=True)
@@ -103,6 +118,15 @@ class DreamConfig:
             **{key: recall.get(key, _RECALL_DEFAULTS[key]) for key in _RECALL_DEFAULTS},
             embedder=self._adapter_settings("embedder", recall),
             reranker=self._adapter_settings("reranker", recall),
+        )
+
+    def consolidate_settings(self) -> ConsolidateSettings:
+        raw = self.data.get("consolidate")
+        raw = raw if isinstance(raw, dict) else {}
+        defaults = ConsolidateSettings()
+        return ConsolidateSettings(
+            mode=raw.get("mode", defaults.mode),
+            subset_files=raw.get("subset_files", defaults.subset_files),
         )
 
     @staticmethod
@@ -246,7 +270,19 @@ def _validate(data: dict[str, Any]) -> list[str]:
             raise ConfigError(f"stage {name} references unknown provider {stage['provider']!r}")
     _validate_character(data)
     _validate_recall(data.get("recall", {}), optional_errors)
+    _validate_consolidate(data.get("consolidate", {}))
     return optional_errors
+
+
+def _validate_consolidate(raw: Any) -> None:
+    if not isinstance(raw, dict):
+        raise ConfigError("consolidate must be a table")
+    _unknown_keys("consolidate", raw, _CONSOLIDATE_KEYS)
+    if "mode" in raw and raw["mode"] not in _CONSOLIDATE_MODES:
+        raise ConfigError("consolidate.mode must be full or subset")
+    value = raw.get("subset_files")
+    if "subset_files" in raw and (type(value) is not int or value <= 0):
+        raise ConfigError("consolidate.subset_files must be a positive integer")
 
 
 def _validate_recall(recall: Any, optional_errors: list[str]) -> None:
