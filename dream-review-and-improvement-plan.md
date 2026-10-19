@@ -1,12 +1,107 @@
-# Dream improvement plan for agentic sessions
+# Dream memory pipeline — review, alternatives, and improvement plan
 
-Oct 19, 2026 · @Szymon Szymkowiak
+As of 2026-10-19. Prepared for Szymon Szymkowiak. Part 1 is the review of `dream` (github.com/emancypage/dream) against the current memory-system landscape; Part 2 is a task-by-task plan for coding-agent sessions, in the repo's own plan style.
 
-> For agentic workers: use superpowers:subagent-driven-development or superpowers:executing-plans. Follow the test-first steps below. Export this tab as Markdown to `docs/superpowers/plans/2026-10-19-recall-and-consolidation-upgrade.md` and commit it before starting Task 0.
+---
+
+# Part 1: Dream memory pipeline — review and alternatives
+
+## Verdict
+
+`dream` is a well-engineered, unusually safety-conscious nightly consolidator whose retrieval, consolidation scaling and forgetting are behind the current state of the art. No single off-the-shelf framework is measurably better at the whole job: the market has converged on the same file-based design `dream` uses, and the public benchmarks are unreliable. "Better" exists at the component level, and the gaps are cheap to close on a dual-RTX-3090 rig.
+
+The parts that are hard to get right (safety, provenance, human review) are done. The parts that are behind (hybrid retrieval, mid-session access, incremental consolidation, usage-based forgetting, a real eval set) are well-understood engineering.
+
+## What was checked
+
+The review is based on the code as of commit `161debb` (2026-10-19), not on the README alone.
+
+- Cloned [github.com/emancypage/dream](https://github.com/emancypage/dream): 20.5k lines including tests and docs, about 16k lines of Python runtime, standard library only. 54 commits: 24 in August 2026, 2 in September, 28 on 18–19 October (the character pipeline).
+- Ran the hermetic suite: 489 tests pass in 22 s on Python 3.13.
+- Read `schema.sql`, both prompts, the recall path (`recall_query.py`, `recall_select.py`, `recall_context.py`, `recall_adapters.py`), `consolidate.py`, the public fixtures, the skill, and both design specs.
+- Compared against current documentation for Claude Code, Codex, Letta, Mem0, Graphiti/Zep, Cognee, three small local-first MCP memory servers (palace-rs, opencode-memory, semantic-memory-mcp), and two 2026 papers. Links are in Sources.
+
+## What dream gets right
+
+The review gate, provenance and threat model are rarer than they look; most hobby and several commercial systems lack them.
+
+- **Human review gate with preconditions.** Suggestions carry `base_sha256`; `accept` and `merge` refuse to write if the target changed; backups precede live writes; curation decisions are logged with reasons. Codex's native memories and Letta's "Dreaming" both auto-apply. Letta's optional review agent explicitly does not ask for approval ([Letta docs](https://docs.letta.com/letta-code/memory)).
+- **Provenance and a real cursor.** Consolidation advances a ledger of consumed distillation keys, not timestamps, and never consumes a truncated batch. Every distillation records prompt version, provider, model, usage and duration.
+- **Recall treated as untrusted data.** Trust levels, an injection marker, a deterministic secret and home-path scrubber, immutable read-only SQLite in hooks, fail-open with exit 0. This is the right threat model, and it is tested.
+- **Design validated by the market.** The memory format (`MEMORY.md` index plus topic files typed `user | feedback | project | reference`) is Claude Code's auto-memory layout, and `dream` writes into that directory. Claude Code loads the first 200 lines or 25 KB of `MEMORY.md` and reads topic files on demand ([Claude Code docs](https://code.claude.com/docs/en/memory?r=0)). Letta's MemFS has the same shape: a root `MEMORY.md`, markdown files with name and description frontmatter, subdirectories kept out of context until needed ([MemFS](https://docs.letta.com/concepts/memfs)). Codex memories are `MEMORY.md` plus consolidated markdown under `~/.codex/memories/` ([Codex deep dive](https://codex.danielvaughan.com/2026/04/18/codex-built-in-memory-system-deep-dive/)). Letta even calls its background consolidation "Dreaming", configured with `/sleeptime`.
+
+## Where it falls behind
+
+Six gaps, in order of how much they cost day to day. Each points at the code that causes it.
+
+1. **Retrieval is lexical-only, and the language split makes it worse.** `rank_lexical` is FTS5 BM25 (unicode61, no stemming) fused by RRF with structured-term, path and recency lists. The embedder and reranker are `Protocol`s with config `type = "none"`; no implementation ships. `distill.md` forces English memories. A Polish prompt to Codex is therefore a near-guaranteed recall miss (no shared tokens, no Polish morphology), and `first_prompt_only = true` means no second chance. Every comparable system now does hybrid dense plus sparse: Mem0 v3 fuses semantic, BM25 and entity signals ([Mem0 migration doc](https://docs.mem0.ai/migration/oss-v2-to-v3)); the small local-first servers all do sqlite-vec plus FTS5 plus RRF with a local ONNX or llama.cpp embedder. On two RTX 3090s a multilingual embedder (bge-m3, Qwen3-Embedding) costs nothing in egress, which is the case the `remote_data_egress` flag was designed for.
+2. **The agent cannot ask memory anything mid-session.** Injection is session-start (index only) plus the first prompt. The skill exposes `dream search`, but that runs over raw transcripts, not approved memories. Claude Code, Letta, Codex and all the MCP servers let the agent read memory on demand throughout the session.
+3. **Consolidation is whole-store-in-prompt.** `MAX_CURRENT_MEMORY_CHARS = 800_000`; the code's own comment records the live store at 420 KB across 75 files in July 2026. That is roughly 100k+ tokens per nightly call at `reasoning_effort = "high"`, scaling linearly with the store, and the "prefer updating to adding" dedup depends on the model spotting a match somewhere in those tokens. Codex native ranks per-session outputs by usage count and recency, keeps the top N, and shows the sub-agent evidence before it forgets anything ([Codex deep dive](https://codex.danielvaughan.com/2026/04/18/codex-built-in-memory-system-deep-dive/)). Mem0 retrieves the top 10 related memories per new fact instead of the whole store ([migration doc](https://docs.mem0.ai/migration/oss-v2-to-v3)).
+4. **Forgetting is weak, and the signal to fix it is already stored.** Removal needs closure language in the file plus a 21-day mtime grace. There is no usage tracking, no validity window, and edits are whole-file bodies. Yet `recall_events.selected_ids_json` records exactly which memories were injected, an unused usage signal. A June 2026 study of 13 memory configurations (FORGETEVAL; single author affiliated with the LETHE vendor, so weigh accordingly) found that recall benchmarks say nothing about whether a store can be commanded to forget, that a narrow mutation-time LLM hook raised intent-aware deletion to 78–85%, and that systems without a partial-edit primitive fail compound-fact cases outright ([arXiv 2606.15903](https://arxiv.org/pdf/2606.15903)).
+5. **Recall quality is unmeasured.** The design spec promises fixtures for multilingual, stale, duplicate, private-data and injection cases. The shipped public fixture is 4 documents and 3 queries. The 1,769 Claude Code sessions on disk are enough to draw a 50–100 question held-out set from.
+6. **Scope: the character pipeline.** About 30% of the codebase, 28 commits in two days, nine prompt files, DPO export with no trainer, deployed as at most three examples in context. It has no measured effect on agent behaviour, and full scope was chosen without variant testing. It is a research prototype bolted onto a memory tool; it is already behind a flag, and it should stay frozen until a before/after eval on fixed probes shows it changes anything. Otherwise it is review burden on every memory-related change.
+
+Minor: `rank_lexical` loads and scrubs every document on each hook call (O(N)). Fine at personal scale, and the reason the 5 s hook timeout exists.
+
+## The landscape, calibrated
+
+The leaderboards do not rank the alternatives; cost, latency and what each system can do decide. LoCoMo transcripts fit in a context window (about 16–26k tokens); vendors grade with their own judge prompts; Zep revised its own LoCoMo claim from about 84% to 58% after fixing its eval; Mem0's own results show full context beating its pipeline on accuracy, and one 2026 analysis puts long-context models ahead by about 35 points. Memory layers earn their keep on cost and latency (about 7k tokens and 1.4 s per query versus 25k+ tokens and 17 s) and once the history no longer fits ([dreaming.press analysis](https://dreaming.press/posts/how-to-read-an-agent-memory-benchmark.html)). Mem0's 93.4% LongMemEval did not reproduce in a competitor's harness (73.8%) or in an independent paper (49% with a GPT-5-mini reader) ([Mnemoverse comparison](https://mnemoverse.com/docs/library/ai-memory-solutions-2026-q3)).
+
+| System | Better than dream at | Worse than dream, or its cost |
+| --- | --- | --- |
+| [Claude Code auto memory](https://code.claude.com/docs/en/memory?r=0) (built-in) | Agent reads and writes memory all session; per-repo scope; `modified` timestamps; zero maintenance | Claude-only; auto-applies; no cross-tool ingestion; off by default in self-hosted environments |
+| [Codex memories](https://learn.chatgpt.com/docs/customization/memories) (native; rolling out to the EEA since June 2026, disabled by default there per [WindowsReport](https://windowsreport.com/?p=1499581)) | Usage-ranked consolidation with evidence-backed forgetting; rate-limit aware | Codex-only; no user review; `codex exec --ephemeral` and sub-agent sessions excluded, which is how `dream` itself calls Codex |
+| [Letta Code / MemFS + Dreaming](https://docs.letta.com/letta-code/memory) | Git-versioned memory; subagents in worktrees; `/doctor` audits duplication and token cost; closest conceptual twin | Adopting it means adopting the harness (OpenCode and Codex drop out); the review agent does not ask for approval |
+| [Graphiti](https://www.falkordb.com/blog/graphiti-get-started/) (Apache-2.0, embedded FalkorDBLite) | Bi-temporal validity window on every fact, the only system with it by default | Run a graph database plus LLM extraction per episode; overkill for one user |
+| Cognee (Apache-2.0, embedded SQLite/LanceDB) | No infrastructure; many search types | No public LoCoMo or LongMemEval score; bi-temporal conflict resolution is an Enterprise feature |
+| [Mem0 OSS](https://docs.mem0.ai/migration/oss-v2-to-v3) | Drop-in SDK; hybrid retrieval | v3 OSS extraction is ADD-only (no UPDATE or DELETE); graph memory removed from OSS; contradictions accumulate |
+| [palace-rs](https://github.com/AncientiCe/palace-rs), [opencode-memory](https://github.com/rajarshighoshal/opencode-memory), [semantic-memory-mcp](https://github.com/Michael-Logies/semantic-memory-mcp) | MCP plus sqlite-vec plus local embeddings; palace-rs reports R@5 0.98 on LongMemEval-S (self-run) | 1–4 GitHub stars each; no consolidation or review gate; not adoptable, but the pattern is copyable |
+
+The sleep-time compute paper behind Letta's approach reports about 5× less test-time compute at equal accuracy and +13/+18 points on stateful GSM-Symbolic/AIME ([arXiv 2504.13171](https://arxiv.org/abs/2504.13171v1)). Those are math benchmarks, so it validates nightly consolidation in principle, not for coding memory specifically.
+
+## Options
+
+Recommendation: option A, with the MCP tool from option D. The review gate, provenance and cross-tool ingestion are what nothing else offers; the weak parts are well-understood engineering, and the rig removes the usual cost objection.
+
+**A. Keep dream and close the four gaps.** (1) Ship a real embedder adapter: a local multilingual model via llama.cpp or ONNX into `recall_embeddings`, fused into the existing RRF. (2) Add an MCP server, or a `dream recall` subcommand the skill calls, over `recall_documents`, so agents query approved memory mid-session. (3) Make consolidation incremental: retrieve the top-k related memory files per distilled finding instead of the whole store, and add a mutation-time step that proposes `supersede` or partial edits at fact level. (4) Feed `recall_events` usage into ranking and decay, and build a 50–100 question held-out eval from the stored sessions. Trade-off: your time, and you remain the sole maintainer.
+
+**B. Go native.** Claude Code auto memory plus Codex memories, nothing for OpenCode. Zero maintenance and agent-accessible all session. Trade-off: three silos, auto-apply without review, Codex sessions driven through `exec` do not contribute, and provenance is lost.
+
+**C. Switch to Letta Code.** The closest realized version of the same idea, git-backed and company-maintained. Trade-off: all-in on their harness, and no human approval step.
+
+**D. Hybrid.** `dream` stays the ingest, distill and review layer; Graphiti on FalkorDBLite holds temporal facts for "what was true when" questions. More infrastructure than one person's memory usually justifies; worth it only if stale-fact errors are what actually bites.
+
+Whatever the choice, keep the character pipeline frozen until a before/after eval on fixed probes shows a measurable change.
+
+A task-by-task plan for coding-agent sessions, in the repo's plan style, follows in Part 2.
+
+## Sources
+
+Pages opened for this review, as of 2026-10-19.
+
+- [dream repository](https://github.com/emancypage/dream) (commit `161debb`)
+- [Claude Code: How Claude remembers your project](https://code.claude.com/docs/en/memory?r=0)
+- [Codex memories (official docs)](https://learn.chatgpt.com/docs/customization/memories)
+- [Codex built-in memory deep dive](https://codex.danielvaughan.com/2026/04/18/codex-built-in-memory-system-deep-dive/) (third-party)
+- [Codex features reach Europe, WindowsReport, 2026-06-18](https://windowsreport.com/?p=1499581)
+- [Letta Code memory](https://docs.letta.com/letta-code/memory), [MemFS](https://docs.letta.com/concepts/memfs), [Sleep-time compute blog](https://letta.com/blog/sleep-time-compute)
+- [Sleep-time Compute: Beyond Inference Scaling at Test-time, arXiv 2504.13171](https://arxiv.org/abs/2504.13171v1)
+- [Control-Plane Placement Shapes Forgetting, arXiv 2606.15903](https://arxiv.org/pdf/2606.15903) (vendor-affiliated author)
+- [Mem0 OSS v2 to v3 migration](https://docs.mem0.ai/migration/oss-v2-to-v3), [Mem0 State of Agent Memory 2026](https://mem0.ai/blog/state-of-ai-agent-memory-2026) (vendor blog)
+- [Mnemoverse: Mem0 vs Zep vs Letta vs Cognee vs Supermemory, September 2026](https://mnemoverse.com/docs/library/ai-memory-solutions-2026-q3) (vendor-published)
+- [How to read an agent-memory benchmark](https://dreaming.press/posts/how-to-read-an-agent-memory-benchmark.html)
+- [palace-rs](https://github.com/AncientiCe/palace-rs), [opencode-memory](https://github.com/rajarshighoshal/opencode-memory), [semantic-memory-mcp](https://github.com/Michael-Logies/semantic-memory-mcp)
+- [Getting started with Graphiti and FalkorDB](https://www.falkordb.com/blog/graphiti-get-started/)
+
+---
+
+# Part 2: Dream improvement plan for agentic sessions
+
+> For agentic workers: use superpowers:subagent-driven-development or superpowers:executing-plans. Follow the test-first steps below. Copy this part of the file to `docs/superpowers/plans/2026-10-19-recall-and-consolidation-upgrade.md` and commit it before starting Task 0.
 
 ## Goal
 
-Close the four measured gaps from the review tab without giving up what `dream` already does right: cross-lingual hybrid recall, mid-session memory access for every agent, incremental consolidation with fact-level patches, and usage-aware forgetting, all gated by a private held-out eval built from real sessions. The review gate, provenance, read-only hooks and stdlib-only runtime stay exactly as they are.
+Close the four measured gaps from Part 1 without giving up what `dream` already does right: cross-lingual hybrid recall, mid-session memory access for every agent, incremental consolidation with fact-level patches, and usage-aware forgetting, all gated by a private held-out eval built from real sessions. The review gate, provenance, read-only hooks and stdlib-only runtime stay exactly as they are.
 
 ## Architecture
 
@@ -18,7 +113,7 @@ Python 3.11+ standard library (`urllib.request`, `array`, `struct`, `json`, `sql
 
 ## Spec
 
-The review tab of this doc is the design basis. Task 0 turns it into `docs/superpowers/specs/2026-10-19-recall-and-consolidation-upgrade-design.md` for approval before any code changes.
+Part 1 of this file is the design basis. Task 0 turns it into `docs/superpowers/specs/2026-10-19-recall-and-consolidation-upgrade-design.md` for approval before any code changes.
 
 ## Global constraints
 
@@ -70,7 +165,7 @@ The review tab of this doc is the design basis. Task 0 turns it into `docs/super
 
 - [ ] Run `python3 -m pytest -q -p no:cacheprovider dream`; require the current 489 tests to pass.
 - [ ] Run `git status --short` and record unrelated changes; create `feat/recall-upgrade` from `main`.
-- [ ] Write `docs/superpowers/specs/2026-10-19-recall-and-consolidation-upgrade-design.md` from the review tab: objective, data model changes (`recall_embeddings` blob column, `recall_usage` table, `patch` suggestion kind), config keys with defaults, hook and MCP contracts, non-goals (no numpy, no sqlite-vec, no character changes).
+- [ ] Write `docs/superpowers/specs/2026-10-19-recall-and-consolidation-upgrade-design.md` from Part 1: objective, data model changes (`recall_embeddings` blob column, `recall_usage` table, `patch` suggestion kind), config keys with defaults, hook and MCP contracts, non-goals (no numpy, no sqlite-vec, no character changes).
 - [ ] Stop and request Szymon's approval of the spec. Do not start Task 1 without it.
 
 ### Task 1: Private held-out recall eval with per-language metrics
