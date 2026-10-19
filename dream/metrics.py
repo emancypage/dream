@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 from http import HTTPStatus
@@ -320,8 +321,8 @@ def serve_metrics(
             if self.path != "/metrics":
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            body = render_metrics(
-                _read_state(state_path),
+            body = collect_metrics(
+                state_path,
                 stale_after=stale_after,
             ).encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -335,6 +336,32 @@ def serve_metrics(
 
     with ThreadingHTTPServer((bind, port), MetricsHandler) as server:
         server.serve_forever()
+
+
+def collect_metrics(state_path: Path, *, config=None, stale_after: float = DEFAULT_STALE_AFTER) -> str:
+    """Read the review queue on every scrape, independently of nightly run state."""
+    from config import load_config
+    from storage import open_db_readonly
+    from character.short import pending_review_count
+    text = render_metrics(_read_state(state_path), stale_after=stale_after)
+    lines = ['# HELP dream_character_short_review_source_up Whether the short review queue was readable.',
+             '# TYPE dream_character_short_review_source_up gauge']
+    conn = None
+    try:
+        cfg = config if config is not None else load_config()
+        conn = open_db_readonly(cfg.db_path)
+        count = pending_review_count(conn, cfg)
+    except (OSError, ValueError, sqlite3.Error):
+        lines.append('dream_character_short_review_source_up 0')
+    else:
+        lines.extend(['dream_character_short_review_source_up 1',
+                      '# HELP dream_character_short_drafts_pending Current short example drafts awaiting human review.',
+                      '# TYPE dream_character_short_drafts_pending gauge',
+                      f'dream_character_short_drafts_pending {count}'])
+    finally:
+        if conn is not None:
+            conn.close()
+    return text + '\n'.join(lines) + '\n'
 
 
 def _command(args: argparse.Namespace) -> int:

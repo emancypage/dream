@@ -115,3 +115,19 @@ class DashboardPatchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_short_review_panel_counts_current_drafts_and_does_not_hide_source_failure():
+    result=monitoring_dashboard.patch_dashboard(dashboard_fixture())
+    panel=next(p for p in result['panels'] if p['id']==44)
+    assert panel['title']=='Dream short drafts waiting for review'
+    query=panel['targets'][0]
+    assert query['instant'] is True
+    assert 'dream_character_short_drafts_pending' in query['expr']
+    assert 'dream_character_short_review_source_up' in query['expr']
+    assert 'up{job="dream",instance="dream"}' in query['expr']
+    assert 'or vector(0)' not in query['expr']
+    assert panel['fieldConfig']['defaults']['noValue']=='Unavailable'
+    assert 'inactive' in panel['description'] and 'dream character short list' in panel['description']
+    again=monitoring_dashboard.patch_dashboard(result)
+    assert len([p for p in again['panels'] if p['id']==44])==1

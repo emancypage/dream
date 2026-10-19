@@ -52,6 +52,25 @@ def list_examples(conn, config):
     return [show_example(conn, config, row['id']) for row in _rows(conn, config)]
 
 
+def pending_review_count(conn, config):
+    """Count current reviewable drafts without exposing any draft wording."""
+    doc, _ = _context(config)
+    sources = {p['id']:p['content_sha256'] for p in accepted_pairs(conn, config, doc)}
+    return sum(row.get('status') == 'draft' and sources.get(row['pair_id']) == row['pair_sha256']
+               for row in storage.eligible_records(conn, config, TABLE, doc))
+
+
+def review_reminder(conn, config):
+    count = pending_review_count(conn, config)
+    if not count:
+        return ''
+    noun = 'draft is' if count == 1 else 'drafts are'
+    return ('# Dream review reminder\nAt session start, briefly tell the user that '
+            +str(count)+' short example '+noun+' waiting for review. '
+            +'The drafts remain inactive until separate human approval. '
+            +'Review command: dream character short list.\n')
+
+
 def show_example(conn, config, identity):
     row = next((r for r in _rows(conn, config) if r['id'] == identity), None)
     if row is None:

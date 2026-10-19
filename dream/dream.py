@@ -1166,6 +1166,14 @@ def cmd_context(args: argparse.Namespace) -> int:
                              constitution_path=args.config.data["character"]["constitution_path"])
         character_text = ""
         character_diagnostic = None
+        reminder_text = ""
+        reminder_diagnostic = None
+        if event_name == "SessionStart":
+            try:
+                from character.short import review_reminder
+                reminder_text = review_reminder(conn, args.config)
+            except Exception as reminder_error:
+                reminder_diagnostic = "short-review-unavailable:" + type(reminder_error).__name__
         character_settings = args.config.data["character"]
         if event_name == "SessionStart" and character_settings["hook_injection"]:
             try:
@@ -1178,6 +1186,7 @@ def cmd_context(args: argparse.Namespace) -> int:
             result.rendered_context, character_text, query.requested_codepoint_budget,
             settings.session_start_additional_context_limit if event_name == "SessionStart"
             else settings.prompt_additional_context_limit,
+            reminder_text=reminder_text,
         )
         character_diagnostic = character_diagnostic or budget_diagnostic
         if attempt_token is not None:
@@ -1187,6 +1196,7 @@ def cmd_context(args: argparse.Namespace) -> int:
                 "candidate_ids": [candidate.document.id for candidate in result.selected],
                 "selected_codepoints": len(combined_context),
                 "character_diagnostic": character_diagnostic,
+                "short_review_diagnostic": reminder_diagnostic,
                 "elapsed_ms": result.diagnostics.elapsed_ms,
                 "calibration_version": result.calibration_version,
                 "fallback_reason": result.diagnostics.fallback_reason,

@@ -13,10 +13,13 @@ from typing import Any, Sequence
 
 
 PROMETHEUS = {"type": "prometheus", "uid": "prometheus"}
-OWNED_PANEL_IDS = frozenset({40, 41, 42, 43})
+OWNED_PANEL_IDS = frozenset({40, 41, 42, 43, 44})
 HEALTH_QUERY = 'dream_run_health{job="dream",instance="dream"}'
 AGE_QUERY = 'time() - dream_last_run_timestamp_seconds{job="dream",instance="dream"}'
 INFO_QUERY = 'dream_last_run_info{job="dream",instance="dream"} == 1'
+SHORT_REVIEW_QUERY = ('dream_character_short_drafts_pending{job="dream",instance="dream"}'
+                      ' and on(job,instance) (dream_character_short_review_source_up{job="dream",instance="dream"} == 1)'
+                      ' and on(job,instance) (up{job="dream",instance="dream"} == 1)')
 
 
 def _target(expression: str, *, instant: bool, legend: str = "") -> dict[str, Any]:
@@ -155,7 +158,16 @@ def _panels(y: int) -> list[dict[str, Any]]:
         },
         "targets": [_target(HEALTH_QUERY, instant=False, legend="health")],
     }
-    return [health, age, stage, history]
+    review = _stat(44, 'Dream short drafts waiting for review',
+                   {'x':0, 'y':y+18, 'w':24, 'h':4},
+                   _target(SHORT_REVIEW_QUERY, instant=True),
+                   thresholds={'mode':'absolute','steps':[{'color':'green','value':None},
+                                                         {'color':'orange','value':1}]})
+    review['description'] = ('Short drafts are inactive until you approve them. '
+                             'Run dream character short list to review. '
+                             'Unavailable means the exporter or review source could not be read.')
+    review['fieldConfig']['defaults'].update(decimals=0, min=0, noValue='Unavailable')
+    return [health, age, stage, history, review]
 
 
 def _next_y(panels: list[dict[str, Any]]) -> int:

@@ -334,7 +334,7 @@ The exporter should bind to an address reachable by Prometheus but not to every
 network interface. Configure it to listen on the private address reachable by monitoring. The main metric is `dream_run_health`: `3` = success,
 `2` = running, `1` = stale, `0` = failed, and `-1` = no recorded run.
 
-The test-backed patchers add the exporter target and four panels to the existing
+The test-backed patchers add the exporter target and five panels to the existing
 fleet dashboard:
 
 ```bash
@@ -344,6 +344,14 @@ python3 dream/monitoring_dashboard.py /path/to/rpi-fleet.json
 
 Both patchers are idempotent, reject ambiguous targets, and preserve unrelated
 dashboard panels. Back up the live files before applying generated output.
+
+The short-review panel shows `dream_character_short_drafts_pending`. The exporter
+reads the current eligible draft count on every scrape, so approval updates the
+view without waiting for a nightly run. It emits no draft text, IDs, or source
+paths. `dream_character_short_review_source_up` is `1` when that read succeeds.
+If it fails, the count is omitted and the health signal is `0`. The dashboard
+requires both source health and exporter availability, and shows unavailable data
+instead of a false zero. Waiting drafts are orange; zero is green.
 
 ## Main files
 
@@ -504,6 +512,16 @@ Injection is independent of `character.enabled`, which controls generation,
 judging, and model-based evaluation. Set `hook_injection = true` and
 `enabled = false` to use an approved constitution in sessions while those model
 stages stay disabled.
+
+When current short drafts are waiting for review, the session-start hook adds a
+count-only reminder and the command `dream character short list`. This notice is
+independent of `character.hook_injection`; it works while example injection or
+model generation is disabled, provided automatic recall is enabled. It never
+includes draft wording or approves anything. Approved, rejected, stale, and
+policy-excluded drafts do not contribute to the waiting count. There is no notice
+when the count is zero and no reminder on individual prompt submissions. The
+notice shares the hook's context budget and takes priority over an oversized
+character block. Failure to read the queue does not block normal recall.
 
 Session-start context defaults to an 18,000-byte budget when character injection
 is enabled. This budget holds the complete character block and recalled memory.
