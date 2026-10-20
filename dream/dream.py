@@ -396,7 +396,7 @@ def cmd_estimate(args: argparse.Namespace) -> int:
     conn = open_db_readonly(args.db)
     candidates = sessions_needing_distill(
         conn, min_chars=args.min_chars, project_slug=args.project, config=args.config,
-        refresh_config=getattr(args, "refresh", False),
+        refresh_config=getattr(args, "refresh", False), model=getattr(args, "model", None),
     )
     if not candidates:
         print("Nothing to distill.")
@@ -422,7 +422,7 @@ def cmd_distill(args: argparse.Namespace) -> int:
     conn = open_db(args.db)
     candidates = sessions_needing_distill(
         conn, min_chars=args.min_chars, project_slug=args.project, config=args.config,
-        refresh_config=getattr(args, "refresh", False),
+        refresh_config=getattr(args, "refresh", False), model=getattr(args, "model", None),
     )
     if not candidates:
         print("Nothing to distill.")

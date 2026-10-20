@@ -294,6 +294,7 @@ def sessions_needing_distill(
     project_slug: str | None = None,
     config: DreamConfig | None = None,
     refresh_config: bool = False,
+    model: str | None = None,
 ) -> list[tuple[str, int]]:
     cfg = config or load_config()
     stage = cfg.stage("distill")
@@ -324,7 +325,8 @@ def sessions_needing_distill(
     excluded_sessions = {row[0] for row in conn.execute("SELECT session_id, project_slug FROM sessions")
                          if policy.excludes(project_slug=row[1])}
     rows = conn.execute(sql, params).fetchall()
-    current_route = _local_route_snapshot(cfg) if refresh_config else None
+    # ``model`` is the --model override, which takes precedence in the request as well.
+    current_route = _local_route_snapshot(cfg, model) if refresh_config else None
     if current_route is not None:
         rows = _drop_unchanged_local_routes(conn, rows, stage, current_route)
     return [(r[0], r[1]) for r in rows if r[0] not in excluded_sessions]

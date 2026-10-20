@@ -713,6 +713,20 @@ def test_refresh_compares_the_effective_model_not_where_it_is_set(tmp_path, monk
     )) == []
 
 
+def test_refresh_honours_the_model_override(tmp_path, monkeypatch, server):
+    server.responder = lambda request: (200, _completion(json.dumps(DISTILL_OUTPUT)))
+    config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+    distill_session(conn, "s1", config=config, model="qwen3-14b")
+    routed = _routed_config(tmp_path, server)
+
+    def pending(model):
+        return [sid for sid, _ in sessions_needing_distill(conn, config=routed, refresh_config=True, model=model)]
+
+    # Rerunning with the same override finds nothing new; dropping it compares against the configured model.
+    assert pending("qwen3-14b") == []
+    assert pending(None) == ["s1"]
+
+
 def test_recorded_route_snapshot_is_credential_free(tmp_path, monkeypatch, server):
     monkeypatch.setenv("DREAM_TEST_LOCAL_LLM_KEY", "sk-local-secret")
     server.responder = lambda request: (200, _completion(json.dumps(DISTILL_OUTPUT)))
