@@ -12,7 +12,7 @@ import pytest
 import backend
 from config import ConfigError, load_config
 from distill import DISTILL_SCHEMA, distill_session, prompt_version, sessions_needing_distill
-from model_types import GenerationRequest, ProviderError, SchemaValidationError
+from model_types import GenerationRequest, GenerationResult, ProviderError, SchemaValidationError
 from providers import openai_compatible
 from providers.registry import create_provider, preflight_provider
 
@@ -665,16 +665,118 @@ def _pending(conn, config, *, refresh=True) -> list[str]:
     return [sid for sid, _ in sessions_needing_distill(conn, config=config, refresh_config=refresh)]
 
 
-def _routed_config(tmp_path: Path, server, *, provider: str = "local", stage_extra: str = ""):
+def _routed_config(
+    tmp_path: Path, server, *, provider: str = "local", stage_extra: str = "",
+    provider_model: str = "qwen3-32b", base_url: str | None = None,
+):
     path = tmp_path / f"config-{provider}.toml"
+    url = base_url or server.base_url
     path.write_text(
         f'[storage]\ndb_path = "{tmp_path / "dream.db"}"\nmemory_root = "{tmp_path / "memory"}"\n'
         f'[stages.distill]\nprovider = "{provider}"\n{stage_extra}'
-        f'[providers.local]\ntype = "openai-compatible"\nbase_url = "{server.base_url}"\nmodel = "qwen3-32b"\n'
-        f'[providers.local2]\ntype = "openai-compatible"\nbase_url = "{server.base_url}"\nmodel = "qwen3-32b"\n',
+        f'[providers.local]\ntype = "openai-compatible"\nbase_url = "{url}"\nmodel = "{provider_model}"\n'
+        f'[providers.local2]\ntype = "openai-compatible"\nbase_url = "{url}"\nmodel = "{provider_model}"\n',
         encoding="utf-8",
     )
     return load_config(path)
+
+
+def test_refresh_requeues_when_provider_level_model_changes(tmp_path, monkeypatch, server):
+    # The packaged example puts model on the provider table and leaves the stage without one.
+    server.responder = lambda request: (200, _completion(json.dumps(DISTILL_OUTPUT), model="qwen3-32b-q4_k_m.gguf"))
+    config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+    distill_session(conn, "s1", config=config)
+
+    assert _pending(conn, _routed_config(tmp_path, server)) == []
+    assert _pending(conn, _routed_config(tmp_path, server, provider_model="qwen3-14b")) == ["s1"]
+    assert _pending(conn, _routed_config(tmp_path, server, provider_model="qwen3-14b"), refresh=False) == []
+
+
+def test_refresh_requeues_when_base_url_changes(tmp_path, monkeypatch, server):
+    server.responder = lambda request: (200, _completion(json.dumps(DISTILL_OUTPUT)))
+    config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+    distill_session(conn, "s1", config=config)
+
+    assert _pending(conn, _routed_config(tmp_path, server, base_url="http://127.0.0.1:18081")) == ["s1"]
+
+
+def test_refresh_compares_the_effective_model_not_where_it_is_set(tmp_path, monkeypatch, server):
+    server.responder = lambda request: (200, _completion(json.dumps(DISTILL_OUTPUT)))
+    config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+    distill_session(conn, "s1", config=config)
+
+    # Naming the same model on the stage leaves the request unchanged.
+    assert _pending(conn, _routed_config(tmp_path, server, stage_extra='model = "qwen3-32b"\n')) == []
+    # A stage model overrides a changed provider model, so the request is unchanged too.
+    assert _pending(conn, _routed_config(
+        tmp_path, server, stage_extra='model = "qwen3-32b"\n', provider_model="qwen3-14b",
+    )) == []
+
+
+def test_recorded_route_snapshot_is_credential_free(tmp_path, monkeypatch, server):
+    monkeypatch.setenv("DREAM_TEST_LOCAL_LLM_KEY", "sk-local-secret")
+    server.responder = lambda request: (200, _completion(json.dumps(DISTILL_OUTPUT)))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = load_config(_write_config(
+        tmp_path,
+        f'type = "openai-compatible"\nbase_url = "{server.base_url}"\nmodel = "qwen3-32b"\n'
+        'api_key_env = "DREAM_TEST_LOCAL_LLM_KEY"\n',
+    ))
+    _config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+    distill_session(conn, "s1", config=config)
+
+    assert server.chat_requests()[0]["headers"]["authorization"] == "Bearer sk-local-secret"
+    options_text = conn.execute("SELECT provider_options FROM distilled").fetchone()[0]
+    assert "sk-local-secret" not in options_text and "DREAM_TEST_LOCAL_LLM_KEY" not in options_text
+    options = json.loads(options_text)
+    assert options["effective_request"] == {
+        "provider": "local", "type": "openai-compatible", "base_url": server.base_url, "model": "qwen3-32b",
+    }
+    assert {key: value for key, value in options.items() if key != "effective_request"} == config.stage("distill")
+
+
+def test_cli_route_provider_options_are_byte_identical(tmp_path, monkeypatch, server):
+    import distill
+
+    _config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+    config = _codex_config(tmp_path)
+    monkeypatch.setattr(distill, "generate", lambda *args, **kwargs: GenerationResult(
+        output=DISTILL_OUTPUT, raw_result="{}", provider="codex", model=None, usage=None, duration_ms=1,
+    ))
+    distill_session(conn, "s1", config=config)
+
+    stored = conn.execute("SELECT provider_options FROM distilled").fetchone()[0]
+    assert stored == json.dumps(config.stage("distill"), sort_keys=True)
+
+
+def _legacy_row(conn, config, *, served_model: str) -> None:
+    """A row written before the effective-request snapshot existed."""
+    conn.execute(
+        "INSERT INTO distilled(session_id, provider, model, prompt_version, provider_options, notes_json) "
+        "VALUES ('s1', 'openai-compatible', ?, ?, ?, '{}')",
+        (served_model, prompt_version(), json.dumps(config.stage("distill"), sort_keys=True)),
+    )
+
+
+def test_legacy_row_requeues_when_provider_model_cannot_be_confirmed(tmp_path, monkeypatch, server):
+    config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+    _legacy_row(conn, config, served_model="qwen3-32b")
+
+    # The server reported the requested name, so the unchanged route is confirmed.
+    assert _pending(conn, config) == []
+    # The probe case: provider-level model old -> new with an unchanged stage.
+    assert _pending(conn, _routed_config(tmp_path, server, provider_model="qwen3-14b")) == ["s1"]
+    # A server-specific name cannot confirm which model was requested: re-run it.
+    conn.execute("UPDATE distilled SET model = 'qwen3-32b-q4_k_m.gguf'")
+    assert _pending(conn, config) == ["s1"]
+
+
+def test_legacy_row_with_stage_model_is_confirmed_by_the_stage(tmp_path, monkeypatch, server):
+    config, conn = _distill_fixture(tmp_path, monkeypatch, server, stage_extra='model = "qwen3-14b"\n')
+    _legacy_row(conn, config, served_model="served-name")
+
+    assert _pending(conn, config) == []
+    assert _pending(conn, _routed_config(tmp_path, server, stage_extra='model = "qwen3-8b"\n')) == ["s1"]
 
 
 def test_refresh_keeps_openai_compatible_session_distilled_until_route_changes(tmp_path, monkeypatch, server):

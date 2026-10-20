@@ -37,8 +37,9 @@ type = "claude-cli"
 # A non-loopback base_url requires remote_data_egress = true. The stage's
 # model and timeout_seconds win; the provider's values are defaults. Built-in
 # stages always set timeout_seconds, so the provider's timeout_seconds applies
-# only when a stage omits it. dream distill --refresh notices a changed stage
-# provider or model, but not a model changed only in this table.
+# only when a stage omits it. dream distill --refresh re-runs sessions whose
+# provider name, base_url or effective model (the stage's, else this table's)
+# changed.
 # [providers.local-qwen]
 # type = "openai-compatible"
 # base_url = "http://127.0.0.1:8080"
