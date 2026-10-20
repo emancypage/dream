@@ -211,6 +211,21 @@ def test_audit_base_sha_is_the_hash_of_the_bytes_the_model_saw(tmp_path, monkeyp
     assert "Edited by hand." in (root / "project_topic_00.md").read_text(encoding="utf-8")
 
 
+def test_audit_prompts_show_every_chunk_file_whole_even_when_oversized(tmp_path, monkeypatch):
+    root = _store(tmp_path, count=4)
+    (root / "project_huge.md").write_text("---\nname: huge\n---\n\n" + "fact " * 400 + "END-OF-HUGE\n", encoding="utf-8")
+    monkeypatch.setattr(C, "MAX_CURRENT_MEMORY_CHARS", 4 * 400)
+    calls = _fake(monkeypatch)
+    C.run_audit(_db(), root, config=_config(tmp_path, root))
+    for call in calls:
+        memory = call["prompt"].split("## Memory files in this chunk", 1)[1]
+        for section in memory.split("### FILE: ")[1:]:
+            name = section.split("\n", 1)[0]
+            assert (root / name).read_text(encoding="utf-8") in section
+    assert any("END-OF-HUGE" in call["prompt"] for call in calls)
+    assert not any("truncated" in call["prompt"] for call in calls)
+
+
 def test_audit_removals_keep_the_21_day_grace(tmp_path, monkeypatch):
     root = _store(tmp_path, count=2)
     _age(root / "project_topic_00.md", C.REMOVE_GRACE_DAYS + 5)

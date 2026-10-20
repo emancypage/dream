@@ -506,16 +506,30 @@ def _other_memory_lines(files: list[MemoryFile], shown: list[str]) -> str:
     return "\n".join(lines) or "(none: every memory file is shown above)"
 
 
-def _bounded_memory_blob(chunks: list[str], what: str) -> str:
-    blob = "\n---\n".join(chunks)
-    if len(blob) > MAX_CURRENT_MEMORY_CHARS:
+def _fit_whole_files(rendered: list[tuple[str, str]], limit: int) -> list[tuple[str, str]]:
+    """The longest prefix of whole rendered files whose joined text stays within limit.
+
+    A file is never cut mid-body. The first file that does not fit, and every
+    file after it, is left out of the prompt and listed by its index line, so
+    the host treats it as unseen and an update to it can only append. The
+    selection puts MEMORY.md first.
+    """
+    kept: list[tuple[str, str]] = []
+    size = 0
+    for name, text in rendered:
+        added = len(text) + (len("\n---\n") if kept else 0)
+        if size + added > limit:
+            break
+        kept.append((name, text))
+        size += added
+    if len(kept) < len(rendered):
         print(
-            f"WARNING: {what} ({len(blob):,} chars) exceeds "
-            f"MAX_CURRENT_MEMORY_CHARS ({MAX_CURRENT_MEMORY_CHARS:,}) — truncating.",
+            f"WARNING: memory subset exceeds MAX_CURRENT_MEMORY_CHARS ({limit:,}); "
+            f"{len(rendered) - len(kept)} of {len(rendered)} selected files left out "
+            "and listed by their index lines instead.",
             file=sys.stderr,
         )
-        blob = blob[:MAX_CURRENT_MEMORY_CHARS] + "\n\n... [memory truncated for prompt budget] ..."
-    return blob or "(memory root is empty — no files yet)"
+    return kept
 
 
 def _drop(kind: str, target: str, reason: str) -> None:
@@ -536,11 +550,12 @@ def _patch_mode_suggestions(
     """Host checks for subset and audit output (full mode keeps its own loop).
 
     Only `allowed` kinds survive, and only for eligible memory files or new
-    paths. Base SHAs come from the bytes the model was shown. A patch needs a
-    nonempty `find`, a target shown in full, never targets MEMORY.md (index
-    lines are only appended) and may not empty a file. In subset mode a `new`
-    on an existing file becomes an `update`, and a full-body `update` of a file
-    the model was not shown becomes an append to its current body.
+    paths. Base SHAs come from the bytes the model was shown. `shown` holds only
+    files whose whole text was in the prompt. A patch needs a nonempty `find`, a
+    target shown in full, never targets MEMORY.md (index lines are only
+    appended) and may not empty a file. In subset mode a `new` on an existing
+    file becomes an `update`, and a full-body `update` of a file the model was
+    not shown in full becomes an append to its current body.
     """
     root = memory_root.resolve()
     index = root / INDEX_FILE
@@ -638,13 +653,22 @@ def _consolidate_subset(
     constitution_path = cfg.data["character"]["constitution_path"]
     files = memory_files(memory_root, constitution_path=constitution_path)
     bodies = {entry.path.name: entry.body for entry in files}
-    selected = select_memory_subset(
+    # Only files read above can be shown, so every shown body matches its base SHA.
+    selected = [path.name for path in select_memory_subset(
         conn, memory_root, batch, settings, constitution_path=constitution_path, embedder=embedder)
-    # Only files read above are shown, so every shown body matches its base SHA.
-    shown = [path.name for path in selected if path.name in bodies]
-    usage = memory_annotations(conn, shown)
-    current_memory = _bounded_memory_blob(
-        [render_memory_file(name, bodies[name], annotation=usage[name]) for name in shown], "memory subset")
+        if path.name in bodies]
+    usage = memory_annotations(conn, selected)
+    fitted = _fit_whole_files(
+        [(name, render_memory_file(name, bodies[name], annotation=usage[name])) for name in selected],
+        MAX_CURRENT_MEMORY_CHARS,
+    )
+    # A file counts as shown only when the prompt holds all of it; the rest are
+    # listed by index line, so the host treats them as unseen.
+    shown = [name for name, _text in fitted]
+    current_memory = "\n---\n".join(text for _name, text in fitted) or (
+        "(no memory file fits the prompt budget; see the other memory files below)" if selected
+        else "(memory root is empty — no files yet)"
+    )
     prompt = (
         SUBSET_PROMPT_PATH.read_text(encoding="utf-8")
         .replace("{{today}}", dt.date.today().isoformat())
@@ -743,6 +767,8 @@ def run_audit(
         prompt += policy.context()
         res = generate("audit", prompt, CONSOLIDATE_PATCH_SCHEMA, model=model, config=cfg)
         provider, used_model = res.provider, res.model
+        # audit_chunks never cuts a file, so the chunk's files are exactly what the
+        # model read in full; anything else is not a valid target for this call.
         suggestions += _patch_mode_suggestions(
             res.output, memory_root, allowed=("remove", "patch"), shown={entry.path.name for entry in chunk},
             files=files, policy=policy, projects={}, subset=False,

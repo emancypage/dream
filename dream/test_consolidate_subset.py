@@ -778,6 +778,85 @@ def test_subset_patch_is_persisted_with_find_text_and_a_unified_diff_preview(tmp
     assert "+Facts about kw04, now owned by ops and nothing else. Body marker BODY-04." in preview
 
 
+def _budget_store(tmp_path, monkeypatch, output, budget):
+    """The supervisor's case: MEMORY.md fits, a.md does not, z.md would fit after it."""
+    _fixed_clock(monkeypatch)
+    root = tmp_path / "memory"
+    root.mkdir()
+    (root / "MEMORY.md").write_text("- [A](a.md)\n- [Z](z.md)\n", encoding="utf-8")
+    (root / "a.md").write_text("A" * 1000, encoding="utf-8")
+    (root / "z.md").write_text("ORIGINAL_Z_UNSEEN_FACTS\n", encoding="utf-8")
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA)
+    dream._migrate(conn)
+    _distill(conn, "s-1", {"projects": ["a.md z.md"]})
+    monkeypatch.setattr(C, "MAX_CURRENT_MEMORY_CHARS", budget)
+    calls = []
+    monkeypatch.setattr(C, "generate", lambda stage, prompt, schema, **kw: calls.append(prompt) or SimpleNamespace(
+        output=output, provider="fake", model="fake"))
+    suggestions = C.consolidate(conn, root, config=_config(tmp_path, root, mode="subset"))
+    return root, conn, calls, suggestions
+
+
+def _file_sections(prompt):
+    memory = prompt.split("## Current memory store (subset)", 1)[1].split("## Other memory files", 1)[0]
+    return {section.split("\n", 1)[0]: section for section in memory.split("### FILE: ")[1:]}
+
+
+def test_subset_budget_shows_only_whole_files_and_appends_to_files_cut_out(tmp_path, monkeypatch):
+    output = {"suggestions": [_suggestion("update", "z.md", "MODEL_ADDITION_ONLY\n", "add one fact")]}
+    root, _, calls, suggestions = _budget_store(tmp_path, monkeypatch, output, 250)
+    prompt = calls[0]
+    assert list(_file_sections(prompt)) == ["MEMORY.md"]
+    assert "AAAA" not in prompt and "truncated" not in prompt
+    assert "ORIGINAL_Z_UNSEEN_FACTS" not in prompt
+    other = prompt.split("## Other memory files", 1)[1].split("## New distilled notes", 1)[0]
+    assert "- [A](a.md)" in other and "- [Z](z.md)" in other
+    assert "holds 3 files; 1 of them are shown in full" in prompt
+    [s] = suggestions
+    assert s.kind == "update"
+    assert s.body == "ORIGINAL_Z_UNSEEN_FACTS\n\nMODEL_ADDITION_ONLY\n"
+    assert "appended: target not shown to the model" in s.rationale
+    assert s.base_sha256 == _sha(root / "z.md")
+
+
+def test_subset_budget_drops_patches_for_files_cut_out(tmp_path, monkeypatch, capsys):
+    output = {"suggestions": [_suggestion("patch", "a.md", "B", "shorten", find="AAAA")]}
+    _, conn, _, suggestions = _budget_store(tmp_path, monkeypatch, output, 250)
+    assert suggestions == []
+    assert conn.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0] == 0
+    assert "dropped patch a.md: target was not shown in full" in capsys.readouterr().out
+
+
+def test_subset_budget_never_cuts_a_file_mid_body(tmp_path, monkeypatch, capsys):
+    root, conn = _store(tmp_path)
+    _distill(conn, "s-1", {"projects": [" ".join(f"kw{i:02d}" for i in range(10))]})
+    calls = []
+    monkeypatch.setattr(C, "generate", lambda stage, prompt, schema, **kw: calls.append(prompt) or SimpleNamespace(
+        output={"suggestions": []}, provider="fake", model="fake"))
+    monkeypatch.setattr(C, "MAX_CURRENT_MEMORY_CHARS", 3_000)
+    C.consolidate(conn, root, config=_config(tmp_path, root, mode="subset", subset_files=10))
+    sections = _file_sections(calls[0])
+    assert list(sections)[0] == "MEMORY.md"
+    assert 1 < len(sections) < 11
+    for name, section in sections.items():
+        assert (root / name).read_text(encoding="utf-8") in section
+    memory = calls[0].split("## Current memory store (subset)", 1)[1].split("## Other memory files", 1)[0]
+    blob = memory[memory.index("### FILE: "):]
+    assert blob.endswith("\n\n")
+    assert len(blob[:-2]) <= 3_000
+    assert f"{len(sections)} of them are shown in full" in calls[0]
+    assert "left out" in capsys.readouterr().err
+
+
+def test_subset_budget_shows_a_file_that_fits(tmp_path, monkeypatch):
+    output = {"suggestions": [_suggestion("update", "z.md", "Rewritten after reading it.\n", "rewrite")]}
+    root, _, calls, suggestions = _budget_store(tmp_path, monkeypatch, output, 5_000)
+    assert list(_file_sections(calls[0])) == ["MEMORY.md", "a.md", "z.md"]
+    [s] = suggestions
+    assert (s.kind, s.body, s.rationale) == ("update", "Rewritten after reading it.\n", "rewrite")
+
+
 def test_subset_patch_preview_explains_an_ambiguous_find(tmp_path, monkeypatch):
     output = {"suggestions": [_suggestion("patch", "project_topic_04.md", "X", find="---")]}
     root, conn, _, suggestions = _run_subset(tmp_path, monkeypatch, output)
