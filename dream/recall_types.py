@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 
 @dataclass(frozen=True)
@@ -84,6 +84,48 @@ class RecallCandidate:
     component_ranks: Mapping[str, int]
     score: float
     best_component_rank: int
+
+
+class PendingExcerpt:
+    """A document text that a ``LazyRecallCandidate`` scrubs on first read."""
+
+    __slots__ = ("text", "scrub")
+
+    def __init__(self, text: str, scrub):
+        self.text = text
+        self.scrub = scrub
+
+
+class LazyRecallCandidate(RecallCandidate):
+    """A RecallCandidate whose excerpt is scrubbed on first read and then kept.
+
+    A session start ranks hundreds of candidates but renders only the few
+    that fit its budget, so scrubbing every one up front was most of its
+    work. Construct it with a ``PendingExcerpt`` (or a scrubbed string) as
+    ``scrubbed_excerpt``; reading the attribute always returns scrubbed text,
+    never the raw document. It compares equal to a RecallCandidate with the
+    same field values.
+    """
+
+    def _read_excerpt(self) -> str:
+        value = self.__dict__["_scrubbed_excerpt"]
+        if isinstance(value, PendingExcerpt):
+            value = value.scrub(value.text)
+            self.__dict__["_scrubbed_excerpt"] = value
+        return value
+
+    def _store_excerpt(self, value) -> None:
+        # Only the dataclass __init__ reaches this (via object.__setattr__); the class stays frozen.
+        self.__dict__["_scrubbed_excerpt"] = value
+
+    scrubbed_excerpt = property(_read_excerpt, _store_excerpt)
+
+    def __eq__(self, other):
+        if not isinstance(other, RecallCandidate):
+            return NotImplemented
+        return all(getattr(self, field.name) == getattr(other, field.name) for field in fields(RecallCandidate))
+
+    __hash__ = None
 
 
 @dataclass(frozen=True)

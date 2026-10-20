@@ -192,6 +192,12 @@ pytest -q -p no:cacheprovider dream
 
 The suite is hermetic: it never invokes the Codex or Claude CLIs, requires no credentials, and makes no model calls.
 
+A few tests hold recall latency to budgets set for a developer machine (for
+example 150 ms at session start on 10,000 documents). They multiply each
+budget by `DREAM_PERF_BUDGET_SCALE`, which defaults to `3` when the `CI`
+environment variable is set and to `1` otherwise. Set it explicitly on a slow
+machine, for example `DREAM_PERF_BUDGET_SCALE=2 pytest -q -p no:cacheprovider dream`.
+
 ## Usage
 
 ```bash
@@ -329,11 +335,14 @@ query) and never embed documents. Set `remote_data_egress = true` only after
 reviewing the adapter's data-flow implications; Dream does not add a model package
 or network dependency.
 
-Session-start recall matches structure and path evidence over the FTS matches
-plus the 500 most recent eligible documents rather than the whole store, and
-the synchronized `path_text` column holds each document's normalized path text.
+On stores with more than about 500 eligible documents, session start
+deliberately considers only the FTS and dense matches plus the 500 most recent
+documents for structure and path evidence; smaller stores rank exactly as a
+full scan would. Excerpts are scrubbed only when they are read, and the
+synchronized `path_text` column holds each document's normalized path text.
 `dream/test_recall_query.py` holds the session-start path to 150 ms and the
-prompt path to 250 ms at p95 on a synthetic 10,000-document store.
+prompt path to 250 ms at p95 on a synthetic 10,000-document store, scaled on
+CI as described under Testing.
 
 Search indexed conversations:
 

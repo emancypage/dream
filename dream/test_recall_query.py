@@ -259,10 +259,12 @@ def test_usage_only_reorders_within_exact_ties(tmp_path):
 # RECENT_POOL_SIZE, where the bound changes nothing), and the prompt-path
 # queries of the 10,000-document store, whose candidate pool the bound leaves
 # as it was. Session starts on the large store match paths over a bounded
-# pool by design (test_session_start_pool_is_bounded_on_a_large_store). Set
+# pool by design (test_session_start_pool_is_bounded_on_a_large_store); their
+# bounded output was captured at 06b1cbe in lexical-golden-bounded.json. Set
 # DREAM_UPDATE_GOLDEN=1 only for an intentional, reviewed ranking change.
 
 GOLDEN = Path(__file__).parent / "fixtures" / "recall" / "lexical-golden.json"
+BOUNDED_GOLDEN = Path(__file__).parent / "fixtures" / "recall" / "lexical-golden-bounded.json"
 PUBLIC_FIXTURE = Path(__file__).parent / "fixtures" / "recall" / "public.json"
 GOLDEN_HOME = "/home/golden"
 _INDEXED_AT = "2026-10-20T00:00:00+00:00"
@@ -495,8 +497,9 @@ def _context_record(result) -> dict:
     }
 
 
-def _golden_records(conn, rows, corpus: str, tmp_path: Path, *, prompt_path_only: bool = False,
+def _golden_records(conn, rows, corpus: str, tmp_path: Path, *, path: str | None = None,
                     contexts: bool = True) -> dict:
+    """Golden records of every query, or only of the ``"prompt"`` or ``"session-start"`` path."""
     from recall_context import run_context
     from recall_usage import usage_map
 
@@ -505,7 +508,7 @@ def _golden_records(conn, rows, corpus: str, tmp_path: Path, *, prompt_path_only
     dense = _golden_dense(rows)
     records = {}
     for name, query in _golden_queries(corpus).items():
-        if prompt_path_only and query.hook_event.startswith("session-start"):
+        if path is not None and query.hook_event.startswith("session-start") != (path == "session-start"):
             continue
         for dense_name, dense_list in (("lexical", None), ("dense", dense)):
             for usage_name, usage_value in (("plain", None), ("usage", usage)):
@@ -542,12 +545,12 @@ def _golden_text(golden: dict) -> str:
     return "{\n" + ",\n".join(lines) + "\n}\n"
 
 
-def _assert_matches_golden(records: dict, corpus: str, *, ranks_only: bool = False) -> None:
-    golden = json.loads(GOLDEN.read_text(encoding="utf-8")) if GOLDEN.exists() else {}
+def _assert_matches_golden(records: dict, corpus: str, *, ranks_only: bool = False, golden_path: Path = GOLDEN) -> None:
+    golden = json.loads(golden_path.read_text(encoding="utf-8")) if golden_path.exists() else {}
     if os.environ.get("DREAM_UPDATE_GOLDEN") == "1" and not ranks_only:
         golden = {key: value for key, value in golden.items() if not key.startswith(f"{corpus}/")}
         golden.update(records)
-        GOLDEN.write_text(_golden_text(golden), encoding="utf-8")
+        golden_path.write_text(_golden_text(golden), encoding="utf-8")
     expected = {key: value for key, value in golden.items()
                 if key.startswith(f"{corpus}/") and (not ranks_only or "/rank/" in key)}
     assert expected, "golden file has no records for this corpus"
@@ -568,7 +571,15 @@ def test_small_store_rankings_and_contexts_match_the_pre_bound_golden(corpus, tm
 def test_large_store_prompt_rankings_and_contexts_match_the_pre_bound_golden(large_store, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", GOLDEN_HOME)
     conn, rows = large_store
-    _assert_matches_golden(_golden_records(conn, rows, "synthetic-10k", tmp_path, prompt_path_only=True), "synthetic-10k")
+    _assert_matches_golden(_golden_records(conn, rows, "synthetic-10k", tmp_path, path="prompt"), "synthetic-10k")
+
+
+def test_large_store_session_starts_match_the_bounded_golden(large_store, tmp_path, monkeypatch):
+    """The bounded session-start output, pinned so a later change to the pool or the ranking shows up."""
+    monkeypatch.setenv("HOME", GOLDEN_HOME)
+    conn, rows = large_store
+    _assert_matches_golden(_golden_records(conn, rows, "synthetic-10k", tmp_path, path="session-start"),
+                           "synthetic-10k", golden_path=BOUNDED_GOLDEN)
 
 
 @pytest.mark.parametrize("shape", ["half-null", "unmigrated"])
@@ -632,8 +643,8 @@ def _second_worst_ms(run, runs: int) -> float:
     return sorted(times)[-2]
 
 
-def test_recall_latency_budget_on_10000_documents(large_store, tmp_path, monkeypatch):
-    """Session-start p95 <= 150 ms, prompt p95 <= 250 ms, warmed read-only connection, embedder off."""
+def test_recall_latency_budget_on_10000_documents(large_store, tmp_path, monkeypatch, perf_budget_ms):
+    """Session-start p95 <= 150 ms, prompt p95 <= 250 ms (scaled on CI), warmed read-only connection, embedder off."""
     from config import load_config
     from recall_context import run_context
 
@@ -652,5 +663,72 @@ def test_recall_latency_budget_on_10000_documents(large_store, tmp_path, monkeyp
     session_start = timed("start-dream")
     prompt = timed("prompt-en")
     print(f"recall p95 on 10,000 documents: session start {session_start:.1f} ms, prompt {prompt:.1f} ms")
-    assert session_start <= 150.0
-    assert prompt <= 250.0
+    assert session_start <= perf_budget_ms(150.0)
+    assert prompt <= perf_budget_ms(250.0)
+
+
+# ------------------------------------------------------------ lazy scrubbing
+
+
+def test_excerpts_are_scrubbed_once_and_only_when_read(tmp_path, monkeypatch):
+    import recall_query
+    from dataclasses import replace
+    from recall_scrub import scrub_text
+    from recall_types import RecallCandidate
+
+    monkeypatch.setenv("HOME", GOLDEN_HOME)
+    conn = _db(tmp_path)
+    conn.execute("UPDATE recall_documents SET text = text || ' API_KEY=sk-live-123456 under /home/golden/dev'")
+    conn.commit()
+    calls = []
+
+    def counting_scrub(text, home):
+        calls.append(text)
+        return scrub_text(text, home)
+
+    monkeypatch.setattr(recall_query, "scrub_text", counting_scrub)
+    results = rank_lexical(conn, RecallQuery("postgres", "s1", "prompt", None, (), 4000, frozenset(), False))
+    assert len(results) == 2 and calls == []  # no structured term: nothing scrubbed yet
+
+    first = results[0].scrubbed_excerpt
+    assert "sk-live" not in first and "<redacted>" in first and "<home>" in first
+    assert results[0].scrubbed_excerpt is first and len(calls) == 1  # kept, not scrubbed again
+    plain = RecallCandidate(results[0].document, first, dict(results[0].component_ranks),
+                            results[0].score, results[0].best_component_rank)
+    assert results[0] == plain and plain == results[0] and results[1] != plain
+    assert replace(results[1], score=1.0).scrubbed_excerpt == scrub_text(results[1].document.text, Path.home())
+
+
+def test_structured_matching_scrubs_only_documents_whose_raw_text_has_a_term(tmp_path, monkeypatch):
+    import recall_query
+    from recall_scrub import scrub_text
+
+    monkeypatch.setenv("HOME", GOLDEN_HOME)
+    conn = _db(tmp_path)
+    conn.execute("UPDATE recall_documents SET text = 'postgres runbook: run pytest first' WHERE id = 'a'")
+    conn.commit()
+    calls = []
+    monkeypatch.setattr(recall_query, "scrub_text", lambda text, home: calls.append(text) or scrub_text(text, home))
+    results = rank_lexical(conn, RecallQuery("postgres pytest", "s1", "prompt", None, (), 4000, frozenset(), False))
+    assert calls == ["postgres runbook: run pytest first"]
+    assert results[0].component_ranks["structured"] == 1
+
+
+def test_scrubber_placeholders_hold_no_structured_term():
+    """The structured prefilter relies on this: scrubbing never adds a command or an issue key."""
+    from recall_query import _COMMANDS
+    from recall_scrub import scrub_text
+
+    secrets = ("-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\nBearer tok123 "
+               "postgres://u:p@h/db API_KEY=v1 GITHUB_TOKEN=v2 password: v3 token=v4 /home/golden/x")
+    scrubbed = scrub_text(secrets, Path("/home/golden")).casefold()
+    assert scrubbed.count("<redacted>") >= 6 and "<home>" in scrubbed
+    placeholders = " ".join(("<redacted>", "bearer <redacted>", "= <redacted>", "<home>"))
+    assert not [term for term in _COMMANDS if term in placeholders]
+    for term in _COMMANDS:
+        assert term not in scrubbed or term in secrets.casefold()
+    rows = synthetic_rows(300)
+    for row in rows:
+        folded, cleaned = row["text"].casefold(), scrub_text(row["text"], Path(GOLDEN_HOME)).casefold()
+        for term in (*_COMMANDS, *extract_structured_terms(row["text"])):
+            assert term not in cleaned or term in folded

@@ -9,7 +9,7 @@ import unicodedata
 from pathlib import Path
 
 from recall_scrub import scrub_text
-from recall_types import RecallCandidate, RecallDocument, RecallQuery
+from recall_types import LazyRecallCandidate, PendingExcerpt, RecallCandidate, RecallDocument, RecallQuery
 
 _JIRA = re.compile(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]+-\d+)(?![A-Za-z0-9])")
 _WORD = re.compile(r"[\w]+", re.UNICODE)
@@ -190,8 +190,10 @@ def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | N
     prompt path the FTS and dense candidates, at session start those plus the
     ``RECENT_POOL_SIZE`` most recent eligible documents. A store with at most
     that many eligible documents therefore ranks exactly as an unbounded scan.
-    Each pool document is scrubbed at most once, and path matching reads the
-    stored ``path_text`` when the column exists and is set.
+    A document is scrubbed only when a structured term occurs in its raw text
+    or when its excerpt is first read (``LazyRecallCandidate``), at most once,
+    and path matching reads the stored ``path_text`` when the column exists
+    and is set.
     """
     stored_path_text = "path_text" in _document_columns(conn)
     structured = extract_structured_terms(query.query_text)
@@ -225,16 +227,19 @@ def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | N
     home = Path.home()
     scrubbed: dict[str, str] = {}
 
-    def scrubbed_text(doc: RecallDocument) -> str:
-        value = scrubbed.get(doc.id)
-        if value is None:
-            value = scrubbed[doc.id] = scrub_text(doc.text, home)
-        return value
+    def scrub(text: str) -> str:
+        return scrub_text(text, home)
 
     if structured:
         matches = []
         for doc in all_docs:
-            text = scrubbed_text(doc).casefold()
+            # Scrubbing only replaces spans with "<...>" placeholders, which hold
+            # no structured term, so a term missing from the raw text is missing
+            # from the scrubbed text too; only possible matches are scrubbed.
+            folded = doc.text.casefold()
+            if not any(term in folded for term in structured):
+                continue
+            text = scrubbed.setdefault(doc.id, scrub(doc.text)).casefold()
             hits = sum(term in text for term in structured)
             if hits:
                 matches.append((doc.id, -hits))
@@ -286,7 +291,8 @@ def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | N
         doc = by_id[doc_id]
         score = sum(1.0 / (60 + rank) for rank in components.values()) / count
         best = min(components.values())
-        result.append(RecallCandidate(doc, scrubbed_text(doc), dict(components), score, best))
+        excerpt = scrubbed.get(doc.id) or PendingExcerpt(doc.text, scrub)
+        result.append(LazyRecallCandidate(doc, excerpt, dict(components), score, best))
     fts_first = is_prompt and not dense_ids
     result.sort(
         key=lambda candidate: (

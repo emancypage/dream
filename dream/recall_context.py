@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -162,11 +163,57 @@ def retrieve(conn, query: RecallQuery, settings, calibrations, *, embedder=None,
     return Retrieval(tuple(candidates), selected, mode, fallback or adapter_fallback, version)
 
 
-def document_allowed(document, *, policy, memory_root, constitution_path) -> bool:
-    """Whether retention policy and the constitution guard let recall serve ``document``."""
-    from character.safety import is_constitution_source
+def constitution_guard(memory_root, constitution_path):
+    """``character.safety.is_constitution_source`` for many documents, resolving the constitution once.
+
+    Returns ``is_constitution(source_path) -> bool``. Each source path is
+    still resolved and, when that differs from the constitution, compared by
+    file identity, so a symlink or hard link to the constitution is caught
+    exactly as ``is_constitution_source`` catches it. The constitution's path
+    and identity are read on the first call.
+    """
+    if constitution_path is None:
+        return lambda source_path: False
+    target = Path(constitution_path).expanduser()
+    resolved: list = []
+
+    def is_constitution(source_path) -> bool:
+        source = Path(source_path).expanduser()
+        if not source.is_absolute() and memory_root is not None:
+            source = Path(memory_root) / source
+        source_resolved = source.resolve()
+        if not resolved:
+            try:
+                target_stat = target.stat()
+            except OSError:
+                target_stat = None
+            resolved.append((target.resolve(), target_stat))
+        target_resolved, target_stat = resolved[0]
+        if source_resolved == target_resolved:
+            return True
+        if target_stat is None:
+            return False
+        try:
+            return os.path.samestat(source.stat(), target_stat)
+        except OSError:
+            return False
+
+    return is_constitution
+
+
+def document_allowed(document, *, policy, memory_root, constitution_path, is_constitution=None) -> bool:
+    """Whether retention policy and the constitution guard let recall serve ``document``.
+
+    ``is_constitution`` is a ``constitution_guard`` shared by one run's
+    documents; without it, ``is_constitution_source`` checks this one.
+    """
+    if is_constitution is None:
+        from character.safety import is_constitution_source
+
+        def is_constitution(source_path) -> bool:
+            return is_constitution_source(source_path, memory_root=memory_root, constitution_path=constitution_path)
     return not (
-        is_constitution_source(document.source_path, memory_root=memory_root, constitution_path=constitution_path)
+        is_constitution(document.source_path)
         or policy.excludes(source_path=document.source_path, project_slug=document.project_slug, text=document.text)
         or (document.source_kind == "approved_memory" and memory_root is not None
             and policy.excludes_memory_path(memory_root, document.source_path))
@@ -192,12 +239,13 @@ def _run_context(conn, query: RecallQuery, settings, explain: bool = False, *, e
     """``run_context`` plus the selected candidates whose block was rendered."""
     started = time.perf_counter()
     policy = load_retention_policy(memory_root)
+    is_constitution = constitution_guard(memory_root, constitution_path)
 
     def keep(candidate) -> bool:
         if kinds is not None and candidate.document.source_kind not in kinds:
             return False
         return document_allowed(candidate.document, policy=policy, memory_root=memory_root,
-                                constitution_path=constitution_path)
+                                constitution_path=constitution_path, is_constitution=is_constitution)
 
     outcome = retrieve(
         conn, query, settings, _load_calibrations(conn), embedder=embedder, reranker=reranker,

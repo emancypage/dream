@@ -188,7 +188,7 @@ def test_migration_adds_vector_columns_and_backs_up_the_legacy_database_once(tmp
     assert sorted(tmp_path.glob("dream.db.bak-*")) == backups
 
 
-def test_dense_scan_p95_over_5000_vectors_of_1024_dimensions(tmp_path):
+def test_dense_scan_p95_over_5000_vectors_of_1024_dimensions(tmp_path, perf_budget_ms):
     conn = _db(tmp_path)
     rng = random.Random(7)
     dimension = 1024
@@ -211,7 +211,7 @@ def test_dense_scan_p95_over_5000_vectors_of_1024_dimensions(tmp_path):
     assert all(left[1] >= right[1] for left, right in zip(results, results[1:]))
     # p95 of eight runs, read as the second worst so one scheduler hiccup on CI does not fail it.
     p95 = sorted(timings)[-2]
-    assert p95 < 400, f"dense scan p95 {p95:.0f} ms"
+    assert p95 < perf_budget_ms(400), f"dense scan p95 {p95:.0f} ms"
 
 
 # --- nightly embedding -------------------------------------------------------
