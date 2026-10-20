@@ -30,6 +30,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import tomllib
@@ -159,7 +160,7 @@ class _Text:
     newline: str
 
     def encode(self, body: str) -> str:
-        return ("﻿" if self.bom else "") + body
+        return ("\ufeff" if self.bom else "") + body
 
 
 _NEW_FILE = _Text("", False, "\n")
@@ -193,7 +194,7 @@ def _read(path: Path, kind: str) -> _Text | None:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise McpInstallError(f"{path} is not UTF-8 {kind}; fix it first") from exc
-    bom = text.startswith("﻿")
+    bom = text.startswith("\ufeff")
     body = text[1:] if bom else text
     return _Text(body, bom, "\r\n" if "\r\n" in body else "\n")
 
@@ -212,17 +213,26 @@ def _backup(path: Path) -> str:
 def _replace(path: Path, text: str) -> str | None:
     """Back up the current file, then atomically replace it, keeping its permission bits.
 
-    ``text`` is written exactly (``newline=""``). Any filesystem error becomes
+    ``text`` is written exactly, as UTF-8 bytes without newline translation. A
+    read-only file is refused, and any filesystem error becomes
     McpInstallError; the temporary file never outlives a failure.
     """
+    if path.exists() and not path.stat().st_mode & stat.S_IWUSR:
+        raise McpInstallError(f"{path} is read-only (its owner has no write permission); "
+                              "make it writable or edit it by hand")
+    try:
+        data = text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise McpInstallError(f"{path} could not be written: the new text is not valid UTF-8; check that "
+                              "the dream launcher path and " + ", ".join(RECORDED_ENV) + " are UTF-8") from exc
     temp_name = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         mode = path.stat().st_mode & 0o7777 if path.exists() else None
         backup = _backup(path) if path.exists() else None
         fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            handle.write(text)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         if mode is not None:
@@ -244,8 +254,9 @@ def _replace(path: Path, text: str) -> str | None:
 
 
 def _toml_string(value: str) -> str:
-    # A JSON string with ASCII escapes is a valid TOML basic string.
-    return json.dumps(value, ensure_ascii=True)
+    # JSON escapes quotes, backslashes and C0 controls the way TOML basic strings do. Characters
+    # outside the BMP stay literal (TOML has no surrogate-pair escapes), and DEL must be escaped.
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
 def _codex_entry(launch: ServerLaunch) -> dict:
@@ -282,7 +293,7 @@ def _parse_toml(text: str, path: Path, change: str | None = None) -> dict:
     try:
         return tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
-        hint = " It contains a U+FEFF byte order mark after the start of the file." if "﻿" in text else ""
+        hint = " It contains a U+FEFF byte order mark after the start of the file." if "\ufeff" in text else ""
         if change is None:
             raise McpInstallError(f"{path} is not valid TOML ({exc}); fix it first.{hint}") from exc
         raise McpInstallError(f"{change} would make {path} not valid TOML ({exc}); edit it by hand.{hint}") from exc
@@ -574,7 +585,9 @@ def install_claude(launch: ServerLaunch | None = None) -> McpInstallReport:
     get_argv = ["claude", "mcp", "get", SERVER_NAME]
     get_code, get_output = _run_claude(get_argv)
     if get_code == 0 and _claude_entry_is_ours(get_output):
-        return McpInstallReport("claude", False, None, None, "already installed")
+        return McpInstallReport("claude", False, None, None, "already installed", (
+            "Kept the existing entry; run `dream mcp uninstall --client claude` and install again to refresh "
+            "its command or environment.",))
     raise McpInstallError(f"an MCP server named {SERVER_NAME} already exists; inspect it with `claude mcp get {SERVER_NAME}`")
 
 

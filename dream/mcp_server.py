@@ -53,7 +53,7 @@ from recall_context import (
 )
 from recall_render import _render_blocks
 from recall_scrub import scrub_text
-from storage import open_db_readonly
+from storage import ActiveWalError, open_db_readonly
 
 SERVER_NAME = "dream"
 SERVER_VERSION = "1.0.0"
@@ -166,12 +166,14 @@ _INTERNAL_ERROR_LINE = '{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"messa
 def _bounded(text: str, limit: int = _ERROR_TEXT_CODEPOINTS) -> str:
     """Scrubbed, single-line and at most ``limit`` code points; never raises.
 
-    The home directory comes from ``os.path.expanduser``, which falls back to
-    "~" instead of raising when there is no home; a scrubber failure withholds
-    the text rather than sending it unscrubbed.
+    The home directory comes from ``os.path.expanduser``, which returns "~"
+    instead of raising when there is none; credentials are still scrubbed then.
+    A scrubber failure withholds the text rather than sending it unscrubbed.
     """
+    home = os.path.expanduser("~")
     try:
-        value = " ".join(scrub_text(str(text), Path(os.path.expanduser("~"))).split())
+        # Without a resolvable home, "/" makes the scrubber skip only the home-path replacement.
+        value = " ".join(scrub_text(str(text), Path(home if home != "~" else "/")).split())
     except Exception:
         return "details withheld"
     return value if len(value) <= limit else value[: limit - 1] + "…"
@@ -391,10 +393,11 @@ def _readonly(session: _Session):
         raise ToolFailure("database does not exist")
     try:
         conn = open_db_readonly(path)
+    except ActiveWalError as exc:
+        # The nightly writer is busy: expected and brief, so no diagnostic.
+        raise ToolFailure(f"database unavailable ({exc})") from exc
     except sqlite3.Error as exc:
-        # An active WAL means the nightly writer is busy: expected and brief, so no diagnostic.
-        busy = "active WAL" in str(exc)
-        raise ToolFailure(f"database unavailable ({exc})", diagnostic=None if busy else type(exc).__name__) from exc
+        raise ToolFailure(f"database unavailable ({exc})", diagnostic=type(exc).__name__) from exc
     try:
         yield conn
     except sqlite3.Error as exc:

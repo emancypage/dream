@@ -886,26 +886,39 @@ def _diagnostic_lines(home):
     return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
 
-@pytest.mark.parametrize("failure", ["scrubber", "home"])
-def test_the_loop_survives_a_failing_scrubber_or_home_lookup(home, tmp_path, monkeypatch, failure):
+@pytest.mark.parametrize("failure", ["scrubber", "no-home"])
+def test_the_loop_survives_a_failing_scrubber_or_a_missing_home(home, tmp_path, monkeypatch, failure):
+    """A broken scrubber withholds error text; without any home directory errors are still scrubbed."""
+    import pwd
     _memory, db = _store(home, _FILES)
     config = _config(tmp_path)
 
     def boom(*_args, **_kwargs):
-        raise RuntimeError("Could not determine home directory.")
+        raise KeyError("no passwd entry") if failure == "no-home" else RuntimeError("scrub failed")
 
     if failure == "scrubber":
         monkeypatch.setattr(mcp_server, "scrub_text", boom)
     else:
-        monkeypatch.setattr(Path, "home", classmethod(boom))
+        # No HOME and no passwd entry: os.path.expanduser("~") stays "~" and Path.home() raises.
+        monkeypatch.delenv("HOME")
+        monkeypatch.setattr(pwd, "getpwuid", boom)
+        assert os.path.expanduser("~") == "~"
+        with pytest.raises(RuntimeError):
+            Path.home()
     responses = _session(config, db, b"{bad", _request(1, "ping"), _call(2, "recall_search", {"query": "postgres"}),
-                         _request(3, "no/such"), _request(4, "ping"))
+                         _request(3, "API_KEY=sk-live-0123456789"), _request(4, "ping"))
     assert [response["id"] for response in responses] == [None, 1, 2, 3, 4]
     assert _error_code(responses[0]) == -32700 and _error_code(responses[3]) == -32601
     assert responses[1]["result"] == {} and responses[4]["result"] == {}
-    assert responses[2]["result"]["isError"] is (failure == "home")
+    assert "sk-live-0123456789" not in json.dumps(responses)
     if failure == "scrubber":
-        assert responses[0]["error"]["message"] == "details withheld"
+        assert responses[0]["error"]["message"] == responses[3]["error"]["message"] == "details withheld"
+        assert responses[2]["result"]["isError"] is False
+    else:
+        assert responses[0]["error"]["message"] == "Parse error: invalid JSON"
+        assert responses[3]["error"]["message"].startswith("Method not found: API_KEY=")
+        # Rendering needs the home directory, so the tool reports it instead of crashing the loop.
+        assert responses[2]["result"]["isError"] is True and "RuntimeError" in _text(responses[2]["result"])
 
 
 def test_a_line_whose_handling_fails_gets_a_fixed_internal_error(home, tmp_path, monkeypatch):
@@ -955,8 +968,13 @@ def test_diagnostics_are_appended_once_per_tool_and_error_in_a_session(home, tmp
 
 
 def test_an_active_wal_is_reported_without_diagnostics(home, tmp_path):
+    from storage import ActiveWalError
     _memory, db = _store(home, _FILES)
     db.with_name("dream.db-wal").write_bytes(b"pending writer frames")
+    # A dedicated subclass with the old message: other callers still see an OperationalError.
+    assert issubclass(ActiveWalError, sqlite3.OperationalError)
+    with pytest.raises(ActiveWalError, match="^database has active WAL; immutable read deferred$"):
+        open_db_readonly(db)
     calls = [_call(index, name, arguments) for index, (name, arguments) in enumerate(
         [("recall_search", {"query": "postgres"}), ("recall_get", {"id": "x"}), ("memory_index", {})] * 2)]
     responses = _session(_config(tmp_path), db, *calls)

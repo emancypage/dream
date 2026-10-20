@@ -7,6 +7,10 @@ from pathlib import Path
 from urllib.parse import quote
 
 
+class ActiveWalError(sqlite3.OperationalError):
+    """A writer holds an active WAL: an immutable read would miss its frames, so it is deferred."""
+
+
 def open_db_readonly(path: Path) -> sqlite3.Connection:
     """Open an existing database without requiring write access to its directory.
 
@@ -17,7 +21,7 @@ def open_db_readonly(path: Path) -> sqlite3.Connection:
     resolved = Path(path).expanduser().resolve()
     wal_path = resolved.with_name(f"{resolved.name}-wal")
     if wal_path.exists() and wal_path.stat().st_size > 0:
-        raise sqlite3.OperationalError("database has active WAL; immutable read deferred")
+        raise ActiveWalError("database has active WAL; immutable read deferred")
     uri = f"file:{quote(str(resolved), safe='/')}?mode=ro&immutable=1"
     conn = sqlite3.connect(uri, uri=True)
     conn.execute("PRAGMA query_only = ON")

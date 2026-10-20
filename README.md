@@ -356,13 +356,14 @@ prints the names, not the values. `--path` points codex or opencode at another
 file.
 
 Install refuses malformed files, foreign `dream` entries, `[[mcp_servers]]`
-arrays and dangling symlinks, re-parses the result before an atomic replace,
+arrays, read-only files and dangling symlinks, re-parses the result before an atomic replace,
 keeps unrelated entries, line endings, a UTF-8 byte order mark and the JSON
 indentation, writes a timestamped `.bak-` copy of the previous file, and writes
 nothing when the entry is already current. A changed Codex block is reported as
 updated; an existing OpenCode entry keeps the keys you added and an explicit
 `"enabled": false`. For Claude Code, an existing `dream` server counts as
-installed only when `claude mcp get dream` shows `mcp serve`; every other
+installed only when `claude mcp get dream` shows `mcp serve` (it is kept as
+is: uninstall and install again to refresh it); every other
 `claude` failure is reported with its output. Claude Code keeps its own file,
 so Dream makes no backup there. `dream mcp uninstall --client ...` removes only
 the Dream entry and is the rollback; for Codex it restores the file byte for

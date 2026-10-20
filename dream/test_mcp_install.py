@@ -384,6 +384,8 @@ def test_claude_install_confirms_an_existing_server_with_mcp_get(home, tmp_path,
     assert claude.calls() == [_ADD, ["mcp", "get", "dream"]]
     if ok:
         assert rc == 0 and "already installed" in out
+        assert ("Kept the existing entry; run `dream mcp uninstall --client claude` and install again to refresh "
+                "its command or environment.") in out
     else:
         assert rc == 1 and out == ""
         assert "an MCP server named dream already exists; inspect it with `claude mcp get dream`" in err
@@ -544,7 +546,7 @@ def test_codex_install_and_uninstall_restore_the_file_byte_for_byte(home, tmp_pa
     path.write_bytes(original)
     assert mcp_install.install_codex(path).changed
     installed = path.read_bytes()
-    assert tomllib.loads(installed.decode("utf-8").lstrip("﻿"))["mcp_servers"]["dream"] == DREAM_ENTRY
+    assert tomllib.loads(installed.decode("utf-8").lstrip("\ufeff"))["mcp_servers"]["dream"] == DREAM_ENTRY
     assert installed.startswith(_BOM) is original.startswith(_BOM)
     if b"\r\n" in original:
         assert installed.count(b"\n") == installed.count(b"\r\n")
@@ -568,7 +570,7 @@ def test_opencode_layout_line_endings_and_bom_are_kept(home, tmp_path, indent, n
     assert mcp_install.install_opencode(path).changed
     installed = path.read_bytes()
     assert installed.startswith(_BOM) is bom
-    body = installed.decode("utf-8").lstrip("﻿")
+    body = installed.decode("utf-8").lstrip("\ufeff")
     assert json.loads(body)["mcp"]["dream"]["command"] == ["dream", "mcp", "serve"]
     assert body.endswith("\n") is trailing
     if newline == "\r\n":
@@ -587,7 +589,7 @@ def test_an_empty_opencode_file_counts_as_an_empty_object(home, tmp_path, conten
     path = tmp_path / "opencode.json"
     path.write_bytes(content)
     assert mcp_install.install_opencode(path).changed
-    body = path.read_bytes().decode("utf-8").lstrip("﻿")
+    body = path.read_bytes().decode("utf-8").lstrip("\ufeff")
     assert json.loads(body) == {"mcp": {"dream": {"type": "local", "command": ["dream", "mcp", "serve"], "enabled": True}}}
     assert len(_backups(path)) == 1
 
@@ -681,3 +683,42 @@ def test_a_directory_at_the_config_path_is_refused(home, tmp_path, capsys):
     (home / ".codex" / "config.toml").mkdir(parents=True)
     rc, _out, err = _main(capsys, tmp_path, "install", "--client", "codex")
     assert rc == 1 and "could not be read: Is a directory" in err
+
+
+
+def test_recorded_paths_keep_characters_outside_the_bmp(home, tmp_path, capsys, monkeypatch):
+    value = str(tmp_path / "konfiguracja-\U0001F600-żółw-\x7f.toml")
+    monkeypatch.setenv("DREAM_CONFIG", value)
+    path = home / ".codex" / "config.toml"
+    path.parent.mkdir()
+    path.write_text('model = "x"\n', encoding="utf-8")
+    original = path.read_bytes()
+    rc, _out, err = _main(capsys, tmp_path, "install", "--client", "codex")
+    assert rc == 0, err
+    text = path.read_text(encoding="utf-8")
+    assert "\U0001F600" in text and "\\u007f" in text and "\x7f" not in text
+    assert tomllib.loads(text)["mcp_servers"]["dream"]["env"] == {"DREAM_CONFIG": value}
+    assert _main(capsys, tmp_path, "uninstall", "--client", "codex")[0] == 0
+    assert path.read_bytes() == original
+
+
+def test_a_variable_that_is_not_utf8_is_refused(home, tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("DREAM_CONFIG", "/tmp/config-\udcff.toml")  # an undecodable byte, as os.environ keeps it
+    rc, out, err = _main(capsys, tmp_path, "install", "--client", "opencode")
+    assert rc == 1 and out == "" and "not valid UTF-8" in err and "Traceback" not in err
+    assert not (home / ".config").exists()
+
+
+@pytest.mark.parametrize("client", ["codex", "opencode"])
+def test_a_read_only_config_is_refused(home, tmp_path, capsys, client):
+    path = tmp_path / "config.file"
+    path.write_text('model = "x"\n' if client == "codex" else '{"theme": "x"}\n', encoding="utf-8")
+    path.chmod(0o444)
+    try:
+        rc, out, err = _main(capsys, tmp_path, "install", "--client", client, "--path", str(path))
+    finally:
+        mode = stat.S_IMODE(path.stat().st_mode)
+        path.chmod(0o644)
+    assert rc == 1 and out == "" and "is read-only" in err
+    assert mode == 0o444 and _backups(path) == []
+    assert path.read_text(encoding="utf-8") in ('model = "x"\n', '{"theme": "x"}\n')
