@@ -254,20 +254,28 @@ def test_usage_only_reorders_within_exact_ties(tmp_path):
 # ------------------------------------------------------------ golden outputs and latency
 #
 # fixtures/recall/lexical-golden.json was captured from rank_lexical and
-# run_context at a63783f, before the lexical path was bounded: every query of
+# run_context at a63783f (bdb047d after the history rewrite), before the
+# lexical path was bounded: every query of
 # the public fixture and of a 300-document synthetic store (both below
 # RECENT_POOL_SIZE, where the bound changes nothing), and the prompt-path
 # queries of the 10,000-document store, whose candidate pool the bound leaves
 # as it was. Session starts on the large store match paths over a bounded
 # pool by design (test_session_start_pool_is_bounded_on_a_large_store); their
-# bounded output was captured at 06b1cbe in lexical-golden-bounded.json. The
+# bounded output was captured at 06b1cbe (d33394b) in lexical-golden-bounded.json. The
 # four prompt-excluded embedder records were updated when session exclusions
 # moved before the dense-candidate limit: the excluded documents no longer take
 # dense slots, so one more eligible candidate enters. Set
 # DREAM_UPDATE_GOLDEN=1 only for an intentional, reviewed ranking change.
+#
+# Records keep IDs, component ranks, counts and hashes exact but round every
+# score to 12 decimal places (GOLDEN_SCORE_DECIMALS). Python 3.12 made sum() of
+# floats compensated while 3.11 adds left to right, so the same RRF score can
+# differ in its last bit between versions; 12 places keeps about 10
+# significant digits of a score near 0.01, far above that noise.
 
 GOLDEN = Path(__file__).parent / "fixtures" / "recall" / "lexical-golden.json"
 BOUNDED_GOLDEN = Path(__file__).parent / "fixtures" / "recall" / "lexical-golden-bounded.json"
+GOLDEN_SCORE_DECIMALS = 12
 PUBLIC_FIXTURE = Path(__file__).parent / "fixtures" / "recall" / "public.json"
 GOLDEN_HOME = "/home/golden"
 _INDEXED_AT = "2026-10-20T00:00:00+00:00"
@@ -473,7 +481,8 @@ def _digest(value) -> str:
 
 def _ranking_record(results) -> dict:
     entries = [
-        [c.document.id, [list(item) for item in c.component_ranks.items()], c.score, c.best_component_rank,
+        [c.document.id, [list(item) for item in c.component_ranks.items()], round(c.score, GOLDEN_SCORE_DECIMALS),
+         c.best_component_rank,
          hashlib.sha256(c.scrubbed_excerpt.encode("utf-8")).hexdigest()[:16]]
         for c in results
     ]
