@@ -14,7 +14,7 @@ from pathlib import Path
 from recall_events import POLICY_VERSION
 from recall_adapters import AdapterError, EmbedderUnavailable, adapter_fingerprint, apply_optional_adapters, build_embedder, embed_query, embedder_fallback_reason
 from recall_embeddings import dense_candidates, embedding_text, has_vectors
-from recall_render import render_context
+from recall_render import _render_blocks
 from recall_query import rank_lexical
 from recall_select import calibration_for, embedder_calibration_version, select_recall_candidates
 from recall_types import RecallCandidate, RecallDiagnostics, RecallQuery, RecallResult
@@ -169,6 +169,15 @@ def run_context(conn, query: RecallQuery, settings, explain: bool = False, *, em
     ``limit`` keeps the first selected candidates before rendering. Both
     default to None (every kind, no limit), which the hooks rely on.
     """
+    return _run_context(conn, query, settings, explain, embedder=embedder, reranker=reranker,
+                        allow_cache_writes=allow_cache_writes, memory_root=memory_root,
+                        constitution_path=constitution_path, kinds=kinds, limit=limit)[0]
+
+
+def _run_context(conn, query: RecallQuery, settings, explain: bool = False, *, embedder=None, reranker=None,
+                 allow_cache_writes: bool = False, memory_root=None, constitution_path, kinds=None, limit=None,
+                 ) -> tuple[RecallResult, tuple[RecallCandidate, ...]]:
+    """``run_context`` plus the selected candidates whose block was rendered."""
     started = time.perf_counter()
     policy = load_retention_policy(memory_root)
     from character.safety import is_constitution_source
@@ -190,11 +199,11 @@ def run_context(conn, query: RecallQuery, settings, explain: bool = False, *, em
         allow_cache_writes=allow_cache_writes, keep=keep,
     )
     selected = outcome.selected if limit is None else outcome.selected[:limit]
-    rendered = render_context(selected, query.requested_codepoint_budget, query.query_text)
+    rendered, kept = _render_blocks(selected, query.requested_codepoint_budget, query.query_text)
     elapsed = int((time.perf_counter() - started) * 1000)
     diagnostics = RecallDiagnostics(len(outcome.candidates), len(selected), outcome.fallback_reason,
                                     len(rendered), elapsed, outcome.calibration_version)
-    return RecallResult(selected, rendered, outcome.mode, outcome.calibration_version, diagnostics)
+    return RecallResult(selected, rendered, outcome.mode, outcome.calibration_version, diagnostics), tuple(kept)
 
 
 AGENT_QUERY_EVENT = "agent-query"
@@ -240,22 +249,6 @@ def validate_agent_query(query_text, kinds, settings) -> tuple[str, frozenset[st
     return query_text, frozenset(names)
 
 
-def _rendered_candidates(candidates, budget_codepoints: int, query_text: str) -> tuple[RecallCandidate, ...]:
-    """The candidates whose block ``render_context`` keeps, in order.
-
-    Rendering is greedy and skips a block that no longer fits, so a candidate
-    is rendered exactly when it lengthens the rendering of the prefix before it.
-    """
-    shown = []
-    previous = 0
-    for index, candidate in enumerate(candidates):
-        length = len(render_context(candidates[:index + 1], budget_codepoints, query_text))
-        if length > previous:
-            shown.append(candidate)
-        previous = length
-    return tuple(shown)
-
-
 def recall_for_agent(conn, settings, *, query_text, cwd, memory_root, constitution_path, project_slug=None,
                      kinds=None, limit=5, budget_codepoints=4000, embedder=None) -> RecallResult:
     """Answer an agent's memory query: the entry point of ``dream recall`` and the MCP server.
@@ -287,9 +280,9 @@ def recall_for_agent(conn, settings, *, query_text, cwd, memory_root, constituti
     allow_raw = settings.allow_raw_transcript_prompt and "raw_transcript" in allowed
     query = RecallQuery(query_text, None, AGENT_QUERY_EVENT, str(cwd) if cwd else None, (project,) if project else (),
                         int(budget_codepoints), frozenset(), allow_raw)
-    result = run_context(conn, query, settings, embedder=embedder, allow_cache_writes=False, memory_root=memory_root,
-                         constitution_path=constitution_path, kinds=allowed, limit=limit)
-    shown = _rendered_candidates(result.selected, query.requested_codepoint_budget, query.query_text)
+    result, shown = _run_context(conn, query, settings, embedder=embedder, allow_cache_writes=False,
+                                 memory_root=memory_root, constitution_path=constitution_path,
+                                 kinds=allowed, limit=limit)
     return replace(result, selected=shown, diagnostics=replace(result.diagnostics, selected_count=len(shown)))
 
 

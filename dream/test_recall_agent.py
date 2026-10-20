@@ -131,13 +131,13 @@ def test_recall_accepts_every_option_together(agent_env, capsys):
 def test_recall_runs_through_the_agent_query_path_without_cache_writes(agent_env, capsys, monkeypatch):
     _memory, db = _store(agent_env, _FILES)
     seen = {}
-    original = recall_context.run_context
+    original = recall_context._run_context
 
     def spy(conn, query, settings, *args, **kwargs):
         seen.update(query=query, kwargs=kwargs)
         return original(conn, query, settings, *args, **kwargs)
 
-    monkeypatch.setattr(recall_context, "run_context", spy)
+    monkeypatch.setattr(recall_context, "_run_context", spy)
     config = _write_config(agent_env, "prompt_budget_codepoints = 3000")
     rc, out, _err = _recall(capsys, config, db, "postgres", "--project", "api")
     assert rc == 0 and MARKER in out
@@ -565,6 +565,24 @@ def test_json_reports_the_pipeline_fallback_reason_verbatim(agent_env, capsys, m
     monkeypatch.setattr(dream, "recall_for_agent", with_reason)
     payload = _json(capsys, _write_config(agent_env), db, "postgres migrations")
     assert payload["fallback_reason"] == "embedder-some-new-reason"
+
+
+@pytest.mark.parametrize("calibration", ["none", "other-fingerprint"])
+def test_agent_query_needs_a_calibration_for_the_current_embedder(agent_env, capsys, embedding_server, calibration):
+    from dream import open_db
+    _memory, db = _store(agent_env, _ENGLISH)
+    conn = open_db(db)
+    embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False)
+    if calibration == "other-fingerprint":
+        calibrate_embedder_mode(conn, fingerprint="openai-compatible:other-model:8")
+    conn.close()
+    embedding_server.requests.clear()
+    _cli_config(agent_env, embedding_server.url)
+    payload = _json(capsys, agent_env / "config.toml", db, "postgresql migrations release")
+    assert payload["mode"] == "lexical"
+    assert payload["fallback_reason"] == ("embedder-uncalibrated" if calibration == "none" else "embedder-calibration-stale")
+    assert payload["results"] and "PostgreSQL" in payload["context"]
+    assert embedding_server.requests == []
 
 
 def test_misconfigured_embedder_is_reported_and_never_contacted(agent_env, capsys, embedding_server):

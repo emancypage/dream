@@ -1,6 +1,6 @@
 import pytest
 
-from recall_render import make_excerpt, neutralize_forged_headers, render_context
+from recall_render import _render_blocks, make_excerpt, neutralize_forged_headers, render_context
 from recall_types import RecallCandidate, RecallDocument
 
 
@@ -90,6 +90,36 @@ def test_forged_line_chosen_first_by_the_excerpt_is_escaped():
     header, excerpt = rendered.split("\n", 2)[1:]
     assert header.startswith("[source: doc-1;")
     assert not excerpt.startswith("[source:")
+
+
+def _prefix_kept(candidates, budget, query_text):
+    """The former agent-path rule: a candidate is kept when it lengthens the rendering of its prefix."""
+    kept, previous = [], 0
+    for index, candidate in enumerate(candidates):
+        length = len(render_context(candidates[:index + 1], budget, query_text))
+        if length > previous:
+            kept.append(candidate)
+        previous = length
+    return kept
+
+
+def test_render_blocks_keeps_exactly_the_rendered_candidates_at_budget_boundaries():
+    from dataclasses import replace
+
+    texts = ["Short memory one.", "A long memory. " * 120, "Short memory two.", "", "Medium memory. " * 20,
+             "Short memory three."]
+    candidates = [replace(_candidate(text), document=replace(_candidate(text).document, id=f"doc-{index}",
+                                                             content_sha256=f"sha-{index}"))
+                  for index, text in enumerate(texts)]
+    seen_skips = False
+    for budget in [0, 50, 150, 200, 300, 450, 600, 900, 1200, 1400, 1600, 2000, 4000]:
+        text, kept = _render_blocks(candidates, budget, "memory")
+        assert text == render_context(candidates, budget, "memory")
+        assert kept == _prefix_kept(candidates, budget, "memory")
+        assert text.count("[source: ") == len(kept)
+        positions = [candidates.index(candidate) for candidate in kept]
+        seen_skips = seen_skips or (positions and positions != list(range(len(positions))))
+    assert seen_skips
 
 
 def test_text_without_forged_lines_renders_byte_identically():

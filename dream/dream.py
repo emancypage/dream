@@ -49,7 +49,7 @@ from config import load_config  # noqa: E402
 from curate import CURATION_SCHEMA, build_curation_prompt, parse_curation_output  # noqa: E402
 from recall_documents import embed_recall_documents, synchronize_recall_documents  # noqa: E402
 from recall_context import append_diagnostic, configured_embedder, parse_hook_payload, recall_preflight, recent_diagnostic, run_context, hook_success_json  # noqa: E402
-from recall_context import RECALL_KINDS, RecallUnavailable, agent_results, recall_for_agent, validate_agent_query  # noqa: E402
+from recall_context import RECALL_KINDS, RecallUnavailable, agent_results, recall_for_agent, validate_agent_query, with_adapters  # noqa: E402
 from recall_hook_state import claim_hook_event, finish_hook_event, successful_session_start_ids  # noqa: E402
 from recall_hooks import install_hooks, uninstall_hooks  # noqa: E402
 from storage import open_db_readonly  # noqa: E402
@@ -568,8 +568,7 @@ def cmd_recall(args: argparse.Namespace) -> int:
         # Building the embedder contacts nothing; an unusable one means lexical recall.
         embedder, embedder_problem = configured_embedder(args.config)
         if embedder_problem:
-            from dataclasses import replace
-            settings = replace(settings, embedder=replace(settings.embedder, enabled=False))
+            settings = with_adapters(settings, embedder=False)
         try:
             cwd = os.getcwd()
         except OSError:
