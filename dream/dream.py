@@ -1648,23 +1648,35 @@ def cmd_mcp(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
     path = Path(args.path).expanduser() if args.path else None
-    action = mcp_install.install if args.mcp_cmd == "install" else mcp_install.uninstall
+    launch = mcp_install.server_launch()
     try:
-        report = action(args.client, path)
+        if args.mcp_cmd == "install":
+            report = mcp_install.install(args.client, path, launch)
+        else:
+            report = mcp_install.uninstall(args.client, path)
     except mcp_install.McpInstallError as exc:
         print(f"dream mcp: {exc}", file=sys.stderr)
         return 1
+    except OSError as exc:
+        print(f"dream mcp: {exc.strerror or type(exc).__name__}", file=sys.stderr)
+        return 1
     where = f" in {report.path}" if report.path else ""
     if args.mcp_cmd == "install":
-        print(f"Installed the Dream MCP server for {args.client}{where}." if report.changed
-              else f"The Dream MCP server is already installed for {args.client}{where}.")
+        if not report.changed:
+            print(f"The Dream MCP server is already installed for {args.client}{where}.")
+        elif report.detail == "updated":
+            print(f"Updated the Dream MCP server entry for {args.client}{where}.")
+        else:
+            print(f"Installed the Dream MCP server for {args.client}{where}.")
     else:
         print(f"Removed the Dream MCP server for {args.client}{where}." if report.changed
               else f"Nothing to remove for {args.client}{where}: {report.detail}.")
+    for note in report.notes:
+        print(note)
     if report.backup_path:
         print(f"Backup of the previous file: {report.backup_path}")
     if args.mcp_cmd == "install":
-        print(mcp_install.NEXT_STEPS[args.client])
+        print(mcp_install.next_step(args.client, launch))
     return 0
 
 

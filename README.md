@@ -339,20 +339,32 @@ tools or invalid arguments `-32602`. stdout carries only protocol messages.
 The server is not installed by default. `dream mcp install --client codex`
 adds a marker-delimited `[mcp_servers.dream]` block at the end of
 `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`); `--client opencode`
-adds `mcp.dream` (`{"type": "local", "command": ["dream", "mcp", "serve"],
+adds `mcp.dream` (`{"type": "local", "command": [<dream>, "mcp", "serve"],
 "enabled": true}`) to `$OPENCODE_CONFIG` or the global
 `~/.config/opencode/opencode.json` (`opencode.jsonc` when only that exists;
-it must be plain JSON); `--client claude` runs
-`claude mcp add --scope user dream -- dream mcp serve`, or prints that command
-when `claude` is not on `PATH`. `--path` points codex or opencode at another
-file. Install refuses malformed files and foreign `dream` entries, re-parses
-the result before an atomic replace, keeps unrelated entries, writes a
-timestamped `.bak-` copy of the previous file, and writes nothing when the
-entry is already current. Claude Code keeps its own file, so Dream makes no
-backup there. `dream mcp uninstall --client ...` removes only the Dream entry
-and is the rollback. Neither command starts the server: restart the client
-and check its MCP list (`/mcp` in Codex and Claude Code, `opencode mcp list`).
-The clients run `dream mcp serve` by name, so `dream` must be on their `PATH`.
+it must be plain JSON, and an empty file counts as `{}`); `--client claude`
+runs `claude mcp add --scope user dream -- <dream> mcp serve`, or prints that
+command when `claude` is not on `PATH`. `<dream>` is the absolute path of the
+`dream` launcher found on `PATH`; without one the entry runs `dream` by name
+and the client must find it on its own `PATH`. When `DREAM_CONFIG`,
+`DREAM_MEMORY_ROOT` or `CLAUDE_DREAM_DB` is set, install records it in the
+entry's environment (Codex `env`, OpenCode `environment`, Claude `-e`) and
+prints the names, not the values. `--path` points codex or opencode at another
+file.
+
+Install refuses malformed files, foreign `dream` entries, `[[mcp_servers]]`
+arrays and dangling symlinks, re-parses the result before an atomic replace,
+keeps unrelated entries, line endings, a UTF-8 byte order mark and the JSON
+indentation, writes a timestamped `.bak-` copy of the previous file, and writes
+nothing when the entry is already current. A changed Codex block is reported as
+updated; an existing OpenCode entry keeps the keys you added and an explicit
+`"enabled": false`. For Claude Code, an existing `dream` server counts as
+installed only when `claude mcp get dream` shows `mcp serve`; every other
+`claude` failure is reported with its output. Claude Code keeps its own file,
+so Dream makes no backup there. `dream mcp uninstall --client ...` removes only
+the Dream entry and is the rollback; for Codex it restores the file byte for
+byte. Neither command starts the server: restart the client and check its MCP
+list (`/mcp` in Codex and Claude Code, `opencode mcp list`).
 
 ## Data and compatibility
 
