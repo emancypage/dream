@@ -88,17 +88,34 @@ def make_excerpt(text: str, normalized_query: str, max_codepoints: int) -> str:
     return " ".join(selected)
 
 
+def _block_header(doc) -> str:
+    """The marker and provenance lines that open a rendered block."""
+    return (
+        f"{RECALL_MARKER}\n"
+        f"[source: {doc.id}; kind: {doc.source_kind}; trust: {doc.trust_level}; project: {doc.project_slug or 'global'}]\n"
+    )
+
+
 def delivered_ids(candidates, context: str) -> list[str]:
-    """IDs of the candidates whose block header appears in ``context``, in candidate order.
+    """IDs of the candidates whose block reached ``context`` with memory text, in candidate order.
 
     ``context`` is what an agent finally received, after any later cut (a
     hook puts character text first and may trim the recall text after it).
-    Only a real header produces the marker line directly followed by a
-    provenance line: neutralize_forged_headers escapes both line starts in a
-    document's text, so a forged header never counts as a delivered block.
+    A block counts only when its whole header, provenance line included, is
+    followed by excerpt text: a cut inside the header or right after it
+    delivers no memory. Only a real header produces the marker line directly
+    followed by a provenance line: neutralize_forged_headers escapes both line
+    starts in a document's text, so a forged header never counts as a
+    delivered block.
     """
-    return [candidate.document.id for candidate in candidates
-            if f"{RECALL_MARKER}\n[source: {candidate.document.id}; " in context]
+    delivered = []
+    for candidate in candidates:
+        header = _block_header(candidate.document)
+        start = context.find(header)
+        # Rendered excerpts are stripped, so the first character after a header is never whitespace.
+        if start != -1 and context[start + len(header):start + len(header) + 1].strip():
+            delivered.append(candidate.document.id)
+    return delivered
 
 
 def render_context(candidates, budget_codepoints: int, query_text: str, *, excerpt_codepoints: int = 1000) -> str:
@@ -123,14 +140,9 @@ def _render_blocks(candidates, budget_codepoints: int, query_text: str, *,
     blocks: list[str] = []
     kept: list = []
     used = 0
-    marker = RECALL_MARKER
     for candidate in candidates:
         doc = candidate.document
-        project = doc.project_slug or "global"
-        header = (
-            f"{marker}\n"
-            f"[source: {doc.id}; kind: {doc.source_kind}; trust: {doc.trust_level}; project: {project}]\n"
-        )
+        header = _block_header(doc)
         remaining = budget_codepoints - used - (2 if blocks else 0) - len(header)
         if remaining <= 0:
             continue

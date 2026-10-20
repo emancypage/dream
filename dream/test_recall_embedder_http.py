@@ -948,6 +948,28 @@ def test_query_text_is_scrubbed_before_it_reaches_the_embedder(tmp_path, embeddi
     assert "sk-live-query-secret" not in sent and "postgres" in sent
 
 
+_QUOTED_CREDENTIAL = '{"password": "example-value-123", "api_key": "two words"}'
+
+
+def test_quoted_json_credentials_never_reach_the_embedder_from_a_document(tmp_path, embedding_server):
+    conn, _memory = _memory_store(tmp_path, {**_ENGLISH, "db.md": f"PostgreSQL client config: {_QUOTED_CREDENTIAL}"})
+    report = embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False)
+    assert report.error is None
+    (sent,) = [text for text in embedding_server.posted_inputs() if "client config" in text]
+    assert "example-value-123" not in sent and "two words" not in sent
+    assert '"password": "<redacted>"' in sent and '"api_key": "<redacted>"' in sent
+
+
+def test_quoted_json_credentials_never_reach_the_embedder_from_a_query(tmp_path, embedding_server):
+    conn, _memory = _memory_store(tmp_path, _ENGLISH)
+    embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False)
+    embedding_server.requests.clear()
+    run_context(conn, _prompt(f"postgres login with {_QUOTED_CREDENTIAL}"), recall_settings(embedder_settings()),
+                embedder=make_embedder(embedding_server.url), allow_cache_writes=False, constitution_path=None)
+    (sent,) = embedding_server.posted_inputs()
+    assert "example-value-123" not in sent and "two words" not in sent and "postgres" in sent
+
+
 # --- wall-clock bound, stale calibrations, quiet failures ---------------------
 
 

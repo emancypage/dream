@@ -22,6 +22,23 @@ _KEY_VALUE = re.compile(
     r"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|passwd|token)"
     r"\s*[:=]\s*([^\s#;,]+)"
 )
+# The same labels and variable names as quoted keys (JSON, a Python dict, YAML),
+# where the closing quote sits between the key and its separator. A quoted value,
+# spaces and escapes included, is replaced inside its quotes; a bare scalar is
+# replaced whole; an object or a list is left to the keys inside it.
+_QUOTED_KEY_VALUE = re.compile(
+    r"""(["'])(?:(?i:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|passwd|token)"""
+    r"""|[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?)|(?:AWS|GITHUB|OPENAI|ANTHROPIC)_[A-Z0-9_]+)\1"""
+    r"""\s*[:=]\s*(?:"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'|([^\s"'{\[\]},#;][^\s,}\]#;]*))"""
+)
+
+
+def _redact_quoted_value(match: re.Match) -> str:
+    group = next(index for index in (2, 3, 4) if match.group(index) is not None)
+    text, start = match.group(0), match.start(0)
+    return text[: match.start(group) - start] + "<redacted>" + text[match.end(group) - start:]
+
+
 # Provider tokens without a label. Each needs its provider's prefix plus a
 # realistic length and charset, so words and identifiers that merely share a
 # prefix (sk-learn, xoxo, ASIAN) stay readable. Prefixed OpenAI keys also need
@@ -53,6 +70,7 @@ def scrub_text(text: str, home: Path) -> str:
     value = _PEM.sub("<redacted>", value)
     value = _BEARER.sub("Bearer <redacted>", value)
     value = _CONNECTION.sub("<redacted>", value)
+    value = _QUOTED_KEY_VALUE.sub(_redact_quoted_value, value)
     value = _ASSIGNMENT.sub(lambda m: m.group(0)[: m.group(0).find("=") + 1] + " <redacted>", value)
     value = _KEY_VALUE.sub(lambda m: m.group(0)[: m.group(0).find(m.group(1))] + "<redacted>", value)
     # Last, so a labelled value keeps its label and earlier output is unchanged.

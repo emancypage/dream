@@ -85,3 +85,30 @@ def test_bare_tokens_in_a_query_never_reach_the_embedder():
     from recall_embeddings import embedding_text
     query = "how do we ship kubernetes rollout token " + BARE_TOKENS["openai lowercase"]
     assert embedding_text(query) == "how do we ship kubernetes rollout token <redacted>"
+
+
+# Quoted keys: the closing quote sits between the label and its separator.
+@pytest.mark.parametrize("text, expected", [
+    ('{"password": "example-value-123"}', '{"password": "<redacted>"}'),
+    ('{"password":"correct horse battery staple"}', '{"password":"<redacted>"}'),
+    ("{'api_key': 'two words'}", "{'api_key': '<redacted>'}"),
+    ('{"apiKey": "v", "name": "x"}', '{"apiKey": "<redacted>", "name": "x"}'),
+    ('{"secret": "with \\"escaped\\" quotes"}', '{"secret": "<redacted>"}'),
+    ('{"access_token": 123456, "ok": true}', '{"access_token": <redacted>, "ok": true}'),
+    ('"OPENAI_API_KEY": "abc def"', '"OPENAI_API_KEY": "<redacted>"'),
+    ('env: {"DB_PASSWORD" : "hunter two"}', 'env: {"DB_PASSWORD" : "<redacted>"}'),
+    ("'token': plainvalue", "'token': <redacted>"),
+])
+def test_quoted_credential_keys_are_redacted(tmp_path, text, expected):
+    assert scrub_text(text, tmp_path / "home") == expected
+
+
+@pytest.mark.parametrize("text", [
+    '{"max_tokens": 4096, "tokens": 12}',
+    '{"password_hint": "the usual one"}',
+    '{"name": "password", "label": "token"}',
+    '{"secret": {"nested": "object"}}',
+    '{"monkey": "banana"}',
+])
+def test_quoted_lookalikes_of_credential_keys_are_left_alone(tmp_path, text):
+    assert scrub_text(text, tmp_path / "home") == text

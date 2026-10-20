@@ -872,6 +872,30 @@ def test_delivered_ids_are_the_blocks_whose_real_header_reached_the_context():
     assert delivered_ids([shown, third], both[: both.index("[source: third;")]) == ["shown"]
 
 
+def test_a_block_cut_inside_its_header_or_before_its_excerpt_is_not_delivered():
+    from recall_context import compose_hook_context
+    from recall_render import delivered_ids, render_context
+    from recall_types import RecallCandidate, RecallDocument
+
+    def candidate(doc_id, text):
+        return RecallCandidate(RecallDocument(doc_id, doc_id, "approved_memory", "user_approved", None,
+                                              f"{doc_id}.md", "", "", "v1", text), text, {"fts": 1}, 0.5, 1)
+
+    first, second = candidate("first", "The first note."), candidate("second", "The second note.")
+    both = render_context([first, second], 10_000, "notes")
+    provenance = both.index("[source: second; ")
+    header_end = both.index("]\n", provenance) + 2
+    for cut in (provenance + len("[source: second; "), header_end - 1, header_end):
+        assert delivered_ids([first, second], both[:cut]) == ["first"], cut
+    assert delivered_ids([first, second], both[:header_end + 1]) == ["first", "second"]
+    # The hook's final composition cuts recall bytes after the character text.
+    trusted, separator = "Character text.", "\n\n# Untrusted recall\n"
+    limit = len((trusted + separator).encode("utf-8")) + len(both[:header_end].encode("utf-8"))
+    combined, _reason = compose_hook_context(both, trusted, limit, limit)
+    assert combined.endswith(both[:header_end])
+    assert delivered_ids([first, second], combined) == ["first"]
+
+
 def _sixty_topic_store(tmp_path):
     memory = tmp_path / "memory"
     memory.mkdir()
