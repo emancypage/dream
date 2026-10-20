@@ -329,8 +329,11 @@ successful call writes nothing: no database rows, hook markers, embedding
 cache or files under the home directory. Memory text comes only from the
 database (`memory_index` serves the synchronized copy of `MEMORY.md`); the one
 file read under the memory root is `.dream-retention.json`, so exclusions apply
-even to documents synchronized before the policy changed. A failed call may append one bounded diagnostic to `recall.diagnostic_path`,
-and a failed append is ignored. Tool failures (database missing or busy,
+even to documents synchronized before the policy changed. A failed call may append one bounded diagnostic to `recall.diagnostic_path`
+(once per tool and error in a session, never for an active WAL), and a failed
+append is ignored. Structured results also carry the rendered block as
+`context`, so a client that forwards only structured content still passes the
+marked, scrubbed text. Tool failures (database missing or busy,
 schema not migrated, unknown or excluded id) come back as results with
 `isError: true`; malformed JSON and lines over 1 MiB get `-32700`, batches
 (JSON arrays) and invalid requests `-32600`, unknown methods `-32601`, unknown

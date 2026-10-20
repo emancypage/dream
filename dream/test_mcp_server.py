@@ -26,6 +26,9 @@ from recall_context import agent_results, recall_for_agent
 from recall_documents import stable_document_id
 from storage import open_db_readonly
 from test_recall_agent import MARKER, _FILES, _insert, _store
+from test_recall_embedder_http import (  # noqa: F401  (embedding_server is a fixture)
+    FINGERPRINT, _ENGLISH, _cli_config, calibrate_embedder_mode, embedding_server, make_embedder,
+)
 
 DREAM_PY = Path(__file__).resolve().parent / "dream.py"
 NEWEST = "2025-06-18"
@@ -222,6 +225,8 @@ def test_recall_search_returns_the_rendered_block_and_structured_results(home, t
     assert _text(result).startswith(MARKER + "\n[source: ")
     structured = result["structuredContent"]
     assert structured["results"] == agent_results(expected)
+    # A client that forwards only structuredContent still hands the model the marked block.
+    assert structured["context"] == _text(result)
     assert structured["mode"] == "lexical" and structured["fallback_reason"] is None
     assert {row["kind"] for row in structured["results"]} == {"approved_memory", "distilled_summary"}
     for row in structured["results"]:
@@ -340,7 +345,7 @@ def test_recall_get_renders_one_document_capped_at_the_prompt_budget(home, tmp_p
     assert text.count(MARKER) == 1
     assert 1000 < len(text.split("\n", 2)[2]) and len(text) <= 3000
     assert result["structuredContent"] == {"id": doc_id, "kind": "approved_memory", "trust": "user_approved",
-                                           "project": None}
+                                           "project": None, "context": text}
 
 
 def test_recall_get_survives_a_forged_line_escaped_after_excerpting(home, tmp_path):
@@ -408,7 +413,7 @@ def test_memory_index_renders_memory_md_from_the_database_with_the_topic_count(h
     assert len(rest.split("\n", 2)[2]) > 1000
     assert "topic-39.md" in rest
     assert len(rest) <= config.recall_settings().session_start_budget_codepoints
-    assert result["structuredContent"] == {"id": INDEX_ID, "other_approved_memory_count": 2}
+    assert result["structuredContent"] == {"id": INDEX_ID, "other_approved_memory_count": 2, "context": rest}
 
 
 def test_memory_index_counts_only_documents_recall_may_serve(home, tmp_path):
@@ -424,7 +429,7 @@ def test_memory_index_without_an_index_document(home, tmp_path):
     result = _tool(_config(tmp_path), db, "memory_index")
     assert result["isError"] is False
     assert MARKER not in _text(result) and "No MEMORY.md" in _text(result)
-    assert result["structuredContent"] == {"id": None, "other_approved_memory_count": 2}
+    assert result["structuredContent"] == {"id": None, "other_approved_memory_count": 2, "context": ""}
 
 
 # --- arguments ---------------------------------------------------------------------------------------
@@ -870,3 +875,225 @@ def test_dream_mcp_serve_with_a_broken_configuration_still_speaks_json_rpc(home,
     assert [response["id"] for response in responses] == [1, 2]
     assert responses[1]["result"]["isError"] is True
     assert "configuration" in responses[1]["result"]["content"][0]["text"]
+
+
+
+# --- review hardening ------------------------------------------------------------------------------
+
+
+def _diagnostic_lines(home):
+    path = home / ".cache" / "dream" / "recall-diagnostics.jsonl"
+    return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+
+@pytest.mark.parametrize("failure", ["scrubber", "home"])
+def test_the_loop_survives_a_failing_scrubber_or_home_lookup(home, tmp_path, monkeypatch, failure):
+    _memory, db = _store(home, _FILES)
+    config = _config(tmp_path)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("Could not determine home directory.")
+
+    if failure == "scrubber":
+        monkeypatch.setattr(mcp_server, "scrub_text", boom)
+    else:
+        monkeypatch.setattr(Path, "home", classmethod(boom))
+    responses = _session(config, db, b"{bad", _request(1, "ping"), _call(2, "recall_search", {"query": "postgres"}),
+                         _request(3, "no/such"), _request(4, "ping"))
+    assert [response["id"] for response in responses] == [None, 1, 2, 3, 4]
+    assert _error_code(responses[0]) == -32700 and _error_code(responses[3]) == -32601
+    assert responses[1]["result"] == {} and responses[4]["result"] == {}
+    assert responses[2]["result"]["isError"] is (failure == "home")
+    if failure == "scrubber":
+        assert responses[0]["error"]["message"] == "details withheld"
+
+
+def test_a_line_whose_handling_fails_gets_a_fixed_internal_error(home, tmp_path, monkeypatch):
+    original = mcp_server._handle_line
+
+    def flaky(session, line):
+        if b"explode" in line:
+            raise RuntimeError("unexpected")
+        return original(session, line)
+
+    monkeypatch.setattr(mcp_server, "_handle_line", flaky)
+    responses = _session(_config(tmp_path), home / "absent.db", _request("explode", "ping"), _request(2, "ping"))
+    assert responses[0] == {"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": "Internal error"}}
+    assert responses[1] == {"jsonrpc": "2.0", "id": 2, "result": {}}
+
+
+@pytest.mark.parametrize("name, arguments", [
+    ("recall_get", {"id": "\udc80"}),
+    ("recall_search", {"query": "post\udc80gres"}),
+    ("recall_search", {"query": "postgres", "project": "\ud800"}),
+    ("recall_search", {"query": "postgres", "kinds": ["approved_memory\udc80"]}),
+])
+def test_lone_surrogates_are_invalid_params(home, tmp_path, name, arguments):
+    _memory, db = _store(home, _FILES)
+    response = _one(_config(tmp_path), db, _call(1, name, arguments))
+    assert _error_code(response) == -32602 and "valid Unicode text" in response["error"]["message"]
+    assert _diagnostic_lines(home) == []
+
+
+def test_diagnostics_are_appended_once_per_tool_and_error_in_a_session(home, tmp_path, monkeypatch):
+    _memory, db = _store(home, _FILES)
+    config = _config(tmp_path)
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(mcp_server, "recall_for_agent", explode)
+    monkeypatch.setattr(mcp_server, "document_for_agent", explode)
+    responses = _session(config, db, *[_call(index, "recall_search", {"query": "postgres"}) for index in range(3)],
+                         _call(3, "recall_get", {"id": "x"}), _call(4, "recall_get", {"id": "y"}))
+    assert all(response["result"]["isError"] for response in responses)
+    records = [json.loads(line) for line in _diagnostic_lines(home)]
+    assert [(record["tool"], record["error"]) for record in records] == [
+        ("recall_search", "RuntimeError"), ("recall_get", "RuntimeError")]
+    _session(config, db, _call(5, "recall_search", {"query": "postgres"}))
+    assert len(_diagnostic_lines(home)) == 3  # Once per session, not once ever.
+
+
+def test_an_active_wal_is_reported_without_diagnostics(home, tmp_path):
+    _memory, db = _store(home, _FILES)
+    db.with_name("dream.db-wal").write_bytes(b"pending writer frames")
+    calls = [_call(index, name, arguments) for index, (name, arguments) in enumerate(
+        [("recall_search", {"query": "postgres"}), ("recall_get", {"id": "x"}), ("memory_index", {})] * 2)]
+    responses = _session(_config(tmp_path), db, *calls)
+    assert len(responses) == 6
+    for response in responses:
+        assert response["result"]["isError"] is True and "active WAL" in _text(response["result"])
+    assert _diagnostic_lines(home) == [] and not (home / ".cache").exists()
+
+
+def test_recall_search_respects_the_embedder_calibration_gate(home, tmp_path, embedding_server):
+    from dream import open_db
+    from recall_documents import embed_recall_documents
+    _memory, db = _store(home, _ENGLISH)
+    conn = open_db(db)
+    assert embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False).error is None
+    conn.close()
+    config = _cli_config(tmp_path, embedding_server.url)
+    for fingerprint, requests, mode, fallback in (
+            (None, 0, "lexical", "embedder-uncalibrated"),
+            ("openai-compatible:another-model:8", 0, "lexical", "embedder-calibration-stale"),
+            (FINGERPRINT, 1, "lexical_plus_embedder", None)):
+        if fingerprint is not None:
+            conn = open_db(db)
+            calibrate_embedder_mode(conn, fingerprint=fingerprint)
+            conn.close()
+        embedding_server.requests.clear()
+        result = _tool(config, db, "recall_search", {"query": "jaka baza danych"})
+        structured = result["structuredContent"]
+        assert result["isError"] is False
+        assert len(embedding_server.requests) == requests
+        assert (structured["mode"], structured["fallback_reason"]) == (mode, fallback)
+    assert embedding_server.posted_inputs() == ["jaka baza danych"]
+    assert structured["results"] and "PostgreSQL" in structured["context"] and structured["context"].startswith(MARKER)
+
+
+def test_constitution_rows_are_refused_like_unknown_ids(home, tmp_path):
+    from dream import open_db
+    _memory, db = _store(home, {"MEMORY.md": _MEMORY_MD, **_FILES})
+    config = _config(tmp_path)
+    constitution = config.data["character"]["constitution_path"]
+    text = "Postgres constitution rule: never share the store."
+    conn = open_db(db)
+    for doc_id, source_path, kind in (("const-configured", constitution, "approved_memory"),
+                                      ("const-absolute", str(Path(constitution).expanduser()), "distilled_summary")):
+        conn.execute(
+            "INSERT INTO recall_documents(id, content_sha256, source_kind, trust_level, project_slug, source_path, "
+            "source_updated_at, indexed_at, source_version, text) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, 'v1', ?)",
+            (doc_id, hashlib.sha256(text.encode("utf-8")).hexdigest(), kind, "user_approved", source_path,
+             "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z", text))
+    conn.commit()
+    conn.close()
+    unknown = _text(_tool(config, db, "recall_get", {"id": "no-such-document"}))
+    for doc_id in ("const-configured", "const-absolute"):
+        result = _tool(config, db, "recall_get", {"id": doc_id})
+        assert result["isError"] is True and _text(result) == unknown
+    index = _tool(config, db, "memory_index")
+    assert index["structuredContent"]["other_approved_memory_count"] == 2
+    assert "constitution rule" not in _text(index)
+    search = _tool(config, db, "recall_search", {"query": "postgres constitution rule"})
+    assert {row["id"] for row in search["structuredContent"]["results"]}.isdisjoint({"const-configured", "const-absolute"})
+    assert "constitution rule" not in _text(search)
+
+
+def test_one_live_session_crosses_a_real_writer_and_its_wal(home, tmp_path):
+    """ok, then a tool error while the writer holds an active WAL, then the new row after its checkpoint."""
+    import threading
+    from dream import open_db
+    _memory, db = _store(home, _FILES)
+    read_fd, write_fd = os.pipe()
+    out_read, out_write = os.pipe()
+    stdin = os.fdopen(read_fd, "rb", buffering=0)
+    stdout = os.fdopen(out_write, "wb", buffering=0)
+    feed = os.fdopen(write_fd, "wb", buffering=0)
+    replies = os.fdopen(out_read, "rb")
+    thread = threading.Thread(target=serve, args=(stdin, stdout, _config(tmp_path)), kwargs={"db_path": db})
+    thread.start()
+
+    def ask(request_id):
+        feed.write(_encode(_call(request_id, "recall_search", {"query": "orchid rollout"})) + b"\n")
+        return json.loads(replies.readline())["result"]
+
+    writer = None
+    try:
+        assert ask(1)["structuredContent"]["results"] == []
+        writer = open_db(db)
+        _insert(writer, "summary-orchid", "The orchid rollout ships behind a feature flag.")
+        writer.commit()
+        assert db.with_name("dream.db-wal").stat().st_size > 0
+        busy = ask(2)
+        assert busy["isError"] is True and "active WAL" in _text(busy)
+        writer.close()
+        writer = None
+        assert not db.with_name("dream.db-wal").exists()
+        assert [row["id"] for row in ask(3)["structuredContent"]["results"]] == ["summary-orchid"]
+    finally:
+        if writer is not None:
+            writer.close()
+        feed.close()
+        thread.join(timeout=30)
+        stdout.close()
+        replies.close()
+        stdin.close()
+    assert not thread.is_alive()
+    assert _diagnostic_lines(home) == []
+
+
+def test_a_closed_stdout_ends_the_process_with_exit_zero_and_no_noise(home, tmp_path):
+    import time
+    env = {key: value for key, value in os.environ.items()
+           if key not in {"CODEX_HOME", "XDG_CONFIG_HOME", "OPENCODE_CONFIG", "DREAM_CONFIG", "CLAUDE_DREAM_DB"}}
+    env.update(HOME=str(home), PYTHONDONTWRITEBYTECODE="1")
+    process = subprocess.Popen(
+        [sys.executable, str(DREAM_PY), "--config", str(tmp_path / "none.toml"), "--db", str(home / "absent.db"),
+         "mcp", "serve"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=tmp_path / "work",
+    )
+    try:
+        process.stdin.write(_encode(_request(1, "ping")) + b"\n")
+        process.stdin.flush()
+        assert json.loads(process.stdout.readline())["result"] == {}
+        process.stdout.close()
+        try:
+            for index in range(2, 400):
+                process.stdin.write(_encode(_request(index, "tools/list")) + b"\n")
+                process.stdin.flush()
+                time.sleep(0.005)
+        except BrokenPipeError:
+            pass
+        try:
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
+        returncode = process.wait(timeout=30)
+        stderr = process.stderr.read()
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.stderr.close()
+    assert returncode == 0
+    assert b"Exception ignored" not in stderr and b"Traceback" not in stderr

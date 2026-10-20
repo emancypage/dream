@@ -10,7 +10,9 @@ The server runs inside an agent's sandbox, so it is read-only: every tool
 call opens the database with ``open_db_readonly`` and closes it before
 replying, and nothing is written on a successful call (no database rows, hook
 markers, embedding cache or files). A failed tool call may append one bounded
-diagnostic to ``recall.diagnostic_path``; a failed append is ignored. Every
+diagnostic to ``recall.diagnostic_path``, at most once per tool and error in a
+session and never for a busy database (an active WAL); a failed append is
+ignored. Every
 tool output that carries memory text comes from the recall renderer, so it has
 the untrusted-reference marker, the provenance line and the scrubber.
 
@@ -21,7 +23,9 @@ exception -32603 with a bounded message. A tool that cannot answer (database
 missing or busy, schema not migrated, unknown or excluded ID) returns a normal
 result with ``isError: true``. Batches are refused because MCP 2025-06-18
 removed them and no supported client sends them. stdout carries only JSON-RPC
-messages: tool code runs with ``sys.stdout`` redirected to stderr.
+messages: tool code runs with ``sys.stdout`` redirected to stderr, and a line
+whose handling fails unexpectedly still gets a fixed -32603 reply. When the
+client closes stdout the server exits 0 quietly.
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ import json
 import os
 import sqlite3
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from recall_context import (
@@ -152,12 +156,34 @@ class _Session:
     db_path: Path | None
     config_error: str | None
     protocol_version: str = PROTOCOL_VERSIONS[0]
+    diagnosed: set = field(default_factory=set)
+
+
+# Written when handling a line fails in a way no other reply survives.
+_INTERNAL_ERROR_LINE = '{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error"}}\n'
 
 
 def _bounded(text: str, limit: int = _ERROR_TEXT_CODEPOINTS) -> str:
-    """Scrubbed, single-line and at most ``limit`` code points."""
-    value = " ".join(scrub_text(str(text), Path.home()).split())
+    """Scrubbed, single-line and at most ``limit`` code points; never raises.
+
+    The home directory comes from ``os.path.expanduser``, which falls back to
+    "~" instead of raising when there is no home; a scrubber failure withholds
+    the text rather than sending it unscrubbed.
+    """
+    try:
+        value = " ".join(scrub_text(str(text), Path(os.path.expanduser("~"))).split())
+    except Exception:
+        return "details withheld"
     return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def _encodable(value: str) -> bool:
+    """False for text with lone surrogates, which UTF-8 (and SQLite) cannot carry."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 # --- line transport -----------------------------------------------------------------------------
@@ -315,9 +341,10 @@ def _tools_call(session: _Session, params: dict) -> dict:
 
 
 def _diagnose(session: _Session, tool: str, error: str | None) -> None:
-    """Best effort: a sandbox that forbids the append changes nothing."""
-    if session.config is None or error is None:
+    """Best effort, once per tool and error in a session: a sandbox that forbids the append changes nothing."""
+    if session.config is None or error is None or (tool, error) in session.diagnosed:
         return
+    session.diagnosed.add((tool, error))
     try:
         append_diagnostic(session.config.recall_settings(), {"event": "mcp", "tool": tool, "error": _bounded(error, 200)})
     except Exception:
@@ -342,6 +369,8 @@ def _string(arguments: dict, key: str, limit: int, *, required: bool) -> str | N
         return None
     if not isinstance(value, str) or (required and not value.strip()):
         raise InvalidParams(f"{key} must be a non-empty string")
+    if not _encodable(value):
+        raise InvalidParams(f"{key} must be valid Unicode text")
     if len(value) > limit:
         raise InvalidParams(f"{key} is longer than {limit} characters")
     return value
@@ -363,7 +392,9 @@ def _readonly(session: _Session):
     try:
         conn = open_db_readonly(path)
     except sqlite3.Error as exc:
-        raise ToolFailure(f"database unavailable ({exc})", diagnostic=type(exc).__name__) from exc
+        # An active WAL means the nightly writer is busy: expected and brief, so no diagnostic.
+        busy = "active WAL" in str(exc)
+        raise ToolFailure(f"database unavailable ({exc})", diagnostic=None if busy else type(exc).__name__) from exc
     try:
         yield conn
     except sqlite3.Error as exc:
@@ -393,6 +424,8 @@ def _recall_search(session: _Session, arguments: dict):
     kinds = arguments.get("kinds")
     if kinds is not None and (not isinstance(kinds, list) or not all(isinstance(kind, str) for kind in kinds)):
         raise InvalidParams("kinds must be a list of kind names")
+    if kinds is not None and not all(_encodable(kind) for kind in kinds):
+        raise InvalidParams("kinds must be valid Unicode text")
     limit = arguments.get("limit", 5)
     if isinstance(limit, bool) or not isinstance(limit, int):
         raise InvalidParams("limit must be an integer")
@@ -418,6 +451,7 @@ def _recall_search(session: _Session, arguments: dict):
         "mode": result.mode,
         "calibration_version": result.calibration_version,
         "fallback_reason": result.diagnostics.fallback_reason or ("embedder-misconfigured" if problem else None),
+        "context": result.rendered_context,
     }
     return result.rendered_context or "No approved memory matched this query.", structured
 
@@ -455,7 +489,7 @@ def _recall_get(session: _Session, arguments: dict):
         raise ToolFailure("document has no text that fits the prompt budget")
     document = candidate.document
     return rendered, {"id": document.id, "kind": document.source_kind, "trust": document.trust_level,
-                      "project": document.project_slug}
+                      "project": document.project_slug, "context": rendered}
 
 
 def _memory_index(session: _Session, arguments: dict):
@@ -469,7 +503,8 @@ def _memory_index(session: _Session, arguments: dict):
     noun = "document" if others == 1 else "documents"
     summary = f"Dream memory index: {others} other approved memory {noun} in the recall store."
     body = rendered or "No MEMORY.md index document is in the recall store."
-    return f"{summary}\n\n{body}", {"id": index.document.id if rendered else None, "other_approved_memory_count": others}
+    return f"{summary}\n\n{body}", {"id": index.document.id if rendered else None, "other_approved_memory_count": others,
+                                     "context": rendered}
 
 
 # --- loop --------------------------------------------------------------------------------------------
@@ -494,13 +529,33 @@ def serve(stdin, stdout, config, *, db_path=None, config_error: str | None = Non
             return 0
         if line is None:
             return 0
-        if line is _OVERSIZED:
-            reply = _encode(_error(None, PARSE_ERROR, "Parse error: line exceeds 1 MiB"))
-        else:
-            reply = _handle_line(session, line)
+        try:
+            if line is _OVERSIZED:
+                reply = _encode(_error(None, PARSE_ERROR, "Parse error: line exceeds 1 MiB"))
+            else:
+                reply = _handle_line(session, line)
+        except Exception:
+            reply = _INTERNAL_ERROR_LINE
         if reply is None:
             continue
         try:
             _write(writer, reply)
         except (OSError, ValueError):
+            _silence(writer)
             return 0
+
+
+def _silence(writer) -> None:
+    """Point a closed stdout at /dev/null, so the interpreter's final flush cannot fail at exit."""
+    try:
+        fd = writer.fileno()
+    except (OSError, ValueError, AttributeError):
+        return
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, fd)
+        finally:
+            os.close(devnull)
+    except OSError:
+        pass
