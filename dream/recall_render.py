@@ -92,14 +92,17 @@ def render_context(candidates, budget_codepoints: int, query_text: str, *, excer
 
 
 def _render_blocks(candidates, budget_codepoints: int, query_text: str, *,
-                   excerpt_codepoints: int = 1000) -> tuple[str, list]:
+                   excerpt_codepoints: int = 1000, excerpt_cache: dict | None = None) -> tuple[str, list]:
     """Render greedily in rank order: ``(text, kept)``, where ``kept`` lists the rendered candidates.
 
     A block that does not fit is skipped and a later, smaller one may still
     fit, so ``kept`` is not always a prefix of ``candidates``.
     ``excerpt_codepoints`` caps each excerpt; the default 1,000 is what hooks
     and ``dream recall`` use. The MCP tools ``recall_get`` and ``memory_index``
-    raise it to show one whole document.
+    raise it to show one whole document. ``excerpt_cache`` lets a caller
+    that renders many selections of the same candidates for one query (the
+    calibration sweep) reuse each excerpt; it is keyed by document ID and cap,
+    so one cache must only ever serve one query text.
     """
     if budget_codepoints <= 0:
         return "", []
@@ -122,8 +125,13 @@ def _render_blocks(candidates, budget_codepoints: int, query_text: str, *,
         # again after it, because a chunk the excerpt puts first starts a line.
         # Each escape adds one code point. The total budget check runs after
         # escaping, so an over-budget block is dropped, never truncated.
-        source_text = neutralize_forged_headers(candidate.scrubbed_excerpt or doc.text)
-        excerpt = neutralize_forged_headers(make_excerpt(source_text, query_text, min(excerpt_codepoints, remaining)))
+        cap = min(excerpt_codepoints, remaining)
+        excerpt = excerpt_cache.get((doc.id, cap)) if excerpt_cache is not None else None
+        if excerpt is None:
+            source_text = neutralize_forged_headers(candidate.scrubbed_excerpt or doc.text)
+            excerpt = neutralize_forged_headers(make_excerpt(source_text, query_text, cap))
+            if excerpt_cache is not None:
+                excerpt_cache[(doc.id, cap)] = excerpt
         block = header + excerpt
         if not excerpt or used + (2 if blocks else 0) + len(block) > budget_codepoints:
             continue

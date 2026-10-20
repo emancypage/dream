@@ -573,3 +573,76 @@ def test_calibration_scores_delivered_context_and_that_changes_the_threshold():
     # threshold that drops Q2's irrelevant document wins: the middle of (0.35, 0.5].
     assert threshold == pytest.approx(0.425)
     assert key[:3] == (0.5, 0.5, 0.5)
+
+
+def _long_topic_fixture(tmp_path, queries, documents):
+    """The eval-build shape with realistic ~1,700-character documents."""
+    import random
+    rng = random.Random(3)
+    words = ["alpha", "beta", "gamma", "delta", "omega", "runbook", "checklist"]
+    docs, items = [], []
+    for index in range(documents):
+        english, _polish = _TOPICS[index % len(_TOPICS)]
+        docs.append({"id": f"doc-{index}", "source_kind": "approved_memory", "trust_level": "user_approved", "project_slug": None,
+                     "source_path": f"t{index}.md", "source_updated_at": f"2026-01-{1 + index % 28:02d}T00:00:00Z",
+                     "source_version": "v1", "text": f"Note {index}: we use {english}. " + " ".join(rng.choice(words) for _ in range(250))})
+    for number in range(queries):
+        index = rng.randrange(documents)
+        english, polish = _TOPICS[index % len(_TOPICS)]
+        language = "pl" if number % 2 else "en"
+        items.append({"id": f"q{number}", "event": "prompt", "query": (polish if language == "pl" else english) + f" pytanie {number}",
+                      "language": language, "expected_ids": [f"doc-{index}"], "forbidden": [f"doc-{(index + 1) % documents}"] if number % 7 == 0 else []})
+    fixture = tmp_path / f"long-{queries}x{documents}.json"
+    fixture.write_text(json.dumps({"documents": docs, "queries": items}), encoding="utf-8")
+    return fixture, docs, items
+
+
+def test_rendering_each_query_once_equals_the_per_cut_loop_on_long_documents(tmp_path, monkeypatch):
+    from dream import _open_ephemeral_eval_db
+    import recall_eval
+    fixture, docs, items = _long_topic_fixture(tmp_path, queries=12, documents=30)
+    conn = _open_ephemeral_eval_db()
+    recall_eval._ensure_documents(conn, docs)
+    embedder = TopicEmbedder()
+    recall_eval._embed_fixture_documents(conn, embedder, _settings())
+    run_settings = recall_eval._embedder_settings(_settings())
+    fast_paths = 0
+    for item in items:
+        query = recall_eval._query(item, _settings())
+        outcome = recall_eval.retrieve(conn, query, run_settings, {}, embedder=embedder, require_calibration=False)
+        ordered = all(left.score >= right.score for left, right in zip(outcome.candidates, outcome.candidates[1:]))
+        fast_paths += ordered and outcome.mode == "lexical_plus_embedder"
+        assert len(outcome.candidates) == 30
+        fast = recall_eval._query_cuts(item, query, outcome, run_settings, "lexical_plus_embedder")
+        slow = recall_eval._query_cuts_per_cut(item, query, outcome, run_settings, "lexical_plus_embedder")
+        assert fast == slow
+    assert fast_paths == len(items)
+    # The whole calibration picks the same threshold either way.
+    fast_record = calibrate_fixture_file(fixture, _open_ephemeral_eval_db(), "lexical_plus_embedder", embedder=TopicEmbedder())
+    monkeypatch.setattr(recall_eval, "_query_cuts", recall_eval._query_cuts_per_cut)
+    slow_record = calibrate_fixture_file(fixture, _open_ephemeral_eval_db(), "lexical_plus_embedder", embedder=TopicEmbedder())
+    assert fast_record.threshold == slow_record.threshold
+    assert fast_record.calibration_version == slow_record.calibration_version
+
+
+def test_embedder_calibration_on_long_documents_stays_fast(tmp_path, assert_latency):
+    import time
+    from dream import _open_ephemeral_eval_db
+    fixture, _docs, _items = _long_topic_fixture(tmp_path, queries=100, documents=100)
+    started = time.perf_counter()
+    record = calibrate_fixture_file(fixture, _open_ephemeral_eval_db(), "lexical_plus_embedder", embedder=TopicEmbedder())
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    assert record.threshold > 0
+    # Rendering once per cut took about 46 s at this shape; one render per query keeps it to seconds.
+    assert_latency("embedder calibration 100x100 long documents", elapsed_ms, 6000)
+
+
+def test_an_excerpt_cache_never_changes_what_renders():
+    from recall_render import _render_blocks
+    candidates = [_stub_candidate(f"c{index}", 0.5, long=index % 2 == 0) for index in range(7)]
+    cache: dict = {}
+    for size in range(1, len(candidates) + 1):
+        for start in range(len(candidates) - size + 1):
+            selection = candidates[start:start + size]
+            assert _render_blocks(selection, 4000, "note", excerpt_cache=cache) == _render_blocks(selection, 4000, "note")
+    assert cache

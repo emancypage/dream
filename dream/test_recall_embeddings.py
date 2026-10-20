@@ -307,3 +307,25 @@ def test_dense_scan_drops_excluded_and_ineligible_documents_before_the_limit(tmp
     found = dense_candidates(conn, [1.0, 0.0, 0.0], FINGERPRINT, KINDS, limit=2, eligible=eligible)
     assert [doc_id for doc_id, _ in found] == ["c", "d"]
     assert asked and asked[0][:2] == ["a", "b"]
+
+
+def test_dense_eligibility_is_checked_in_bounded_chunks(tmp_path):
+    import recall_embeddings
+    conn = _db(tmp_path)
+    for index in range(450):
+        _doc(conn, f"d{index:03d}")
+        store_vector(conn, f"d{index:03d}", f"sha-d{index:03d}", FINGERPRINT, [1.0, index / 1000.0, 0.0])
+    conn.commit()
+    sizes = []
+
+    def eligible(ids):
+        sizes.append(len(ids))
+        return {doc_id for doc_id in ids if int(doc_id[1:]) % 3 == 0}
+
+    found = dense_candidates(conn, [1.0, 0.0, 0.0], FINGERPRINT, KINDS, limit=100, eligible=eligible)
+    assert len(found) == 100 and all(int(doc_id[1:]) % 3 == 0 for doc_id, _ in found)
+    assert sizes and max(sizes) <= recall_embeddings._ELIGIBILITY_CHUNK
+    # A limit above the chunk still walks in bounded chunks until it has enough.
+    sizes.clear()
+    found = dense_candidates(conn, [1.0, 0.0, 0.0], FINGERPRINT, KINDS, limit=1000, eligible=eligible)
+    assert len(found) == 150 and max(sizes) <= recall_embeddings._ELIGIBILITY_CHUNK and len(sizes) == 3

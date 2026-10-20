@@ -184,9 +184,10 @@ def dense_candidates(conn, query_vector, fingerprint: str, allowed_kinds, limit:
     if eligible is None:
         return scored[:limit]
     kept: list[tuple[str, float]] = []
-    chunk = max(limit, _ELIGIBILITY_CHUNK)
-    for start in range(0, len(scored), chunk):
-        part = scored[start:start + chunk]
+    # A bounded chunk keeps every eligibility query far below SQLite's
+    # variable limit; the loop continues until ``limit`` IDs are eligible.
+    for start in range(0, len(scored), _ELIGIBILITY_CHUNK):
+        part = scored[start:start + _ELIGIBILITY_CHUNK]
         allowed = eligible([document_id for document_id, _cosine in part])
         kept.extend(item for item in part if item[0] in allowed)
         if len(kept) >= limit:

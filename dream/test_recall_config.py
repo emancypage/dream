@@ -237,6 +237,8 @@ def test_openai_compatible_embedder_keys_are_applied(tmp_path):
         ("timeout_seconds = nan", "recall.embedder.timeout_seconds"),
         ("timeout_seconds = 3.5", "recall.embedder.timeout_seconds"),
         ("dense_candidates = 0", "recall.embedder.dense_candidates"),
+        ("dense_candidates = 2001", "recall.embedder.dense_candidates"),
+        ("dense_candidates = 40000", "recall.embedder.dense_candidates"),
         ('api_key_env = "not a name"', "recall.embedder.api_key_env"),
     ],
 )
@@ -256,3 +258,9 @@ def test_error_messages_never_echo_the_configured_url(tmp_path):
 def test_reranker_does_not_accept_embedder_connection_keys(tmp_path):
     config = load_config(_write(tmp_path, '[recall.reranker]\nbase_url = "http://127.0.0.1:8081"\n'))
     assert any("unknown recall.reranker options: base_url" in error for error in config.optional_config_errors)
+
+
+def test_dense_candidates_accepts_its_upper_bound(tmp_path):
+    config = load_config(_write(tmp_path, '[recall.embedder]\nenabled = true\ntype = "openai-compatible"\ndense_candidates = 2000\n'))
+    assert config.optional_config_errors == ()
+    assert config.recall_settings().embedder.dense_candidates == 2000

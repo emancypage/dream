@@ -308,31 +308,60 @@ class _Cut:
     forbidden: int
 
 
+def _cut_row(ids: list[str], relevant: set, forbidden: set) -> _Cut:
+    ranks = _ranks(ids, relevant)
+    return _Cut(min(ranks) if ranks else None,
+                len(relevant.intersection(ids)) / len(ids) if ids else 0.0,
+                len(forbidden.intersection(ids)))
+
+
 def _query_cuts(item: dict, query: RecallQuery, outcome, settings: RecallSettings, mode: str) -> tuple[list[float], list[_Cut]]:
     """Delivered-context evidence of one retrieved query for each distinct score cut.
 
     A threshold ``t`` keeps the candidates scoring at least ``t``, so the
     query has one selection per distinct candidate score plus "nothing
-    passes". Ranking ran once; selection and the one-pass ``_render_blocks``
-    rerun per cut, and only the candidates whose block fits the budget count.
-    Identical selections are rendered once.
+    passes", and only the candidates whose block fits the budget count.
+    When the threshold applies and the candidates are in descending score
+    order (every fused or rescored ranking), the candidates passing ``t``
+    are a prefix, and selection and the one-pass ``_render_blocks`` are both
+    greedy in rank order: selecting and rendering once without a threshold,
+    then keeping the delivered candidates scoring at least ``t``, is exact.
+    Any other ranking (the lexical prompt path sorts FTS rank first) reruns
+    selection per cut in ``_query_cuts_per_cut``.
+    """
+    candidates = outcome.candidates
+    threshold_applies = outcome.mode == mode and not query.hook_event.startswith("session-start")
+    if not threshold_applies or any(left.score < right.score for left, right in zip(candidates, candidates[1:])):
+        return _query_cuts_per_cut(item, query, outcome, settings, mode)
+    cuts = sorted({candidate.score for candidate in candidates})
+    relevant = _relevant(item)
+    forbidden = set(item.get("forbidden", ()))
+    selected = select_recall_candidates(candidates, query, settings, {}, mode=outcome.mode, threshold=None)
+    _text, delivered = _render_blocks(selected, query.requested_codepoint_budget, query.query_text)
+    return cuts, [_cut_row([candidate.document.id for candidate in delivered if candidate.score >= value], relevant, forbidden)
+                  for value in [*cuts, float("inf")]]
+
+
+def _query_cuts_per_cut(item: dict, query: RecallQuery, outcome, settings: RecallSettings, mode: str) -> tuple[list[float], list[_Cut]]:
+    """``_query_cuts`` for any ranking: selection reruns per cut.
+
+    Identical selections render once, and every render of this query shares
+    one excerpt cache, so each document's excerpt is built once per cap.
     """
     cuts = sorted({candidate.score for candidate in outcome.candidates})
     relevant = _relevant(item)
     forbidden = set(item.get("forbidden", ()))
     rendered: dict[tuple[str, ...], list[str]] = {}
+    excerpts: dict = {}
     rows: list[_Cut] = []
     for value in [*cuts, float("inf")]:
         selected = select_recall_candidates(outcome.candidates, query, settings, {mode: {"threshold": value}}, mode=outcome.mode)
         selection = tuple(candidate.document.id for candidate in selected)
         if selection not in rendered:
-            _text, delivered = _render_blocks(selected, query.requested_codepoint_budget, query.query_text)
+            _text, delivered = _render_blocks(selected, query.requested_codepoint_budget, query.query_text,
+                                              excerpt_cache=excerpts)
             rendered[selection] = [candidate.document.id for candidate in delivered]
-        ids = rendered[selection]
-        ranks = _ranks(ids, relevant)
-        rows.append(_Cut(min(ranks) if ranks else None,
-                         len(relevant.intersection(ids)) / len(ids) if ids else 0.0,
-                         len(forbidden.intersection(ids))))
+        rows.append(_cut_row(rendered[selection], relevant, forbidden))
     return cuts, rows
 
 
