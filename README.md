@@ -118,16 +118,16 @@ threshold for the current model and dimension.
 
 ## Privacy and data flow
 
-- **Local reads.** `dream ingest` and `dream search` read only local transcript stores (by default Codex JSONL under `~/.codex/sessions` and Open Code SQLite at `~/.local/share/opencode/opencode.db`) and the local Dream SQLite database. They never transmit anything.
+- **Local reads.** `dream ingest` and `dream search` read only local transcript stores (by default Codex JSONL under `~/.codex/sessions` and Open Code SQLite at `~/.local/share/opencode/opencode.db`) and the local Dream SQLite database. By default they make no network or model calls. When `[recall.embedder]` is enabled, `dream ingest` (like `dream embed`, `dream recall-eval` and `dream recall-calibrate --mode lexical_plus_embedder`) also sends scrubbed document text to the configured embedding server, loopback only unless `remote_data_egress = true`; `dream search` never transmits anything.
 - **Model calls send content.** The `distill` and `consolidate` stages send selected session content to the model provider configured for that stage — by default the Codex CLI against your ChatGPT subscription. Distillation sends the filtered transcript of a session; consolidation sends the distilled notes plus the current memory store. The review stage uses its configured provider and sends pending suggestions plus bounded target context.
-- **Local embedder (off by default).** With `[recall.embedder]` enabled, `dream ingest` and `dream embed` send the scrubbed text of approved memories and distilled summaries (raw transcripts only with `recall.allow_raw_transcript_prompt = true`) to the embedding server, and prompt hooks and agent queries send the scrubbed query. Only loopback URLs are accepted unless `remote_data_egress = true`. Vectors stay in the local database.
-- **Local generation provider.** A stage routed to an `openai-compatible` provider sends that stage's prompt to its `base_url`, again loopback only unless `remote_data_egress = true`.
+- **Local embedder (off by default).** With `[recall.embedder]` enabled, `dream ingest` and `dream embed` send the scrubbed text of approved memories and distilled summaries (raw transcripts only with `recall.allow_raw_transcript_prompt = true`) to the embedding server, and prompt hooks and agent queries send the scrubbed query. `dream recall-eval` and `dream recall-calibrate --mode lexical_plus_embedder` send the scrubbed text of every fixture document and query, which for the private fixture are copies of your memories. Only loopback URLs are accepted unless `remote_data_egress = true`. Vectors stay in the local database.
+- **Local generation provider.** A stage routed to an `openai-compatible` provider sends that stage's prompt to its `base_url`, again loopback only unless `remote_data_egress = true`. For `distill` that prompt holds the filtered session text.
 - **Private eval fixture.** `dream eval-build` sends sampled approved memories and summaries, with the retention policy, to the configured `distill` provider to write test questions, and stores copies of those memories in `~/.config/dream/eval/private.json` (file mode 0600, directory 0700), outside the repository. `.gitignore` also excludes `dream/fixtures/private*`. `dream recall-calibrate` refuses public fixtures and anything under `dream/fixtures/`, evaluates on an in-memory copy, and writes to the live database only with `--apply`.
 - **Weekly audit and subset mode.** `dream audit` sends every topic file, in chunks of at most 200,000 characters (a larger file gets a chunk of its own), with the `MEMORY.md` index and per-file usage annotations, to the `audit` stage provider. Subset consolidation sends `MEMORY.md`, the remaining index lines and the related topic files (at most `subset_files`, plus files a finding names) instead of the whole store.
 - **Recall usage.** `dream ingest` counts which documents the hooks selected, from hook markers older than 24 hours, into the local `recall_usage` table and deletes those markers. `dream recall` and agent queries are never counted. Usage only annotates and breaks ties; it never deletes anything.
 - **Everything else stays local.** The SQLite database (`~/.claude/dream.db` by default), suggestion previews (`.suggestions/`), and the memory store remain on your machine.
 - **Check your configuration first.** Before the first run, review the `[[sources]]` roots and the `[stages.*]`/`[providers.*]` entries in `~/.config/dream/config.toml` so you know which transcripts are read and where their content is sent.
-- **Local and external effects.** `estimate`, `search`, `status`, `preflight`, `context`, `recall`, `mcp serve`, and `suggestions list` only read the persistent local data. Automatic recall, `dream recall` and the MCP server open SQLite through an immutable read-only connection; the hooks' small deduplication markers live under `/tmp`, and `dream recall` and the MCP server leave none. `mcp install` and `mcp uninstall` edit one client's configuration file, with a backup. `ingest` reads transcripts and updates the local SQLite index without calling a model. `distill`, `consolidate`, and configured curation make model calls and write local results. Suggestion review commands update local review state; `accept`, `merge`, and configured apply operations can also update memory files, with backups before live-memory writes.
+- **Local and external effects.** `estimate`, `search`, `status`, `preflight`, `context`, `recall`, `mcp serve`, and `suggestions list` only read the persistent local data. Automatic recall, `dream recall` and the MCP server open SQLite through an immutable read-only connection; the hooks' small deduplication markers live under `/tmp`, and `dream recall` and the MCP server leave none. `mcp install` and `mcp uninstall` edit one client's configuration file, with a backup. `ingest` reads transcripts and updates the local SQLite index; by default it makes no network or model calls, and with `[recall.embedder]` enabled it sends scrubbed document text to the configured embedding server (loopback only unless `remote_data_egress = true`). `distill`, `consolidate`, and configured curation make model calls and write local results. Suggestion review commands update local review state; `accept`, `merge`, and configured apply operations can also update memory files, with backups before live-memory writes.
 - **Cost / subscription usage.** Each model call can incur cost or consume part of your subscription limit. `dream estimate -v` shows how many sessions a distillation run would cover before you run it.
 - **Consent.** Do not run `dream` on confidential transcripts unless you have consciously agreed to send their selected content to the configured provider.
 
@@ -192,11 +192,17 @@ pytest -q -p no:cacheprovider dream
 
 The suite is hermetic: it never invokes the Codex or Claude CLIs, requires no credentials, and makes no model calls.
 
-A few tests hold recall latency to budgets set for a developer machine (for
-example 150 ms at session start on 10,000 documents). They multiply each
-budget by `DREAM_PERF_BUDGET_SCALE`, which defaults to `3` when the `CI`
-environment variable is set and to `1` otherwise. Set it explicitly on a slow
-machine, for example `DREAM_PERF_BUDGET_SCALE=2 pytest -q -p no:cacheprovider dream`.
+Three latency tests carry the performance budgets: session-start recall p95
+at most 150 ms and prompt recall p95 at most 250 ms on 10,000 synthetic
+documents, and a dense scan p95 at most 400 ms over 5,000 vectors of 1,024
+dimensions. Those budgets at scale 1 are the acceptance gates. The tests
+multiply them by `DREAM_PERF_BUDGET_SCALE`, which defaults to `3` when the
+`CI` environment variable is set and to `1` otherwise; a larger scale is only
+a regression check for slow shared runners, never the acceptance budget. Each
+test prints `perf: <name> p95=<ms> budget=<ms> scale=<x>` and puts the measured
+p95 and the effective budget in its failure message, so
+`pytest -s -p no:cacheprovider dream -k "latency_budget or dense_scan_p95"` shows the raw
+numbers.
 
 ## Usage
 
@@ -336,10 +342,12 @@ reviewing the adapter's data-flow implications; Dream does not add a model packa
 or network dependency.
 
 On stores with more than about 500 eligible documents, session start
-deliberately considers only the FTS and dense matches plus the 500 most recent
+deliberately considers only the FTS matches plus the 500 most recent
 documents for structure and path evidence; smaller stores rank exactly as a
-full scan would. Excerpts are scrubbed only when they are read, and the
-synchronized `path_text` column holds each document's normalized path text.
+full scan would. Excerpts are scrubbed only when they are read. The
+synchronized `path_text` column holds a normalized copy of each document's
+project slug, source path and full body; like the `text` column it is not
+scrubbed.
 `dream/test_recall_query.py` holds the session-start path to 150 ms and the
 prompt path to 250 ms at p95 on a synthetic 10,000-document store, scaled on
 CI as described under Testing.

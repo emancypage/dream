@@ -1,4 +1,7 @@
+import os
 from pathlib import Path
+
+import pytest
 
 
 def test_recall_preflight_is_read_only(tmp_path):
@@ -258,3 +261,30 @@ def test_mcp_install_status_reads_client_configs_without_writing(tmp_path, monke
     assert ok and detail.startswith("installed for codex; opencode: ") and "not valid JSON" in detail
     assert detail.endswith(claude)
     assert {path: path.read_bytes() for path in home.rglob("*") if path.is_file()} == files
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores directory permissions")
+def test_preflight_survives_an_unreadable_client_config_directory(tmp_path, monkeypatch, capsys):
+    import argparse
+    import dream
+    from config import load_config
+    from recall_context import mcp_install_status
+
+    home = tmp_path / "home"
+    locked = home / ".config" / "opencode"
+    locked.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    for name in ("CODEX_HOME", "OPENCODE_CONFIG", "XDG_CONFIG_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    locked.chmod(0o000)
+    try:
+        ok, detail = mcp_install_status()
+        assert ok and detail.startswith("not installed for codex or opencode; opencode: ")
+        assert "Permission denied" in detail
+        rc = dream.cmd_preflight(argparse.Namespace(config=load_config(tmp_path / "config.toml"), db=tmp_path / "x.db"))
+    finally:
+        locked.chmod(0o700)
+    out = capsys.readouterr().out
+    assert "ok  recall.mcp: not installed for codex or opencode; opencode: " in out
+    assert "ok  consolidate.mode: full" in out
+    assert rc == 1  # the missing database still fails its own check

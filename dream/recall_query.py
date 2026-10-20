@@ -224,6 +224,11 @@ def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | N
         pool.update(dict.fromkeys(_recent_ids(conn, query, excluded, RECENT_POOL_SIZE)))
     all_docs, path_texts = _load_pool(conn, pool, stored=stored_path_text)
     by_id = {doc.id: doc for doc in all_docs}
+    # On a connection that is not immutable a writer can delete a row between
+    # the queries above; such an ID is dropped rather than looked up.
+    if "fts" in lists:
+        lists["fts"] = [doc_id for doc_id in lists["fts"] if doc_id in by_id]
+    dense_ids = [doc_id for doc_id in dense_ids if doc_id in by_id]
     home = Path.home()
     scrubbed: dict[str, str] = {}
 

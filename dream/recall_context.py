@@ -550,7 +550,8 @@ def mcp_install_status() -> tuple[bool, str]:
     for client in mcp_install.FILE_CLIENTS:
         try:
             state = mcp_install.status(client)
-        except mcp_install.McpInstallError as exc:
+        except (mcp_install.McpInstallError, OSError) as exc:
+            # OSError: an unreadable directory on the way to the file (path lookup, symlink check).
             notes.append(f"{client}: {' '.join(str(exc).split())[:160]}")
             continue
         if state.startswith("installed"):

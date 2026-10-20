@@ -643,7 +643,7 @@ def _second_worst_ms(run, runs: int) -> float:
     return sorted(times)[-2]
 
 
-def test_recall_latency_budget_on_10000_documents(large_store, tmp_path, monkeypatch, perf_budget_ms):
+def test_recall_latency_budget_on_10000_documents(large_store, tmp_path, monkeypatch, assert_latency):
     """Session-start p95 <= 150 ms, prompt p95 <= 250 ms (scaled on CI), warmed read-only connection, embedder off."""
     from config import load_config
     from recall_context import run_context
@@ -662,9 +662,8 @@ def test_recall_latency_budget_on_10000_documents(large_store, tmp_path, monkeyp
 
     session_start = timed("start-dream")
     prompt = timed("prompt-en")
-    print(f"recall p95 on 10,000 documents: session start {session_start:.1f} ms, prompt {prompt:.1f} ms")
-    assert session_start <= perf_budget_ms(150.0)
-    assert prompt <= perf_budget_ms(250.0)
+    assert_latency("recall-session-start-10k", session_start, 150)
+    assert_latency("recall-prompt-10k", prompt, 250)
 
 
 # ------------------------------------------------------------ lazy scrubbing
@@ -732,3 +731,22 @@ def test_scrubber_placeholders_hold_no_structured_term():
         folded, cleaned = row["text"].casefold(), scrub_text(row["text"], Path(GOLDEN_HOME)).casefold()
         for term in (*_COMMANDS, *extract_structured_terms(row["text"])):
             assert term not in cleaned or term in folded
+
+
+def test_a_row_deleted_between_queries_is_dropped_not_looked_up(tmp_path, monkeypatch):
+    """A writer's connection can lose a row after the FTS query; ranking skips it instead of failing."""
+    import recall_query
+
+    conn = _db(tmp_path)
+    real_load_pool = recall_query._load_pool
+
+    def load_pool_after_a_delete(conn, ids, *, stored):
+        documents, path_texts = real_load_pool(conn, ids, stored=stored)
+        return [doc for doc in documents if doc.id != "b"], path_texts
+
+    monkeypatch.setattr(recall_query, "_load_pool", load_pool_after_a_delete)
+    for query, dense in ((RecallQuery("postgres", "s1", "prompt", None, (), 4000, frozenset(), False), None),
+                         (RecallQuery("pottery", "s1", "prompt", None, (), 4000, frozenset(), False), [("b", 0.9), ("a", 0.5)]),
+                         (RecallQuery("/home/a/api", "s1", "session-start:startup", "/home/a/api", (), 6000, frozenset(), False), None)):
+        results = rank_lexical(conn, query, dense=dense)
+        assert [candidate.document.id for candidate in results] == ["a"]

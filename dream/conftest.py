@@ -6,10 +6,11 @@ deletes) old markers there, so every test gets its own marker directory and
 can never count or remove a real session's markers. Tests that set
 ``DREAM_RECALL_STATE_ROOT`` themselves still win.
 
-Latency tests state their budgets for a developer machine and compare against
-``perf_budget_ms(budget)``, which multiplies by ``DREAM_PERF_BUDGET_SCALE``
-(default 3 when ``CI`` is set, otherwise 1), because shared CI runners are
-slower.
+Latency tests check their p95 with ``assert_latency(name, p95_ms, budget_ms)``.
+The budget at scale 1 is the acceptance gate; ``DREAM_PERF_BUDGET_SCALE``
+(default 3 when ``CI`` is set, otherwise 1) multiplies it only so that slow
+shared runners still catch regressions. Every check prints one
+``perf: <name> p95=<ms> budget=<ms> scale=<x>`` line (shown with ``pytest -s``).
 """
 
 import os
@@ -23,10 +24,17 @@ def perf_budget_scale() -> float:
 
 
 @pytest.fixture
-def perf_budget_ms():
-    """``perf_budget_ms(milliseconds)``: a latency budget scaled for the machine running the suite."""
+def assert_latency():
+    """``assert_latency(name, p95_ms, budget_ms)``: print the raw numbers, then check the scaled budget."""
     scale = perf_budget_scale()
-    return lambda milliseconds: milliseconds * scale
+
+    def check(name: str, p95_ms: float, budget_ms: float) -> None:
+        effective = budget_ms * scale
+        print(f"perf: {name} p95={p95_ms:.1f} budget={budget_ms:g} scale={scale:g}")
+        assert p95_ms <= effective, (f"{name}: p95 {p95_ms:.1f} ms is over the effective budget {effective:g} ms "
+                                     f"(budget {budget_ms:g} ms x DREAM_PERF_BUDGET_SCALE {scale:g})")
+
+    return check
 
 
 @pytest.fixture(autouse=True)

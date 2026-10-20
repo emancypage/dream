@@ -99,8 +99,8 @@ remote_data_egress = false
 # it with `dream preflight`, then run `dream embed`. A non-loopback base_url
 # needs remote_data_egress = true. api_key_env names an optional environment
 # variable holding a bearer token. timeout_seconds bounds one query embed in
-# wall-clock time (at most 3 s; hooks time out after 5 s). Prompts and session
-# starts use the dense list only after `dream recall-calibrate --fixtures ...
+# wall-clock time (at most 3 s; hooks time out after 5 s). Prompts (never
+# session starts) use the dense list only after `dream recall-calibrate --fixtures ...
 # --mode lexical_plus_embedder --apply` for the current model: rerun it after
 # changing model or dimension, and after `dream embed --refresh`.
 base_url = "http://127.0.0.1:8081"
