@@ -410,8 +410,14 @@ def _sweep(per_query, *, embedder_mode: bool) -> tuple[tuple[float, float, float
     return best
 
 
-def calibrate_fixture_file(path, conn, mode: str, *, embedder=None, require_usable: bool = False) -> CalibrationRecord:
+def calibrate_fixture_file(path, conn, mode: str, *, embedder=None, require_usable: bool = False,
+                           settings: RecallSettings | None = None) -> CalibrationRecord:
     """Choose the best observed score threshold from a held-out fixture.
+
+    ``settings`` are the configured recall settings (``recall-calibrate``
+    passes them), so thresholds are tuned on the budgets and dense limit
+    agents receive; the adapters are still forced per mode. Without them the
+    packaged defaults apply.
 
     ``lexical_plus_embedder`` evaluates in that mode, sweeping the fused and
     rescored scores, and needs the configured embedder; its version also
@@ -428,7 +434,7 @@ def calibrate_fixture_file(path, conn, mode: str, *, embedder=None, require_usab
     data = _fixture(fixture_path)
     if require_usable and not any(_relevant(item) for item in data["queries"]):
         raise ValueError("refusing --apply: the fixture has no query with relevant documents")
-    settings = _default_settings()
+    settings = settings or _default_settings()
     _ensure_documents(conn, data["documents"])
     embedder_mode = mode == EMBEDDER_MODE
     if embedder_mode:

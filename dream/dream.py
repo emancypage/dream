@@ -1467,7 +1467,8 @@ def cmd_recall_calibrate(args: argparse.Namespace) -> int:
     # fixture row must never be re-inserted into the live recall index.
     conn = _open_ephemeral_eval_db()
     try:
-        record = calibrate_fixture_file(args.fixtures, conn, args.mode, embedder=embedder, require_usable=apply)
+        record = calibrate_fixture_file(args.fixtures, conn, args.mode, embedder=embedder, require_usable=apply,
+                                        settings=args.config.recall_settings())
     except ValueError as exc:
         if not apply:
             raise

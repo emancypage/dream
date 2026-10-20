@@ -646,3 +646,35 @@ def test_an_excerpt_cache_never_changes_what_renders():
             selection = candidates[start:start + size]
             assert _render_blocks(selection, 4000, "note", excerpt_cache=cache) == _render_blocks(selection, 4000, "note")
     assert cache
+
+
+def test_calibration_and_eval_render_with_the_configured_prompt_budget(tmp_path, capsys, monkeypatch):
+    import argparse
+    import recall_eval
+    from config import load_config
+    from dream import cmd_recall_calibrate, cmd_recall_eval
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[recall]\nprompt_budget_codepoints = 1200\n", encoding="utf-8")
+    config = load_config(config_path)
+    budgets = []
+    real_render = recall_eval._render_blocks
+    monkeypatch.setattr(recall_eval, "_render_blocks", lambda selected, budget, query, **kw: budgets.append(budget) or real_render(selected, budget, query, **kw))
+    fixture, _data = _budget_fixture(tmp_path)
+    assert cmd_recall_calibrate(argparse.Namespace(fixtures=fixture, db=tmp_path / "dream.db", mode="lexical", output=None,
+                                                   config=config, apply=False)) == 0
+    assert budgets and set(budgets) == {1200}
+    budgets.clear()
+    assert cmd_recall_eval(argparse.Namespace(fixtures=fixture, db=tmp_path / "dream.db", config=config)) == 0
+    assert budgets and set(budgets) == {1200}
+    capsys.readouterr()
+    # With a 1,200-code-point budget only the first long block is delivered.
+    report = evaluate_fixture_file(fixture, _open_eval_db(), config.recall_settings())
+    assert report.recall_at_5 == 0.5 and report.codepoints <= 2 * 1200
+    default = calibrate_fixture_file(fixture, _open_eval_db(), "lexical")
+    configured = calibrate_fixture_file(fixture, _open_eval_db(), "lexical", settings=config.recall_settings())
+    assert default.fixture_sha256 == configured.fixture_sha256
+
+
+def _open_eval_db():
+    from dream import _open_ephemeral_eval_db
+    return _open_ephemeral_eval_db()
