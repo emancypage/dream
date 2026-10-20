@@ -304,7 +304,8 @@ def build_embedder(settings) -> OpenAICompatibleEmbedder | None:
     )
 
 
-def _fingerprint(adapter) -> str:
+def adapter_fingerprint(adapter) -> str:
+    """The adapter's fingerprint as a string (property or method); AdapterError when missing."""
     value = getattr(adapter, "fingerprint", None)
     value = value() if callable(value) else value
     if not value:
@@ -355,7 +356,7 @@ def apply_optional_adapters(conn, query: RecallQuery, candidates: list[RecallCan
             fallback = "embedder-unavailable"
         else:
             try:
-                fingerprint = _fingerprint(embedder)
+                fingerprint = adapter_fingerprint(embedder)
                 vector_for_query = _validate_vector(query_vector) if query_vector is not None else embed_query(embedder, query.query_text)
                 rescored = []
                 changed = False
@@ -384,7 +385,7 @@ def apply_optional_adapters(conn, query: RecallQuery, candidates: list[RecallCan
             fallback = fallback or "reranker-unavailable"
         else:
             try:
-                _fingerprint(reranker)
+                adapter_fingerprint(reranker)
                 values = tuple(float(value) for value in reranker.score(query.query_text, [candidate.scrubbed_excerpt for candidate in current[:100]]))
                 if len(values) != min(100, len(current)) or not all(math.isfinite(value) for value in values):
                     raise AdapterError("invalid reranker output")

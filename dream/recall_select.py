@@ -52,9 +52,17 @@ def calibration_for(calibrations, mode: str, query) -> tuple[float | None, str |
     return (threshold, _version(calibrations, mode)) if threshold is not None else (None, None)
 
 
-def select_recall_candidates(candidates, query, settings, calibrations, *, mode: str = "lexical") -> tuple[RecallCandidate, ...]:
-    """Apply the mode's threshold, provenance, deduplication, and source caps in rank order."""
-    threshold, _version_used = calibration_for(calibrations, mode, query)
+_LOOKUP = object()
+
+
+def select_recall_candidates(candidates, query, settings, calibrations, *, mode: str = "lexical",
+                             threshold=_LOOKUP) -> tuple[RecallCandidate, ...]:
+    """Apply the mode's threshold, provenance, deduplication, and source caps in rank order.
+
+    ``threshold`` passes a value already looked up with ``calibration_for``.
+    """
+    if threshold is _LOOKUP:
+        threshold, _version_used = calibration_for(calibrations, mode, query)
     filtered = []
     seen_hashes: set[str] = set()
     source_counts: dict[str, int] = {}

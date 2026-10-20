@@ -292,18 +292,44 @@ def test_recall_eval_cli_reports_lexical_only_when_the_embedder_is_misconfigured
     assert "remote_data_egress" in captured.err
 
 
-def test_embedder_mode_calibration_needs_an_embedder_and_sweeps_fused_scores(tmp_path):
+def test_embedder_mode_calibration_needs_an_embedder_and_sweeps_fused_scores(tmp_path, monkeypatch):
     from dream import open_db
     fixture = _language_fixture(tmp_path)
     with pytest.raises(ValueError, match="embedder"):
         calibrate_fixture_file(fixture, open_db(tmp_path / "a.db"), "lexical_plus_embedder")
     lexical = calibrate_fixture_file(fixture, open_db(tmp_path / "b.db"), "lexical")
     embedder = KeywordEmbedder()
+    import recall_eval
+    swept = []
+    real_key = recall_eval.calibration_key
+    monkeypatch.setattr(recall_eval, "calibration_key", lambda rows, threshold: swept.append(threshold) or real_key(rows, threshold))
     record = calibrate_fixture_file(fixture, open_db(tmp_path / "c.db"), "lexical_plus_embedder", embedder=embedder)
     assert record.mode == "lexical_plus_embedder"
     assert record.calibration_version != lexical.calibration_version
     assert record.fixture_sha256 == lexical.fixture_sha256
     assert embedder.calls > 0
+    # The sweep covers exactly the fused, rescored scores of the embedder mode (no artificial 0.0).
+    from dream import _open_ephemeral_eval_db
+    from recall_context import retrieve
+    conn = _open_ephemeral_eval_db()
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    recall_eval._ensure_documents(conn, data["documents"])
+    recall_eval._embed_fixture_documents(conn, KeywordEmbedder(), _settings())
+    expected = set()
+    for item in data["queries"]:
+        outcome = retrieve(conn, recall_eval._query(item, _settings()), recall_eval._embedder_settings(_settings()), {},
+                           embedder=KeywordEmbedder(), require_calibration=False)
+        assert outcome.mode == "lexical_plus_embedder"
+        expected.update(candidate.score for candidate in outcome.candidates)
+    assert swept == sorted(expected) and 0.0 not in swept
+    assert 0 < record.threshold <= max(swept)
+
+    class OtherModel(KeywordEmbedder):
+        fingerprint = "keyword-v2"
+
+    other = calibrate_fixture_file(fixture, open_db(tmp_path / "d.db"), "lexical_plus_embedder", embedder=OtherModel())
+    assert other.calibration_version != record.calibration_version
+    assert other.fixture_sha256 == record.fixture_sha256
 
 
 def test_recall_calibrate_cli_refuses_embedder_mode_without_an_embedder(tmp_path, capsys):
@@ -317,3 +343,141 @@ def test_recall_calibrate_cli_refuses_embedder_mode_without_an_embedder(tmp_path
     assert rc == 2
     assert "embedder" in capsys.readouterr().err
     assert not (tmp_path / "dream.db").exists()
+
+
+# --- calibration that is precise and fast (eval-build shaped fixtures) ----------
+
+_TOPICS = [("postgres database migration", "baza danych migracja"), ("npm deploy release", "wdrożenie wydanie"),
+           ("docker container image", "kontener obraz"), ("pytest unit tests", "testy jednostkowe"),
+           ("redis cache eviction", "pamięć podręczna"), ("kubernetes cluster nodes", "klaster węzły")]
+
+
+class TopicEmbedder:
+    """Real models give unrelated texts a positive cosine: every vector shares a common component."""
+
+    fingerprint = "topic:16"
+    remote_data_egress = False
+
+    def __init__(self):
+        self.calls = 0
+
+    def embed(self, texts):
+        import hashlib
+        import re
+        self.calls += 1
+        vectors = []
+        for text in texts:
+            words = set(re.findall(r"\w+", text.casefold()))
+            vector = [0.3] * 16
+            for axis, (english, polish) in enumerate(_TOPICS):
+                if words & (set(english.split()) | set(polish.split())):
+                    vector[axis] += 1.0
+            digest = hashlib.sha256(text.encode("utf-8")).digest()
+            vectors.append([value + digest[index] / 255 * 0.1 for index, value in enumerate(vector)])
+        return vectors
+
+
+def _topic_fixture(tmp_path, queries=30, documents=40):
+    import random
+    rng = random.Random(3)
+    docs, items = [], []
+    for index in range(documents):
+        english, _polish = _TOPICS[index % len(_TOPICS)]
+        words = " ".join(rng.sample(["alpha", "beta", "gamma", "delta", "omega"], 2))
+        docs.append({"id": f"doc-{index}", "source_kind": "approved_memory", "trust_level": "user_approved", "project_slug": None,
+                     "source_path": f"t{index}.md", "source_updated_at": f"2026-01-{1 + index % 28:02d}T00:00:00Z",
+                     "source_version": "v1", "text": f"Note {index}: we use {english} with extra words {words}."})
+    for number in range(queries):
+        index = rng.randrange(documents)
+        english, polish = _TOPICS[index % len(_TOPICS)]
+        language = "pl" if number % 2 else "en"
+        items.append({"id": f"q{number}", "event": "prompt", "query": (polish if language == "pl" else english) + f" pytanie {number}",
+                      "language": language, "relevant": [f"doc-{index}"], "forbidden": []})
+    fixture = tmp_path / f"heldout-{queries}x{documents}.json"
+    fixture.write_text(json.dumps({"documents": docs, "queries": items}), encoding="utf-8")
+    return fixture, docs
+
+
+def test_embedder_calibration_is_precise_and_fast_on_an_eval_build_shaped_fixture(tmp_path):
+    import time
+    from dream import _open_ephemeral_eval_db
+    from recall_context import retrieve
+    from recall_select import select_recall_candidates
+    import recall_eval
+    fixture, docs = _topic_fixture(tmp_path)
+    embedder = TopicEmbedder()
+    started = time.perf_counter()
+    record = calibrate_fixture_file(fixture, _open_ephemeral_eval_db(), "lexical_plus_embedder", embedder=embedder, require_usable=True)
+    assert time.perf_counter() - started < 2.0
+    assert record.threshold > 0
+    # An unrelated prompt now selects far fewer than the 40 documents a 0.0 threshold let through.
+    conn = _open_ephemeral_eval_db()
+    recall_eval._ensure_documents(conn, docs)
+    recall_eval._embed_fixture_documents(conn, embedder, _settings())
+    calibration = {"lexical_plus_embedder": {"threshold": record.threshold}}
+    for text in ("pottery glazing in the studio", "garncarstwo i szkliwienie"):
+        query = recall_eval._query({"query": text, "event": "prompt"}, _settings())
+        outcome = retrieve(conn, query, recall_eval._embedder_settings(_settings()), calibration, embedder=embedder,
+                           require_calibration=False)
+        assert outcome.mode == "lexical_plus_embedder"
+        assert len(outcome.candidates) == 40
+        assert len(outcome.selected) < 5
+        assert len(select_recall_candidates(outcome.candidates, query, None, {"lexical_plus_embedder": {"threshold": 0.0}},
+                                            mode="lexical_plus_embedder")) == 40
+
+
+def test_cached_calibration_sweep_is_as_good_as_the_naive_one(tmp_path):
+    import bisect
+    from dream import _open_ephemeral_eval_db
+    import recall_eval
+    fixture, _docs = _topic_fixture(tmp_path, queries=6, documents=8)
+    for mode, embedder in (("lexical", None), ("lexical_plus_embedder", TopicEmbedder())):
+        record = calibrate_fixture_file(fixture, _open_ephemeral_eval_db(), mode, embedder=embedder)
+        # Naive reference: the full pipeline, every query, at every swept threshold.
+        conn = _open_ephemeral_eval_db()
+        data = json.loads(fixture.read_text(encoding="utf-8"))
+        recall_eval._ensure_documents(conn, data["documents"])
+        settings = recall_eval._lexical_settings(_settings())
+        if embedder is not None:
+            recall_eval._embed_fixture_documents(conn, embedder, _settings())
+            settings = recall_eval._embedder_settings(_settings())
+        swept = set() if embedder is not None else {0.0}
+        for item in data["queries"]:
+            outcome = recall_eval.retrieve(conn, recall_eval._query(item, _settings()), settings, {}, embedder=embedder,
+                                           require_calibration=False)
+            swept.update(candidate.score for candidate in outcome.candidates)
+
+        def naive_key(threshold):
+            rows = recall_eval._run_queries(data, conn, settings, {mode: {"threshold": threshold}}, embedder=embedder)
+            cuts = []
+            for item, row in zip(data["queries"], rows):
+                ids = row["selected_ids"]
+                relevant = row["relevant"]
+                cuts.append((bool(relevant), recall_eval._Cut(
+                    min(row["ranks"]) if row["ranks"] else None,
+                    len(relevant.intersection(ids)) / len(ids) if ids else 0.0, row["forbidden"])))
+            return recall_eval.calibration_key(cuts, threshold)[:3]
+
+        best = max(naive_key(threshold) for threshold in sorted(swept))
+        assert naive_key(record.threshold) == best, mode
+        ordered = sorted(swept)
+        chosen = ordered[bisect.bisect_left(ordered, record.threshold)] if record.threshold > 0 else 0.0
+        assert naive_key(chosen) == best
+
+
+def test_apply_refuses_a_zero_threshold_for_the_embedder_mode(tmp_path, monkeypatch):
+    from dataclasses import replace as dc_replace
+    from dream import _open_ephemeral_eval_db
+    import recall_eval
+    fixture, _docs = _topic_fixture(tmp_path, queries=4, documents=6)
+    real_retrieve = recall_eval.retrieve
+
+    def zero_scores(*args, **kwargs):
+        outcome = real_retrieve(*args, **kwargs)
+        return dc_replace(outcome, candidates=tuple(dc_replace(candidate, score=0.0) for candidate in outcome.candidates))
+
+    monkeypatch.setattr(recall_eval, "retrieve", zero_scores)
+    with pytest.raises(ValueError, match="threshold of 0"):
+        calibrate_fixture_file(fixture, _open_ephemeral_eval_db(), "lexical_plus_embedder", embedder=TopicEmbedder(), require_usable=True)
+    # Lexical keeps today's behaviour: a 0.0 threshold is accepted.
+    assert calibrate_fixture_file(fixture, _open_ephemeral_eval_db(), "lexical", require_usable=True).threshold == 0.0

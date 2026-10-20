@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from recall_events import POLICY_VERSION
-from recall_adapters import AdapterError, EmbedderUnavailable, apply_optional_adapters, build_embedder, embed_query, embedder_fallback_reason
+from recall_adapters import AdapterError, EmbedderUnavailable, adapter_fingerprint, apply_optional_adapters, build_embedder, embed_query, embedder_fallback_reason
 from recall_embeddings import dense_candidates, embedding_text, has_vectors
 from recall_render import render_context
 from recall_query import rank_lexical
@@ -72,8 +72,13 @@ class Retrieval:
     calibration_version: str | None
 
 
-def _without_embedder(settings):
-    return replace(settings, embedder=replace(settings.embedder, enabled=False))
+def with_adapters(settings, *, embedder: bool | None = None, reranker: bool | None = None):
+    """Settings with the embedder and/or the reranker switched on or off (None keeps it)."""
+    if embedder is not None:
+        settings = replace(settings, embedder=replace(settings.embedder, enabled=embedder))
+    if reranker is not None:
+        settings = replace(settings, reranker=replace(settings.reranker, enabled=reranker))
+    return settings
 
 
 def _dense_list(conn, query: RecallQuery, settings, embedder, calibrations, *, require_calibration: bool):
@@ -88,10 +93,14 @@ def _dense_list(conn, query: RecallQuery, settings, embedder, calibrations, *, r
     without vectors for the fingerprint is not queried either. Every failure
     leaves ``dense`` None, so ranking stays lexical.
     """
+    if query.hook_event.startswith("session-start"):
+        # The cwd and roots carry no topic, and session-start selection has no
+        # threshold: a dense list there would inject unrelated documents.
+        return None, None, None
     if embedder is None:
         return None, None, "embedder-unavailable"
     try:
-        fingerprint = str(embedder.fingerprint)
+        fingerprint = adapter_fingerprint(embedder)
     except Exception as exc:
         return None, None, embedder_fallback_reason(exc)
     if require_calibration:
@@ -132,7 +141,7 @@ def retrieve(conn, query: RecallQuery, settings, calibrations, *, embedder=None,
                                                     require_calibration=require_calibration)
         if query_vector is None:
             # Nothing dense contributes: no second embedder call, lexical scores stay.
-            adapter_settings = _without_embedder(settings)
+            adapter_settings = with_adapters(settings, embedder=False)
     candidates = rank_lexical(conn, query, dense=dense)
     if keep is not None:
         candidates = [candidate for candidate in candidates if keep(candidate)]
@@ -140,8 +149,11 @@ def retrieve(conn, query: RecallQuery, settings, calibrations, *, embedder=None,
         conn, query, candidates, adapter_settings, embedder=embedder, reranker=reranker,
         allow_cache_writes=allow_cache_writes, query_vector=query_vector,
     )
-    _threshold, version = calibration_for(calibrations, mode, query)
-    selected = select_recall_candidates(candidates, query, settings, calibrations, mode=mode)
+    if mode == "lexical" and any("dense" in candidate.component_ranks for candidate in candidates):
+        # Fused dense ranks change the score scale even when nothing was rescored.
+        mode = EMBEDDER_MODE
+    threshold, version = calibration_for(calibrations, mode, query)
+    selected = select_recall_candidates(candidates, query, settings, calibrations, mode=mode, threshold=threshold)
     return Retrieval(tuple(candidates), selected, mode, fallback or adapter_fallback, version)
 
 

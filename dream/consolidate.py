@@ -397,14 +397,13 @@ def _dense_for_subset(conn: sqlite3.Connection, query_text: str, embedder, *, li
     if embedder is None:
         return None
     try:
-        from recall_adapters import embed_query
+        from recall_adapters import adapter_fingerprint, embed_query
         from recall_embeddings import dense_candidates, embedding_text, has_vectors
-        fingerprint = embedder.fingerprint
-        fingerprint = fingerprint() if callable(fingerprint) else fingerprint
-        if not has_vectors(conn, str(fingerprint), ("approved_memory",)):
+        fingerprint = adapter_fingerprint(embedder)
+        if not has_vectors(conn, fingerprint, ("approved_memory",)):
             return []  # nothing embedded yet: no request to the server
         vector = embed_query(embedder, embedding_text(query_text))
-        return dense_candidates(conn, vector, str(fingerprint), ("approved_memory",), limit=limit)
+        return dense_candidates(conn, vector, fingerprint, ("approved_memory",), limit=limit)
     except Exception as exc:
         print(f"subset selection: dense candidates unavailable ({type(exc).__name__}); ranking lexically",
               file=sys.stderr)

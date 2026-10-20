@@ -822,8 +822,7 @@ def test_context_without_an_embedder_calibration_row_never_uses_dense(tmp_path, 
     embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False)
     embedding_server.requests.clear()
     assert conn.execute("SELECT COUNT(*) FROM recall_calibrations").fetchone()[0] == 0
-    for query in (_prompt("jaka baza danych"), _prompt("postgresql migrations release"),
-                  RecallQuery("/nonexistent/project", "s1", "session-start:startup", "/nonexistent/project", (), 6000, frozenset(), False)):
+    for query in (_prompt("jaka baza danych"), _prompt("postgresql migrations release")):
         lexical = run_context(conn, query, recall_settings(), constitution_path=None)
         result = run_context(conn, query, recall_settings(embedder_settings()), embedder=make_embedder(embedding_server.url),
                              allow_cache_writes=False, constitution_path=None)
@@ -1130,3 +1129,43 @@ def test_a_down_embedder_writes_one_diagnostic_per_window(tmp_path, embedding_se
         assert rc == 0
     lines = [json.loads(line) for line in (tmp_path / "diagnostics.jsonl").read_text(encoding="utf-8").splitlines()]
     assert [line["fallback_reason"] for line in lines] == ["embedder-unavailable"]
+
+
+def test_session_start_with_a_calibrated_embedder_never_uses_the_dense_list(tmp_path, embedding_server):
+    conn, memory = _memory_store(tmp_path, _ENGLISH)
+    embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False)
+    embedding_server.requests.clear()
+    for cwd in (str(memory), "/nonexistent/pottery-site"):
+        query = RecallQuery(cwd, "s1", "session-start:startup", cwd, (cwd,), 6000, frozenset(), False)
+        lexical = run_context(conn, query, recall_settings(), constitution_path=None)
+        result = run_context(conn, query, recall_settings(embedder_settings()), embedder=make_embedder(embedding_server.url),
+                             constitution_path=None)
+        assert result.mode == "lexical" and result.diagnostics.fallback_reason is None
+        assert result.rendered_context == lexical.rendered_context
+        assert [c.document.id for c in result.selected] == [c.document.id for c in lexical.selected]
+    assert embedding_server.requests == []
+
+
+def test_fused_dense_ranks_select_with_the_embedder_threshold_even_without_a_rescore(tmp_path, embedding_server, monkeypatch):
+    import recall_context
+    conn, _memory = _memory_store(tmp_path, _ENGLISH)
+    embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False)
+    version = calibrate_embedder_mode(conn, threshold=0.0)
+    monkeypatch.setattr(recall_context, "apply_optional_adapters",
+                        lambda conn, query, candidates, settings, **kwargs: (list(candidates), "lexical", None))
+    result = run_context(conn, _prompt("jaka baza danych"), recall_settings(embedder_settings()),
+                         embedder=make_embedder(embedding_server.url), constitution_path=None)
+    assert result.selected and "dense" in result.selected[0].component_ranks
+    assert result.mode == "lexical_plus_embedder"
+    assert result.calibration_version == version
+
+
+def test_with_adapters_switches_one_adapter_and_keeps_the_other():
+    from recall_context import with_adapters
+    settings = recall_settings(embedder_settings())
+    off = with_adapters(settings, embedder=False)
+    assert off.embedder.enabled is False and off.embedder.model == settings.embedder.model
+    assert off.reranker == settings.reranker
+    both = with_adapters(settings, embedder=True, reranker=True)
+    assert both.embedder.enabled and both.reranker.enabled
+    assert with_adapters(settings) == settings

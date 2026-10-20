@@ -441,7 +441,8 @@ def embed_recall_documents(
     document in place, which is the step after a model change behind an
     unchanged name and dimension.
     """
-    fingerprint = str(embedder.fingerprint)
+    from recall_adapters import adapter_fingerprint
+    fingerprint = adapter_fingerprint(embedder)
     report = EmbedReport(fingerprint)
     if not has_vector_blob(conn):
         report.error = "recall_embeddings has no vector_blob column; open the database with a Dream writer to migrate it"
