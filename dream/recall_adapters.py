@@ -13,7 +13,7 @@ import urllib.parse
 from dataclasses import replace
 from typing import Protocol, Sequence, runtime_checkable
 
-from config import has_url_extras, is_loopback_url
+from config import has_url_extras, is_loopback_url, is_valid_bearer_token
 from recall_embeddings import EMBED_TEXT_MAX_CODEPOINTS, MAX_DIMENSION, embedding_text, has_vector_blob, store_vector, stored_vector
 from recall_types import RecallCandidate, RecallQuery
 
@@ -211,6 +211,9 @@ class OpenAICompatibleEmbedder:
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         token = os.environ.get(self._api_key_env) if self._api_key_env else None
         if token:
+            if not is_valid_bearer_token(token):
+                raise AdapterError(f"embedder api_key_env {self._api_key_env} holds a value that is not a valid "
+                                   "bearer token (control, whitespace or non-ASCII characters)")
             headers["Authorization"] = f"Bearer {token}"
         connection = self._connection(timeout)
         aborted = threading.Event()

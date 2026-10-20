@@ -7,6 +7,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -511,6 +512,45 @@ def test_api_key_echoed_by_server_is_redacted_from_errors(server, monkeypatch):
     assert "Bearer [redacted]" in str(excinfo.value)
     ok, detail = preflight_provider(_settings(server, api_key_env="DREAM_TEST_LOCAL_LLM_KEY"))
     assert not ok and "sk-local-secret" not in detail
+
+
+@pytest.mark.parametrize("suffix", ["\n", "\r", "\r\n"])
+def test_a_malformed_api_key_is_refused_before_any_request_without_echoing_it(server, monkeypatch, suffix):
+    # http.client would reject the header with a ValueError that quotes the whole value.
+    monkeypatch.setenv("DREAM_TEST_LOCAL_LLM_KEY", "sk-local-secret" + suffix)
+    server.responder = lambda request: (200, _completion(json.dumps({"value": "ok"})))
+    settings = _settings(server, api_key_env="DREAM_TEST_LOCAL_LLM_KEY")
+
+    with pytest.raises(ProviderError) as excinfo:
+        openai_compatible.generate(_request(), settings)
+    assert "DREAM_TEST_LOCAL_LLM_KEY" in str(excinfo.value)
+    assert "sk-local-secret" not in str(excinfo.value)
+    assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+    ok, detail = preflight_provider(settings)
+    assert not ok and "DREAM_TEST_LOCAL_LLM_KEY" in detail and "sk-local-secret" not in detail
+    assert server.requests == []
+
+
+def test_a_malformed_api_key_stays_out_of_distill_and_preflight_output(tmp_path, monkeypatch, server, capsys):
+    import dream
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("DREAM_TEST_LOCAL_LLM_KEY", "sk-local-secret\n")
+    _config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+    path = _write_config(tmp_path, f'type = "openai-compatible"\nbase_url = "{server.base_url}"\n'
+                                   'model = "qwen3-32b"\napi_key_env = "DREAM_TEST_LOCAL_LLM_KEY"\n')
+    config = load_config(path)
+    monkeypatch.setattr(dream, "open_db", lambda _path: conn)
+    args = SimpleNamespace(db=tmp_path / "dream.db", min_chars=500, project=None, config=config, limit=1,
+                           max_sessions=5, yes=True, model=None, refresh=False)
+
+    assert dream.cmd_distill(args) == 1
+    dream.main(["--config", str(path), "--db", str(tmp_path / "dream.db"), "preflight"])
+
+    captured = capsys.readouterr()
+    assert "DREAM_TEST_LOCAL_LLM_KEY" in captured.out
+    assert "sk-local-secret" not in captured.out + captured.err
+    assert server.requests == []
 
 
 def test_no_api_key_env_sends_no_authorization(server, monkeypatch):

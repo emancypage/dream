@@ -227,6 +227,16 @@ def has_url_extras(url: str) -> bool:
         return True
 
 
+def is_valid_bearer_token(token: str) -> bool:
+    """True when every character is visible ASCII, so the Authorization header is well formed.
+
+    http.client rejects a header value with CR, LF or other control
+    characters with a ValueError that quotes the complete value; callers
+    check the token first and report the variable name instead.
+    """
+    return bool(token) and all("!" <= char <= "~" for char in token)
+
+
 def _validate_openai_compatible_provider(name: str, provider: dict[str, Any]) -> None:
     """A local model server; sending prompts off this machine needs explicit consent."""
     from urllib.parse import urlsplit

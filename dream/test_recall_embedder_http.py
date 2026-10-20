@@ -248,6 +248,35 @@ def test_missing_api_key_variable_sends_no_authorization(embedding_server, monke
     assert "Authorization" not in embedding_server.requests[0]["headers"]
 
 
+@pytest.mark.parametrize("suffix", ["\n", "\r", "\r\n"])
+def test_a_malformed_api_key_is_refused_before_any_request_without_echoing_it(
+        tmp_path, embedding_server, monkeypatch, capsys, suffix):
+    # http.client would reject the header with a ValueError that quotes the whole value.
+    from dream import cmd_embed
+    from recall_context import embedder_preflight
+    monkeypatch.setenv("DREAM_TEST_EMBED_KEY", "sk-test-secret-123" + suffix)
+    embedder = make_embedder(embedding_server.url, api_key_env="DREAM_TEST_EMBED_KEY")
+    with pytest.raises(AdapterError) as caught:
+        embedder.embed(["postgres"])
+    assert not isinstance(caught.value, EmbedderUnavailable)
+    assert "DREAM_TEST_EMBED_KEY" in str(caught.value) and "sk-test-secret-123" not in str(caught.value)
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+    conn, _memory = _memory_store(tmp_path, {"api.md": "PostgreSQL migrations."})
+    report = embed_recall_documents(conn, embedder, include_raw_transcripts=False)
+    conn.close()
+    assert report.error and "sk-test-secret-123" not in report.error
+
+    monkeypatch.setenv("DREAM_MEMORY_ROOT", str(tmp_path / "memory"))
+    config = _cli_config(tmp_path, embedding_server.url, api_key_env='"DREAM_TEST_EMBED_KEY"')
+    assert cmd_embed(SimpleNamespace(db=tmp_path / "dream.db", config=config, refresh=False)) == 1
+    ok, detail = embedder_preflight(config)
+    assert not ok and detail.startswith("misconfigured:") and "sk-test-secret-123" not in detail
+    captured = capsys.readouterr()
+    assert "DREAM_TEST_EMBED_KEY" in captured.err
+    assert "sk-test-secret-123" not in captured.out + captured.err
+    assert embedding_server.requests == []
+
+
 def test_connection_refused_is_unavailable():
     with pytest.raises(EmbedderUnavailable):
         make_embedder(refused_url()).embed(["postgres"])

@@ -25,7 +25,9 @@ no streaming and no tool calls.
     configured host. A non-loopback `base_url` additionally needs
     `remote_data_egress = true`.
   * `api_key_env` names an environment variable read at call time; its value
-    is sent as a Bearer header and is never logged, returned or stored.
+    is sent as a Bearer header and is never logged, returned or stored. A
+    value with control, whitespace or non-ASCII characters is refused before
+    any request, naming only the variable.
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ import time
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
-from config import has_url_extras, is_loopback_url
+from config import has_url_extras, is_loopback_url, is_valid_bearer_token
 from model_types import (
     GenerationRequest,
     GenerationResult,
@@ -207,6 +209,9 @@ def _request_json(
     key_env = settings.get("api_key_env")
     api_key = os.environ.get(key_env) if key_env else None
     if api_key:
+        if not is_valid_bearer_token(api_key):
+            raise ProviderError(f"api_key_env {key_env} holds a value that is not a valid bearer token "
+                                "(control, whitespace or non-ASCII characters)")
         headers["Authorization"] = f"Bearer {api_key}"
     timed_out = ProviderError(f"{PROVIDER} server at {display} timed out after {timeout:g}s")
     remaining = deadline - time.monotonic()
