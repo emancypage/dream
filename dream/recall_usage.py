@@ -214,7 +214,8 @@ def _record(conn: sqlite3.Connection, markers: list[_Marker], now: dt.datetime |
 
     The ledger insert and the counts commit together, so the ledger is the
     proof that a marker was counted: a marker already in it (its delete failed
-    or the process died after the commit) is only deleted, never recounted.
+    or the process died after the commit) is only deleted, never recounted, and
+    its row is refreshed so pruning never forgets a marker that is still on disk.
     The ledger is keyed by marker name and finish time, because a session that
     resumes after its marker was harvested writes a new marker under the same
     name. The first counted marker opens the observation window.
@@ -223,13 +224,17 @@ def _record(conn: sqlite3.Connection, markers: list[_Marker], now: dt.datetime |
     counted_at = _stamp(now)
     counted: list[_Marker] = []
     with conn:
-        conn.execute("DELETE FROM recall_usage_markers WHERE counted_at < ?", (_stamp(now - LEDGER_RETENTION),))
         for marker in markers:
             fresh = conn.execute(
                 "INSERT OR IGNORE INTO recall_usage_markers(name, finished_at, counted_at) VALUES (?, ?, ?)",
                 (marker.name, marker.finished_at, counted_at),
             ).rowcount
             if not fresh:
+                # Still on disk (its delete keeps failing): keep its proof of counting alive.
+                conn.execute(
+                    "UPDATE recall_usage_markers SET counted_at=? WHERE name=? AND finished_at=?",
+                    (counted_at, marker.name, marker.finished_at),
+                )
                 continue
             counted.append(marker)
             for document_id in marker.selected_ids:
@@ -239,6 +244,8 @@ def _record(conn: sqlite3.Connection, markers: list[_Marker], now: dt.datetime |
                 "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
                 (SINCE_KEY, min(marker.finished_at for marker in counted)),
             )
+        # After the loop, so a row refreshed above for a marker still on disk survives.
+        conn.execute("DELETE FROM recall_usage_markers WHERE counted_at < ?", (_stamp(now - LEDGER_RETENTION),))
     return counted
 
 

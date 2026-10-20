@@ -364,15 +364,21 @@ def embedder_fallback_reason(exc: Exception) -> str:
     return "embedder-unavailable" if isinstance(exc, EmbedderUnavailable) else f"embedder-error:{type(exc).__name__}"
 
 
-def apply_optional_adapters(conn, query: RecallQuery, candidates: list[RecallCandidate], settings, *, embedder=None, reranker=None, allow_cache_writes: bool = False, query_vector=None) -> tuple[list[RecallCandidate], str, str | None]:
+def apply_optional_adapters(conn, query: RecallQuery, candidates: list[RecallCandidate], settings, *, embedder=None, reranker=None, allow_cache_writes: bool = False, query_vector=None, usage=None) -> tuple[list[RecallCandidate], str, str | None]:
     """Enhance lexical candidates, preserving them unchanged on any adapter error.
 
     The embedder rescores the top 100 candidates that have a stored vector.
     ``query_vector`` reuses a query embedding computed by the caller. Without
     ``allow_cache_writes`` (every read-only path) documents are never embedded:
     a candidate without a stored vector keeps its score, and the mode stays
-    ``lexical`` unless at least one candidate was rescored.
+    ``lexical`` unless at least one candidate was rescored. ``usage`` (passed
+    only with ``recall.usage_tie_break``) breaks exact score ties after a
+    rescore, as in ``rank_lexical``; without it the order is unchanged.
     """
+
+    def rescored_order(candidate):
+        return (-candidate.score, -(usage or {}).get(candidate.document.id, (0,))[0], candidate.document.id)
+
     current = list(candidates)
     mode = "lexical"
     fallback: str | None = None
@@ -402,7 +408,7 @@ def apply_optional_adapters(conn, query: RecallQuery, candidates: list[RecallCan
                     conn.commit()
                 if changed:
                     current = rescored + current[100:]
-                    current.sort(key=lambda candidate: (-candidate.score, candidate.document.id))
+                    current.sort(key=rescored_order)
                     mode = "lexical_plus_embedder"
             except Exception as exc:
                 fallback = embedder_fallback_reason(exc)
@@ -416,7 +422,7 @@ def apply_optional_adapters(conn, query: RecallQuery, candidates: list[RecallCan
                 if len(values) != min(100, len(current)) or not all(math.isfinite(value) for value in values):
                     raise AdapterError("invalid reranker output")
                 current = [replace(candidate, score=(candidate.score + values[index]) / 2) for index, candidate in enumerate(current[:100])] + current[100:]
-                current.sort(key=lambda candidate: (-candidate.score, candidate.document.id))
+                current.sort(key=rescored_order)
                 mode = "lexical_plus_reranker" if mode == "lexical" else "combined"
             except Exception as exc:
                 fallback = fallback or f"reranker-error:{type(exc).__name__}"

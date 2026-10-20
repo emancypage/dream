@@ -151,7 +151,7 @@ def retrieve(conn, query: RecallQuery, settings, calibrations, *, embedder=None,
         candidates = [candidate for candidate in candidates if keep(candidate)]
     candidates, mode, adapter_fallback = apply_optional_adapters(
         conn, query, candidates, adapter_settings, embedder=embedder, reranker=reranker,
-        allow_cache_writes=allow_cache_writes, query_vector=query_vector,
+        allow_cache_writes=allow_cache_writes, query_vector=query_vector, usage=usage,
     )
     if mode == "lexical" and any("dense" in candidate.component_ranks for candidate in candidates):
         # Fused dense ranks change the score scale even when nothing was rescored.

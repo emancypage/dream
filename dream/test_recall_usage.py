@@ -671,3 +671,113 @@ def test_status_usage_with_unreadable_recall_tables_reports_it(tmp_path, capsys)
     conn.close()
     assert _status(db_path, config) == 0
     assert "not available (OperationalError" in capsys.readouterr().out
+
+
+def test_a_marker_whose_delete_keeps_failing_is_never_recounted_after_pruning(tmp_path, monkeypatch):
+    root = _root(tmp_path)
+    marker = _marker(root, "stuck", ids=("doc-a",))
+    conn = _db(tmp_path)
+    monkeypatch.setattr(recall_usage, "_delete_counted", lambda dir_fd, markers: None)
+    for days in (0, 31, 62):
+        assert recall_usage.harvest(conn, root, now=NOW + dt.timedelta(days=days)) == (1 if days == 0 else 0)
+        assert _usage(conn)["doc-a"][0] == 1
+    assert marker.exists()
+    assert _ledger(conn) == [("stuck.json", "2026-10-19T06:00:00Z", _stamp(NOW + dt.timedelta(days=62)))]
+
+
+# ------------------------------------------------------------ ties under the embedder
+
+
+class _FlatEmbedder:
+    """Every text embeds to the same vector, so a rescore keeps an exact tie."""
+
+    fingerprint = "fake:flat"
+    remote_data_egress = False
+
+    def embed(self, texts):
+        return [[1.0, 0.0] for _ in texts]
+
+
+class _FlatReranker:
+    fingerprint = "fake:flat-rerank"
+    remote_data_egress = False
+
+    def score(self, query, texts):
+        return [0.5 for _ in texts]
+
+
+def _tied_candidates():
+    from recall_types import RecallCandidate, RecallDocument
+
+    return [
+        RecallCandidate(RecallDocument(doc_id, doc_id, "approved_memory", "user_approved", None, f"{doc_id}.md",
+                                       "2026-08-20T10:00:00Z", "2026-08-20T10:00:00Z", "v1", f"{doc_id} postgres notes"),
+                        f"{doc_id} postgres notes", {"fts": rank}, 0.25, rank)
+        for rank, doc_id in enumerate(("x", "y"), 1)
+    ]
+
+
+def _adapter_settings(*, embed=False, rerank=False, tie_break=False):
+    from recall_types import AdapterSettings, RecallSettings
+
+    return RecallSettings(True, False, False, True, 6000, 4000, 1800, 1200, "", "",
+                          AdapterSettings(embed, "fake", False), AdapterSettings(rerank, "fake", False),
+                          usage_tie_break=tie_break)
+
+
+@pytest.mark.parametrize("adapters", [{"embed": True}, {"rerank": True}, {"embed": True, "rerank": True}])
+def test_rescored_ties_are_broken_by_usage_only_when_it_is_given(tmp_path, adapters):
+    from recall_adapters import apply_optional_adapters
+
+    conn = _db(tmp_path)
+    query = RecallQuery("postgres", "s", "prompt", None, (), 4000, frozenset(), False)
+    kwargs = {"embedder": _FlatEmbedder(), "reranker": _FlatReranker(), "allow_cache_writes": True}
+    settings = _adapter_settings(**adapters)
+    off, mode, fallback = apply_optional_adapters(conn, query, _tied_candidates(), settings, **kwargs)
+    assert mode != "lexical" and fallback is None
+    assert off[0].score == off[1].score
+    assert [c.document.id for c in off] == ["x", "y"]  # unchanged: score, then id
+    on, _mode, _fallback = apply_optional_adapters(conn, query, _tied_candidates(), settings,
+                                                   usage={"y": (9, "2026-10-01T00:00:00Z")}, **kwargs)
+    assert [c.document.id for c in on] == ["y", "x"]
+    assert [c.document.id for c in apply_optional_adapters(
+        conn, query, _tied_candidates(), settings, usage={}, **kwargs)[0]] == ["x", "y"]
+
+
+@pytest.mark.parametrize("tie_break, expected", [(True, ["y", "x"]), (False, ["x", "y"])])
+def test_retrieve_keeps_the_usage_tie_break_through_the_embedder_rescore(tmp_path, monkeypatch, tie_break, expected):
+    import recall_context
+    from recall_adapters import apply_optional_adapters as real_adapters
+    from recall_embeddings import store_vector
+
+    conn = _db(tmp_path)
+    for candidate in _tied_candidates():
+        doc = candidate.document
+        conn.execute(
+            "INSERT INTO recall_documents(id, content_sha256, source_kind, trust_level, project_slug, source_path, "
+            "source_updated_at, indexed_at, source_version, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (doc.id, doc.content_sha256, doc.source_kind, doc.trust_level, doc.project_slug, doc.source_path,
+             doc.source_updated_at, doc.indexed_at, doc.source_version, doc.text),
+        )
+        store_vector(conn, doc.id, doc.content_sha256, _FlatEmbedder.fingerprint, [1.0, 0.0])
+    conn.execute("INSERT INTO recall_usage VALUES ('y', '2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z', 9)")
+    conn.commit()
+    seen = {}
+
+    def tied_ranking(conn, query, *, dense=None, usage=None):
+        seen["rank"], seen["dense"] = usage, dense
+        return _tied_candidates()
+
+    def adapters(*args, **kwargs):
+        seen["adapters"] = kwargs.get("usage")
+        return real_adapters(*args, **kwargs)
+
+    monkeypatch.setattr(recall_context, "rank_lexical", tied_ranking)
+    monkeypatch.setattr(recall_context, "apply_optional_adapters", adapters)
+    query = RecallQuery("postgres", "s", "prompt", None, (), 4000, frozenset(), False)
+    outcome = recall_context.retrieve(conn, query, _adapter_settings(embed=True, tie_break=tie_break), {},
+                                      embedder=_FlatEmbedder(), require_calibration=False)
+    assert seen["dense"] and outcome.mode == "lexical_plus_embedder"
+    assert [c.document.id for c in outcome.candidates] == expected
+    usage = {"y": (9, "2026-10-01T00:00:00Z")} if tie_break else None
+    assert seen["rank"] == seen["adapters"] == usage
