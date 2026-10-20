@@ -103,12 +103,20 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, encoded)
 
 
+class _QuietServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # Clients that time out or abort on purpose reset the connection; a
+        # traceback printed here would land in a later test's captured stderr.
+        pass
+
+
 class FakeEmbeddingServer:
     """A loopback OpenAI-compatible /v1/embeddings server on an ephemeral port."""
 
     def __init__(self, *, model=MODEL, dimension=DIMENSION):
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-        self.httpd.daemon_threads = True
+        self.httpd = _QuietServer(("127.0.0.1", 0), _Handler)
         # Never wait for a deliberately slow handler at teardown.
         self.httpd.block_on_close = False
         self.httpd.requests = []
