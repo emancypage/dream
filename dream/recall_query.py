@@ -142,8 +142,8 @@ def _load_documents(conn, ids: list[str] | None = None) -> list[RecallDocument]:
     return _load_pool(conn, ids, stored=False)[0]
 
 
-def _eligible_ids(conn, ids, query: RecallQuery, excluded: set[str]) -> set[str]:
-    """The subset of ``ids`` that exist and pass the exclusions and the raw-transcript rule."""
+def _eligible_ids(conn, ids, query: RecallQuery, excluded: set[str], kinds=None) -> set[str]:
+    """The subset of ``ids`` that exist and pass the exclusions, the raw-transcript rule and ``kinds``."""
     ids = list(dict.fromkeys(ids))
     eligible: set[str] = set()
     for start in range(0, len(ids), _SQL_CHUNK):
@@ -151,12 +151,21 @@ def _eligible_ids(conn, ids, query: RecallQuery, excluded: set[str]) -> set[str]
         for doc_id, kind in conn.execute(
             f"SELECT id, source_kind FROM recall_documents WHERE id IN ({','.join('?' for _ in chunk)})", chunk
         ):
-            if doc_id not in excluded and (query.allow_raw_transcript or kind != "raw_transcript"):
+            if (doc_id not in excluded and (query.allow_raw_transcript or kind != "raw_transcript")
+                    and (kinds is None or kind in kinds)):
                 eligible.add(doc_id)
     return eligible
 
 
-def _recent_ids(conn, query: RecallQuery, excluded: set[str], limit: int) -> list[str]:
+def _kinds_clause(kinds, column: str) -> tuple[str, tuple[str, ...]]:
+    """``AND <column> IN (...)`` with its parameters, or nothing when every kind is allowed."""
+    if kinds is None:
+        return "", ()
+    names = tuple(sorted(set(kinds)))
+    return f" AND {column} IN ({','.join('?' for _ in names)})", names
+
+
+def _recent_ids(conn, query: RecallQuery, excluded: set[str], limit: int, kinds=None) -> list[str]:
     """The ``limit`` most recent eligible document IDs by stored ``source_updated_at``.
 
     Writers store UTC ISO-8601 timestamps, whose text order is chronological
@@ -164,16 +173,23 @@ def _recent_ids(conn, query: RecallQuery, excluded: set[str], limit: int) -> lis
     chooses the session-start pool; the recency list orders by parsed time.
     """
     allowed = "" if query.allow_raw_transcript else " WHERE source_kind != 'raw_transcript'"
+    kind_clause, kind_params = _kinds_clause(kinds, "source_kind")
+    if kind_clause and not allowed:
+        allowed, kind_clause = " WHERE " + kind_clause[len(" AND "):], ""
     rows = conn.execute(
-        f"SELECT id FROM recall_documents{allowed} ORDER BY source_updated_at DESC, id LIMIT ?",
-        (limit + len(excluded),),
+        f"SELECT id FROM recall_documents{allowed}{kind_clause} ORDER BY source_updated_at DESC, id LIMIT ?",
+        (*kind_params, limit + len(excluded)),
     )
     return [doc_id for (doc_id,) in rows if doc_id not in excluded][:limit]
 
 
 def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | None = None,
-                 usage=None) -> list[RecallCandidate]:
+                 usage=None, kinds=None) -> list[RecallCandidate]:
     """Rank prompt topics by FTS; use fused project signals for session starts.
+
+    ``kinds`` (None: every kind) is a hard source-kind filter bound into the
+    full-text query and the recent pool, so documents of other kinds never
+    take a place under their limits. Without it the queries are unchanged.
 
     ``dense`` is an optional pre-computed ``[(document_id, cosine)]`` list in
     rank order. Its eligible IDs (the same exclusions and raw-transcript rule)
@@ -199,6 +215,7 @@ def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | N
     structured = extract_structured_terms(query.query_text)
     is_prompt = not query.hook_event.startswith("session-start")
     allowed = "d.source_kind != 'raw_transcript'" if not query.allow_raw_transcript else "1=1"
+    kind_clause, kind_params = _kinds_clause(kinds, "d.source_kind")
     excluded = set(query.excluded_source_ids)
     lists: dict[str, list[str]] = {}
 
@@ -207,21 +224,21 @@ def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | N
         try:
             rows = conn.execute(
                 "SELECT d.id FROM recall_documents_fts f JOIN recall_documents d ON d.rowid=f.rowid "
-                f"WHERE recall_documents_fts MATCH ? AND {allowed} ORDER BY bm25(recall_documents_fts), d.id LIMIT 500",
-                (fts,),
+                f"WHERE recall_documents_fts MATCH ? AND {allowed}{kind_clause} ORDER BY bm25(recall_documents_fts), d.id LIMIT 500",
+                (fts, *kind_params),
             ).fetchall()
             lists["fts"] = [row[0] for row in rows if row[0] not in excluded]
         except Exception:
             lists["fts"] = []
 
     dense_pairs = list(dense or ())
-    dense_eligible = _eligible_ids(conn, [doc_id for doc_id, _cosine in dense_pairs], query, excluded) if dense_pairs else set()
+    dense_eligible = _eligible_ids(conn, [doc_id for doc_id, _cosine in dense_pairs], query, excluded, kinds) if dense_pairs else set()
     dense_ids = [doc_id for doc_id, _cosine in dense_pairs if doc_id in dense_eligible]
 
     pool = dict.fromkeys(lists.get("fts", ()))
     pool.update(dict.fromkeys(dense_ids))
     if not is_prompt:
-        pool.update(dict.fromkeys(_recent_ids(conn, query, excluded, RECENT_POOL_SIZE)))
+        pool.update(dict.fromkeys(_recent_ids(conn, query, excluded, RECENT_POOL_SIZE, kinds)))
     all_docs, path_texts = _load_pool(conn, pool, stored=stored_path_text)
     by_id = {doc.id: doc for doc in all_docs}
     # On a connection that is not immutable a writer can delete a row between

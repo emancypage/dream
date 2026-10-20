@@ -1139,3 +1139,12 @@ def test_recall_search_kinds_filter_applies_before_the_dense_limit(home, tmp_pat
     assert "PostgreSQL" in approved["context"]
     every = _tool(config, db, "recall_search", {"query": "jaka baza danych"})["structuredContent"]
     assert {row["kind"] for row in every["results"]} == {"distilled_summary"}
+
+
+def test_recall_search_kinds_filter_applies_inside_the_full_text_limit(home, tmp_path):
+    from test_recall_agent import CROWDING_SUMMARIES, LONG_DEPLOY_MEMORY
+    _memory, db = _store(home, {"deploy.md": LONG_DEPLOY_MEMORY}, rows=CROWDING_SUMMARIES)
+    config = _config(tmp_path)
+    approved = _tool(config, db, "recall_search", {"query": "kubernetes rollout", "kinds": ["approved_memory"]})
+    assert [row["kind"] for row in approved["structuredContent"]["results"]] == ["approved_memory"]
+    assert "kubernetes rollout and argo" in approved["structuredContent"]["context"]

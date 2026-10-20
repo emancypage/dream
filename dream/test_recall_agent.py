@@ -723,3 +723,38 @@ def test_requested_kinds_without_vectors_make_no_embedder_call():
                               constitution_path=None, kinds=["approved_memory"], limit=10, embedder=Counting())
     assert result.selected == () and result.diagnostics.fallback_reason == "embedder-no-vectors"
     assert Counting.calls == 0
+
+
+# --- requested kinds filter the full-text candidate query itself --------------------
+
+# A long approved memory: bm25 ranks it below many short summaries that repeat the terms.
+LONG_DEPLOY_MEMORY = ("---\nname: deploy\n---\n" + "General operations notes. " * 200
+                      + "We deploy with kubernetes rollout and argo.\n")
+CROWDING_SUMMARIES = [{"doc_id": f"sum-{index:04d}", "text": f"Session {index}: kubernetes rollout kubernetes rollout checked."}
+                      for index in range(600)]
+
+
+def test_600_matching_summaries_cannot_crowd_an_approved_memory_out_of_the_full_text_limit(agent_env, capsys):
+    _memory, db = _store(agent_env, {"deploy.md": LONG_DEPLOY_MEMORY}, rows=CROWDING_SUMMARIES)
+    config = _write_config(agent_env)
+    for extra in ((), ("--limit", "10")):
+        payload = _json(capsys, config, db, "kubernetes rollout", "--kinds", "approved_memory", *extra)
+        assert [result["kind"] for result in payload["results"]] == ["approved_memory"]
+        assert "kubernetes rollout and argo" in payload["context"]
+    every = _json(capsys, config, db, "kubernetes rollout")
+    assert {result["kind"] for result in every["results"]} == {"distilled_summary"}
+
+
+def test_rank_lexical_kinds_filter_the_full_text_and_recent_pools(agent_env):
+    from storage import open_db_readonly
+    from recall_query import rank_lexical
+    from recall_types import RecallQuery
+    _memory, db = _store(agent_env, {"deploy.md": LONG_DEPLOY_MEMORY}, rows=CROWDING_SUMMARIES)
+    conn = open_db_readonly(db)
+    prompt = RecallQuery("kubernetes rollout", None, "prompt", None, (), 4000, frozenset(), False)
+    assert {candidate.document.source_kind for candidate in rank_lexical(conn, prompt)} == {"distilled_summary"}
+    only = rank_lexical(conn, prompt, kinds=("approved_memory",))
+    assert [candidate.document.source_path for candidate in only] == ["deploy.md"]
+    start = RecallQuery("/nowhere", None, "session-start:startup", "/nowhere", (), 6000, frozenset(), False)
+    assert {candidate.document.source_kind for candidate in rank_lexical(conn, start, kinds=("approved_memory",))} <= {"approved_memory"}
+    conn.close()

@@ -945,3 +945,24 @@ def test_cli_mode_flag_overrides_the_configured_mode(tmp_path, monkeypatch):
 def test_cli_rejects_an_unknown_mode():
     with pytest.raises(SystemExit):
         dream.main(["consolidate", "--mode", "partial"])
+
+
+def test_matching_summaries_cannot_crowd_memory_files_out_of_subset_ranking(tmp_path):
+    from dream import rebuild_recall_fts
+    root, conn = _store(tmp_path, extra={"deploy.md": "---\nname: deploy\n---\n" + "General operations notes. " * 200
+                                         + "We deploy with kubernetes rollout and argo.\n"})
+    eligible = {path.name for path in root.glob("*.md")}
+    groups = ["Checked the kubernetes rollout again"]
+    assert C._ranked_memory_files(conn, groups, eligible, 15, None) == ["deploy.md"]
+    for index in range(600):
+        text = f"Session {index}: kubernetes rollout checked."
+        conn.execute("INSERT INTO recall_documents(id, content_sha256, source_kind, trust_level, project_slug, source_path, "
+                     "source_updated_at, indexed_at, source_version, text) VALUES (?, ?, 'distilled_summary', 'model_distilled', "
+                     "NULL, ?, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z', 'v1', ?)",
+                     (f"sum-{index:04d}", hashlib.sha256(text.encode()).hexdigest(), f"distilled:{index}", text))
+    rebuild_recall_fts(conn)
+    conn.commit()
+    assert C._ranked_memory_files(conn, groups, eligible, 15, None) == ["deploy.md"]
+    selected = _names(_select(conn, root, _batch("Checked the kubernetes rollout again"),
+                              ConsolidateSettings(mode="subset", subset_files=3)))
+    assert selected[:2] == ["MEMORY.md", "deploy.md"]

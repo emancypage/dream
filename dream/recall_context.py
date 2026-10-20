@@ -168,7 +168,7 @@ def retrieve(conn, query: RecallQuery, settings, calibrations, *, embedder=None,
     # Usage only reorders exact ties, and only once switched on; an unmigrated
     # or read-only database without recall_usage simply yields no usage.
     usage = usage_map(conn) if getattr(settings, "usage_tie_break", False) else None
-    candidates = rank_lexical(conn, query, dense=dense, usage=usage)
+    candidates = rank_lexical(conn, query, dense=dense, usage=usage, kinds=kinds)
     if keep is not None:
         candidates = [candidate for candidate in candidates if keep(candidate)]
     candidates, mode, adapter_fallback = apply_optional_adapters(

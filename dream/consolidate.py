@@ -427,7 +427,8 @@ def _ranked_memory_files(conn, groups: list[str], eligible: set[str], limit: int
         if dense is None:
             # Off, or failed: one failure is reported once, not once per group.
             embedder = None
-        candidates = rank_lexical(conn, query) if dense is None else rank_lexical(conn, query, dense=dense)
+        # Only approved memory files count, so only they may take places under the full-text limit.
+        candidates = rank_lexical(conn, query, dense=dense, kinds=("approved_memory",))
         rank = 0
         for candidate in candidates:
             name = candidate.document.source_path
