@@ -548,6 +548,7 @@ def _recall_unavailable(reason: str) -> int:
 def cmd_recall(args: argparse.Namespace) -> int:
     """Agent-side recall over approved memory, read-only and fail-open.
 
+    Without ``--kinds`` it reads approved memory and distilled summaries.
     Usage errors (an empty query, ``raw_transcript`` without the opt-in)
     exit 2. A missing or busy database, an unmigrated schema or disabled
     recall print one ``unavailable`` line to stderr and exit 0. The command
@@ -580,22 +581,29 @@ def cmd_recall(args: argparse.Namespace) -> int:
         )
     except RecallUnavailable as exc:
         return _recall_unavailable(str(exc))
-    except Exception as exc:
+    except sqlite3.Error as exc:
         return _recall_unavailable(f"{type(exc).__name__}: {exc}")
+    except Exception as exc:
+        # Other messages can carry absolute paths (an unreadable policy file); the type is enough.
+        return _recall_unavailable(type(exc).__name__)
     finally:
         if conn is not None:
             conn.close()
-    if args.json:
-        fallback_reason = result.diagnostics.fallback_reason or ("embedder-misconfigured" if embedder_problem else None)
-        print(json.dumps({
-            "mode": result.mode,
-            "calibration_version": result.calibration_version,
-            "fallback_reason": fallback_reason,
-            "results": agent_results(result),
-            "context": result.rendered_context,
-        }, ensure_ascii=False))
-    elif result.rendered_context:
-        print(result.rendered_context)
+    try:
+        if args.json:
+            fallback_reason = result.diagnostics.fallback_reason or ("embedder-misconfigured" if embedder_problem else None)
+            print(json.dumps({
+                "mode": result.mode,
+                "calibration_version": result.calibration_version,
+                "fallback_reason": fallback_reason,
+                "results": agent_results(result),
+                "context": result.rendered_context,
+            }, ensure_ascii=False))
+        elif result.rendered_context:
+            print(result.rendered_context)
+    except (UnicodeError, OSError) as exc:
+        # A stdout that cannot encode the marker (latin-1 locale) or is closed: no traceback.
+        return _recall_unavailable(type(exc).__name__)
     return 0
 
 
@@ -1704,8 +1712,8 @@ def main(argv: list[str] | None = None) -> int:
     prc.add_argument("query", help="3-8 content words, passed as one argument")
     prc.add_argument("--project", help="Prefer this project slug; other projects stay eligible")
     prc.add_argument("--kinds", type=_recall_kinds,
-                     help="Comma-separated source kinds (approved_memory, distilled_summary; raw_transcript "
-                          "needs recall.allow_raw_transcript_prompt)")
+                     help="Comma-separated source kinds (default approved_memory,distilled_summary; "
+                          "raw_transcript must be named and needs recall.allow_raw_transcript_prompt)")
     prc.add_argument("--limit", type=int, default=5, help="Results to return, clamped to 1-10 (default 5)")
     prc.add_argument("--json", action="store_true",
                      help="Print one JSON object with mode, calibration version, results and the rendered context")
@@ -1806,7 +1814,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({"error": type(exc).__name__, "message": str(exc)[:400]}, separators=(",", ":")))
             return 0
         if args.cmd == "recall":
-            return _recall_unavailable(f"configuration error: {type(exc).__name__}: {exc}")
+            return _recall_unavailable(f"configuration error: {type(exc).__name__}")
         raise
     args.db = Path(args.db).expanduser() if args.db else args.config.db_path
     if hasattr(args, "memory"):

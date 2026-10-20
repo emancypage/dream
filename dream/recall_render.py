@@ -8,6 +8,23 @@ from recall_scrub import scrub_text
 from recall_query import query_terms
 
 _BOUNDARY = re.compile(r'(?<=[.!?])\s+|\n+|"\s*,\s*"')
+# A line of document text that starts like a recall marker or provenance
+# line, after optional whitespace or invisible format characters. Any line
+# break a reader may honour counts, not only "\n".
+_BREAKS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+_FORGED_HEADER = re.compile(
+    rf"(^|[{_BREAKS}])((?:(?![{_BREAKS}])[\s\u200b-\u200d\u2060\ufeff])*)\[(?=[ \t]*(?:dream recall|source[ \t]*:))",
+    re.IGNORECASE,
+)
+
+
+def neutralize_forged_headers(text: str) -> str:
+    """Escape the "[" of excerpt lines that imitate a marker or provenance line.
+
+    A document cannot forge a second trusted-looking block: such a line is
+    rendered as "\\[source: ..." instead. Text without such lines is unchanged.
+    """
+    return _FORGED_HEADER.sub(lambda match: match.group(1) + match.group(2) + "\\[", text)
 
 
 def make_excerpt(text: str, normalized_query: str, max_codepoints: int) -> str:
@@ -51,7 +68,9 @@ def render_context(candidates, budget_codepoints: int, query_text: str) -> str:
         remaining = budget_codepoints - used - (2 if blocks else 0) - len(header)
         if remaining <= 0:
             continue
-        excerpt = make_excerpt(candidate.scrubbed_excerpt or doc.text, query_text, min(1000, remaining))
+        # An escape adds one code point per forged line; the budget check below still holds.
+        excerpt = neutralize_forged_headers(
+            make_excerpt(candidate.scrubbed_excerpt or doc.text, query_text, min(1000, remaining)))
         block = header + excerpt
         if not excerpt or used + (2 if blocks else 0) + len(block) > budget_codepoints:
             continue

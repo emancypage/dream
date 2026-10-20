@@ -200,6 +200,8 @@ def run_context(conn, query: RecallQuery, settings, explain: bool = False, *, em
 AGENT_QUERY_EVENT = "agent-query"
 AGENT_QUERY_MAX_LIMIT = 10
 RECALL_KINDS = ("approved_memory", "distilled_summary", "raw_transcript")
+# Agent queries read approved memory and distilled summaries unless raw transcripts are asked for explicitly.
+AGENT_DEFAULT_KINDS = frozenset({"approved_memory", "distilled_summary"})
 # Every agent query reads these. recall_embeddings is optional: without it ranking stays lexical.
 AGENT_RECALL_TABLES = ("recall_documents", "recall_documents_fts", "recall_calibrations")
 
@@ -213,16 +215,17 @@ def missing_recall_tables(conn) -> tuple[str, ...]:
     return tuple(name for name in AGENT_RECALL_TABLES if name not in names)
 
 
-def validate_agent_query(query_text, kinds, settings) -> tuple[str, frozenset[str] | None]:
+def validate_agent_query(query_text, kinds, settings) -> tuple[str, frozenset[str]]:
     """Check one agent query's user input: ``(query_text, kinds)`` or ValueError.
 
-    ``kinds`` None keeps every kind the prompt path allows. ``raw_transcript``
-    is accepted only when ``recall.allow_raw_transcript_prompt`` is true.
+    ``kinds`` None means approved memory and distilled summaries, even when
+    raw transcript recall is enabled. An explicit ``raw_transcript`` is
+    accepted only when ``recall.allow_raw_transcript_prompt`` is true.
     """
     if not isinstance(query_text, str) or not query_text.strip():
         raise ValueError("expected a non-empty query")
     if kinds is None:
-        return query_text, None
+        return query_text, AGENT_DEFAULT_KINDS
     if not isinstance(kinds, (list, tuple, set, frozenset)):
         raise ValueError("kinds must be a list of kind names")
     names = tuple(dict.fromkeys(kind.strip() if isinstance(kind, str) else repr(kind)[:40] for kind in kinds))
@@ -262,8 +265,10 @@ def recall_for_agent(conn, settings, *, query_text, cwd, memory_root, constituti
     apply, and runs with ``allow_cache_writes=False``. ``conn`` should be a
     read-only connection; nothing here writes markers, cache rows or files.
     ``project_slug`` joins the path evidence as a soft boost: every project
-    stays eligible. ``kinds`` is a hard filter and ``limit`` is clamped to
-    1-10. ``selected`` holds the candidates whose block is in the rendered
+    stays eligible. ``kinds`` is a hard filter that defaults to approved
+    memory and distilled summaries; raw transcripts need an explicit
+    ``raw_transcript`` and the opt-in. ``limit`` is clamped to 1-10.
+    ``selected`` holds the candidates whose block is in the rendered
     context. Invalid input raises ValueError; a disabled or unmigrated store
     raises RecallUnavailable.
     """
@@ -279,7 +284,7 @@ def recall_for_agent(conn, settings, *, query_text, cwd, memory_root, constituti
     missing = missing_recall_tables(conn)
     if missing:
         raise RecallUnavailable("recall tables missing: " + ", ".join(missing))
-    allow_raw = settings.allow_raw_transcript_prompt and (allowed is None or "raw_transcript" in allowed)
+    allow_raw = settings.allow_raw_transcript_prompt and "raw_transcript" in allowed
     query = RecallQuery(query_text, None, AGENT_QUERY_EVENT, str(cwd) if cwd else None, (project,) if project else (),
                         int(budget_codepoints), frozenset(), allow_raw)
     result = run_context(conn, query, settings, embedder=embedder, allow_cache_writes=False, memory_root=memory_root,
