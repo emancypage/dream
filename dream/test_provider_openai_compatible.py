@@ -1,9 +1,10 @@
 """OpenAI-compatible generation provider against a loopback fake server."""
 
 import json
+import socket
 import sqlite3
 import threading
-import urllib.error
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -320,14 +321,116 @@ def test_provider_timeout_is_only_a_fallback_for_direct_requests(server):
 
 
 def test_connect_timeout_is_a_provider_error(server, monkeypatch):
-    class TimingOutOpener:
-        def open(self, request, timeout):
-            raise urllib.error.URLError(TimeoutError("connect timed out"))
+    class TimingOutConnection:
+        sock = None
 
-    monkeypatch.setattr(openai_compatible, "_opener", lambda: TimingOutOpener())
+        def connect(self):
+            raise TimeoutError("connect timed out")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(openai_compatible, "_connection", lambda parts, timeout: TimingOutConnection())
 
     with pytest.raises(ProviderError, match="timed out after 30s"):
         openai_compatible.generate(_request(), _settings(server))
+
+
+def _drip_server(stop, mode, interval=0.05):
+    """A raw socket server that keeps making progress, one body byte or one header line at a time."""
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(5)
+    listener.settimeout(0.05)
+    body = json.dumps(_completion(json.dumps({"value": "late"}))).encode()
+
+    def handle(client):
+        try:
+            client.recv(65536)
+            if mode == "body-drip":
+                client.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body))
+                for byte in body:
+                    if stop.is_set():
+                        break
+                    client.sendall(bytes([byte]))
+                    time.sleep(interval)
+            else:
+                client.sendall(b"HTTP/1.1 200 OK\r\n")
+                for index in range(200):
+                    if stop.is_set():
+                        break
+                    time.sleep(interval)
+                    client.sendall(b"X-Pad-%d: y\r\n" % index)
+                client.sendall(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+        except OSError:
+            pass
+        finally:
+            client.close()
+
+    def loop():
+        while not stop.is_set():
+            try:
+                client, _address = listener.accept()
+            except (socket.timeout, OSError):
+                continue
+            threading.Thread(target=handle, args=(client,), daemon=True).start()
+
+    threading.Thread(target=loop, daemon=True).start()
+    return f"http://127.0.0.1:{listener.getsockname()[1]}", listener
+
+
+@pytest.fixture
+def drip_server():
+    stop = threading.Event()
+    listeners = []
+
+    def start(mode):
+        url, listener = _drip_server(stop, mode)
+        listeners.append(listener)
+        return url
+
+    try:
+        yield start
+    finally:
+        stop.set()
+        for listener in listeners:
+            listener.close()
+
+
+@pytest.mark.parametrize("mode", ["body-drip", "header-drip"])
+def test_a_server_that_keeps_sending_cannot_stretch_the_call_past_its_timeout(server, drip_server, mode):
+    # Each byte or header line arrives well within the socket timeout; only the deadline stops the call.
+    url = drip_server(mode)
+    started = time.monotonic()
+    with pytest.raises(ProviderError, match="timed out after 0.5s"):
+        openai_compatible.generate(_request(timeout_seconds=0.5), _settings(server, base_url=url))
+    assert time.monotonic() - started < 0.5 + 0.4
+
+
+def test_preflight_is_bounded_by_its_deadline(server, drip_server):
+    started = time.monotonic()
+    ok, detail = preflight_provider(_settings(server, base_url=drip_server("header-drip"), timeout_seconds=0.5))
+    assert not ok and "timed out after 0.5s" in detail
+    assert time.monotonic() - started < 0.5 + 0.4
+
+
+def test_the_json_object_retry_gets_only_what_is_left_of_the_deadline(server):
+    def responder(request):
+        if len(server.chat_requests()) == 1:
+            time.sleep(0.6)
+            return 400, {"error": {"message": "response_format json_schema is not supported"}}
+        server.release.wait(5)
+        return 200, _completion(json.dumps({"value": "late"}))
+
+    server.responder = responder
+
+    started = time.monotonic()
+    with pytest.raises(ProviderError, match="timed out after 1s"):
+        openai_compatible.generate(_request(timeout_seconds=1), _settings(server))
+    # A fresh timeout for the retry would take 0.6 s + 1 s.
+    assert time.monotonic() - started < 1.0 + 0.4
+    assert len(server.chat_requests()) == 2
 
 
 def test_oversized_response_body_is_rejected(server, monkeypatch):
@@ -874,3 +977,80 @@ def test_codex_refresh_comparison_is_unchanged(tmp_path, monkeypatch, server):
     # Recorded stage settings never override the column comparison for CLI routes.
     conn.execute("UPDATE distilled SET provider = 'openai-compatible'")
     assert _pending(conn, _codex_config(tmp_path)) == ["s1"]
+
+
+def _consume(conn) -> None:
+    """Mark every current distillation as consumed, as a consolidation run does."""
+    conn.execute("INSERT INTO consolidation_runs(run_id, provider, model) VALUES ('run-1', 'codex', NULL)")
+    conn.execute(
+        "INSERT INTO consolidated_distillations(distillation_key, session_id, run_id) "
+        "SELECT distillation_key, session_id, 'run-1' FROM distilled"
+    )
+    conn.commit()
+
+
+def test_a_refreshed_endpoint_gets_a_distillation_key_consolidation_has_not_consumed(tmp_path, monkeypatch, server):
+    from consolidate import collect_distilled_batch
+
+    served = "qwen3-32b-q4_k_m.gguf"
+    server.responder = lambda request: (200, _completion(json.dumps(DISTILL_OUTPUT), model=served))
+    config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+    distill_session(conn, "s1", config=config)
+    first_key = conn.execute("SELECT distillation_key FROM distilled").fetchone()[0]
+    _consume(conn)
+    assert collect_distilled_batch(conn, None) == []
+
+    other = _FakeServer()
+    try:
+        refreshed = {**DISTILL_OUTPUT, "summary": "Moved distillation to the second local server."}
+        other.responder = lambda request: (200, _completion(json.dumps(refreshed), model=served))
+        moved = _routed_config(tmp_path, other)
+        assert _pending(conn, moved) == ["s1"]
+        distill_session(conn, "s1", config=moved)
+    finally:
+        other.close()
+
+    # Same stage settings and served model, another endpoint: a new identity.
+    second_key = conn.execute("SELECT distillation_key FROM distilled").fetchone()[0]
+    assert second_key != first_key
+    [(session_id, _ts, notes, key)] = collect_distilled_batch(conn, None)
+    assert (session_id, key, notes["summary"]) == ("s1", second_key, refreshed["summary"])
+
+
+def test_cli_route_distillation_keys_are_unchanged(tmp_path, monkeypatch, server):
+    import hashlib
+
+    import distill
+    _config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+    config = _codex_config(tmp_path)
+    monkeypatch.setattr(distill, "generate", lambda *args, **kwargs: GenerationResult(
+        output=DISTILL_OUTPUT, raw_result="{}", provider="codex", model=None, usage=None, duration_ms=1,
+    ))
+    distill_session(conn, "s1", config=config)
+    material = "\0".join(["s1", "", "", prompt_version(), "codex", "",
+                          json.dumps(config.stage("distill"), sort_keys=True)])
+    stored = conn.execute("SELECT distillation_key FROM distilled").fetchone()[0]
+    assert stored == hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def test_refresh_compares_the_route_of_a_provider_named_openai_compatible(tmp_path, monkeypatch, server):
+    # The route name equals the recorded provider type and the stage model equals
+    # the served model, so the session and provider columns match a changed base_url.
+    served = "qwen3-32b-q4_k_m.gguf"
+    server.responder = lambda request: (200, _completion(json.dumps(DISTILL_OUTPUT), model=served))
+    _config, conn = _distill_fixture(tmp_path, monkeypatch, server)
+
+    def literal(base_url):
+        path = tmp_path / "literal.toml"
+        path.write_text(
+            f'[storage]\ndb_path = "{tmp_path / "dream.db"}"\nmemory_root = "{tmp_path / "memory"}"\n'
+            f'[stages.distill]\nprovider = "openai-compatible"\nmodel = "{served}"\n'
+            f'[providers.openai-compatible]\ntype = "openai-compatible"\nbase_url = "{base_url}"\n',
+            encoding="utf-8",
+        )
+        return load_config(path)
+
+    distill_session(conn, "s1", config=literal(server.base_url))
+    assert _pending(conn, literal(server.base_url)) == []
+    assert _pending(conn, literal("http://127.0.0.1:18081")) == ["s1"]
+    assert _pending(conn, literal("http://127.0.0.1:18081"), refresh=False) == []

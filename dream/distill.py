@@ -145,7 +145,7 @@ def distill_session(
         duration_ms=res.duration_ms,
     )
 
-    key_material = "\0".join([
+    key_parts = [
         session_id,
         source_revision or "",
         parser_version or "",
@@ -153,7 +153,14 @@ def distill_session(
         res.provider,
         res.model or "",
         json.dumps(cfg.stage("distill"), sort_keys=True),
-    ])
+    ]
+    snapshot = _local_route_snapshot(cfg, model) if res.provider == "openai-compatible" else None
+    if snapshot is not None:
+        # The effective request --refresh compares, so a route refreshed for
+        # another base_url (same stage settings, same served model) gets a key
+        # consolidation has not consumed. CLI routes keep their keys unchanged.
+        key_parts.append(json.dumps(snapshot, sort_keys=True))
+    key_material = "\0".join(key_parts)
     distillation_key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
     usage_json = json.dumps({
         "input_tokens": res.input_tokens,
@@ -300,6 +307,8 @@ def sessions_needing_distill(
     stage = cfg.stage("distill")
     provider_name = stage["provider"]
     model_name = stage.get("model")
+    # ``model`` is the --model override, which takes precedence in the request as well.
+    current_route = _local_route_snapshot(cfg, model) if refresh_config else None
     sql = """
         SELECT s.session_id, s.total_chars
         FROM sessions s
@@ -313,10 +322,15 @@ def sessions_needing_distill(
                OR COALESCE(d.provider, '') <> ?
                OR COALESCE(d.model, '') <> COALESCE(?, '')
            ))
+           -- Every openai-compatible row reaches the effective-route comparison:
+           -- with a route literally named "openai-compatible" and a stage model
+           -- equal to the served one, the columns above match a changed base_url.
+           OR (? AND d.provider = 'openai-compatible')
         )
           AND s.total_chars >= ?
     """
-    params: list = [int(refresh_config), prompt_version(), provider_name, model_name, min_chars]
+    params: list = [int(refresh_config), prompt_version(), provider_name, model_name,
+                    int(current_route is not None), min_chars]
     if project_slug:
         sql += " AND s.project_slug = ?"
         params.append(project_slug)
@@ -325,8 +339,6 @@ def sessions_needing_distill(
     excluded_sessions = {row[0] for row in conn.execute("SELECT session_id, project_slug FROM sessions")
                          if policy.excludes(project_slug=row[1])}
     rows = conn.execute(sql, params).fetchall()
-    # ``model`` is the --model override, which takes precedence in the request as well.
-    current_route = _local_route_snapshot(cfg, model) if refresh_config else None
     if current_route is not None:
         rows = _drop_unchanged_local_routes(conn, rows, stage, current_route)
     return [(r[0], r[1]) for r in rows if r[0] not in excluded_sessions]

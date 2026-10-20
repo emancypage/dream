@@ -15,9 +15,15 @@ no streaming and no tool calls.
   * The stage's `model` and `timeout_seconds` win; the provider's values are
     defaults, and the final timeout fallback is 600 s. backend.generate
     resolves the timeout, this module the model.
-  * Proxy environment variables are ignored and redirects are refused, so the
-    prompt and the optional key reach only the configured host. A
-    non-loopback `base_url` additionally needs `remote_data_egress = true`.
+  * The timeout is one wall-clock deadline for the whole call: connect,
+    headers, the success or error body and the json_object retry. Each
+    exchange runs in a daemon thread; when the deadline passes its socket is
+    shut down and ProviderError is raised, so a server that drips bytes
+    cannot hold a stage past its timeout.
+  * Requests go over `http.client`, which reads no proxy variables and
+    follows no redirects, so the prompt and the optional key reach only the
+    configured host. A non-loopback `base_url` additionally needs
+    `remote_data_egress = true`.
   * `api_key_env` names an environment variable read at call time; its value
     is sent as a Bearer header and is never logged, returned or stored.
 """
@@ -27,9 +33,10 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import socket
+import ssl
+import threading
 import time
-import urllib.error
-import urllib.request
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -48,17 +55,11 @@ PREFLIGHT_TIMEOUT_SECONDS = 5.0
 _RESPONSE_BODY_LIMIT = 16 * 1024 * 1024
 _ERROR_BODY_LIMIT = 65536
 _ERROR_EXCERPT_CHARS = 300
+_READ_CHUNK = 65536
 
 
-class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None  # Surfaces the 3xx as an HTTPError instead of following it.
-
-
-def _opener() -> urllib.request.OpenerDirector:
-    # ProxyHandler({}) ignores http_proxy and friends; with redirects refused,
-    # every request reaches only the configured base_url.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _RefuseRedirects)
+class _Aborted(Exception):
+    """The caller gave up on this exchange; the worker stops at its next step."""
 
 
 class _HTTPStatusError(ProviderError):
@@ -94,13 +95,15 @@ def generate(request: GenerationRequest, settings: Mapping[str, Any]) -> Generat
         "json_schema": {"name": "dream_output", "schema": request.schema, "strict": True},
     }
     t0 = time.monotonic()
+    # One deadline for both attempts: the fallback gets only what is left.
+    deadline = t0 + timeout
     try:
-        data = _request_json("POST", url, _payload(request, model, strict), settings, timeout)
+        data = _request_json("POST", url, _payload(request, model, strict), settings, timeout, deadline)
     except _HTTPStatusError as exc:
         if not exc.rejects_response_format():
             raise
         fallback = _payload(request, model, {"type": "json_object"}, schema_in_prompt=True)
-        data = _request_json("POST", url, fallback, settings, timeout)
+        data = _request_json("POST", url, fallback, settings, timeout, deadline)
     content, finish_reason = _message_content(data)
     output = _parse_json(content, finish_reason)
     validate_output(output, request.schema)
@@ -120,7 +123,8 @@ def preflight(settings: Mapping[str, Any]) -> tuple[bool, str]:
     try:
         base_url = _checked_base_url(settings)
         timeout = min(PREFLIGHT_TIMEOUT_SECONDS, _timeout(settings, None))
-        data = _request_json("GET", _endpoint(base_url, "models"), None, settings, timeout)
+        data = _request_json("GET", _endpoint(base_url, "models"), None, settings, timeout,
+                             time.monotonic() + timeout)
     except ProviderError as exc:
         return False, str(exc)
     entries = data.get("data") if isinstance(data, dict) else None
@@ -188,7 +192,12 @@ def _request_json(
     payload: dict[str, Any] | None,
     settings: Mapping[str, Any],
     timeout: float,
+    deadline: float,
 ) -> Any:
+    """One request that must finish by ``deadline`` (a ``time.monotonic()`` value).
+
+    ``timeout`` is the call's whole budget, named in the timeout message.
+    """
     display = _display(url)
     headers = {"Accept": "application/json"}
     body = None
@@ -199,20 +208,36 @@ def _request_json(
     api_key = os.environ.get(key_env) if key_env else None
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    try:
-        with _opener().open(req, timeout=timeout) as response:
-            raw = response.read(_RESPONSE_BODY_LIMIT + 1)
-    except urllib.error.HTTPError as exc:
-        raise _HTTPStatusError(display, exc.code, _error_body(exc), api_key) from exc
-    except TimeoutError as exc:
-        raise ProviderError(f"{PROVIDER} server at {display} timed out after {timeout:g}s") from exc
-    except urllib.error.URLError as exc:
-        if isinstance(exc.reason, TimeoutError):
-            raise ProviderError(f"{PROVIDER} server at {display} timed out after {timeout:g}s") from exc
-        raise ProviderError(f"{PROVIDER} server at {display} is unreachable: {exc.reason}") from exc
-    except (OSError, http.client.HTTPException) as exc:
-        raise ProviderError(f"{PROVIDER} request to {display} failed: {type(exc).__name__}") from exc
+    timed_out = ProviderError(f"{PROVIDER} server at {display} timed out after {timeout:g}s")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise timed_out
+    parts = urlsplit(url)
+    connection = _connection(parts, remaining)
+    aborted = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    def exchange() -> None:
+        try:
+            outcome["response"] = _exchange(connection, method, parts.path, body, headers, display, aborted)
+        except BaseException as exc:  # handed to the caller's thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=exchange, name="dream-openai-compatible", daemon=True)
+    worker.start()
+    worker.join(max(0.0, deadline - time.monotonic()))
+    if worker.is_alive():
+        _abort(connection, aborted)
+        raise timed_out
+    if "error" in outcome:
+        error = outcome["error"]
+        if isinstance(error, (TimeoutError, socket.timeout)):
+            raise timed_out from error
+        raise error
+    status, raw = outcome["response"]
+    if not 200 <= status < 300:
+        # Redirects are never followed: a 3xx is reported like any other status.
+        raise _HTTPStatusError(display, status, raw.decode("utf-8", errors="replace"), api_key)
     if len(raw) > _RESPONSE_BODY_LIMIT:
         raise ProviderError(f"{PROVIDER} response from {display} exceeds {_RESPONSE_BODY_LIMIT} bytes")
     try:
@@ -221,11 +246,87 @@ def _request_json(
         raise ProviderError(f"{PROVIDER} server at {display} returned a non-JSON response") from exc
 
 
-def _error_body(exc: urllib.error.HTTPError) -> str:
+def _connection(parts, timeout: float) -> http.client.HTTPConnection:
+    if parts.scheme == "https":
+        return http.client.HTTPSConnection(parts.hostname, parts.port, timeout=timeout,
+                                           context=ssl.create_default_context())
+    return http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
+
+
+def _exchange(connection, method: str, path: str, body: bytes | None, headers: dict, display: str,
+              aborted: threading.Event) -> tuple[int, bytes] | None:
+    """One request on a fresh connection: ``(status, body)``, the body read only up to its limit.
+
+    The worker checks ``aborted`` after connecting and before every read, so
+    it never carries on alone once the caller has given up. Socket timeouts
+    propagate for the caller to report.
+    """
     try:
-        return exc.read(_ERROR_BODY_LIMIT).decode("utf-8", errors="replace")
-    except (OSError, http.client.HTTPException):
-        return ""
+        try:
+            connection.connect()
+        except (TimeoutError, socket.timeout):
+            raise
+        except OSError as exc:
+            raise ProviderError(f"{PROVIDER} server at {display} is unreachable: "
+                                f"{exc.strerror or type(exc).__name__}") from None
+        if aborted.is_set():
+            return None
+        connection.request(method, path or "/", body=body, headers=headers)
+        if aborted.is_set():
+            return None
+        response = connection.getresponse()
+        if aborted.is_set():
+            return None
+        limit = _RESPONSE_BODY_LIMIT + 1 if 200 <= response.status < 300 else _ERROR_BODY_LIMIT
+        try:
+            raw = _read_bounded(response, limit, aborted)
+        except (OSError, http.client.HTTPException):
+            if 200 <= response.status < 300:
+                raise
+            raw = b""  # An unreadable error body still reports the status.
+        return response.status, raw
+    except _Aborted:
+        return None
+    except (TimeoutError, socket.timeout):
+        raise
+    except (OSError, http.client.HTTPException) as exc:
+        raise ProviderError(f"{PROVIDER} request to {display} failed: {type(exc).__name__}") from None
+    finally:
+        connection.close()
+
+
+def _read_bounded(response, limit: int, aborted: threading.Event) -> bytes:
+    """Read at most ``limit`` bytes in small reads, stopping when the caller gives up."""
+    chunks: list[bytes] = []
+    total = 0
+    while total < limit:
+        if aborted.is_set():
+            raise _Aborted()
+        chunk = response.read1(min(_READ_CHUNK, limit - total))
+        if not chunk:
+            break
+        total += len(chunk)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _abort(connection, aborted: threading.Event) -> None:
+    """Tell the worker to stop, wake it if it is blocked on the socket, and drop the connection.
+
+    A worker still inside ``connect()`` finishes connecting (bounded by the
+    socket timeout), sees the event and closes without sending anything.
+    """
+    aborted.set()
+    sock = getattr(connection, "sock", None)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    try:
+        connection.close()
+    except Exception:
+        pass
 
 
 def _message_content(data: Any) -> tuple[str, str | None]:
