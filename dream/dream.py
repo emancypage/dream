@@ -55,7 +55,7 @@ from recall_hook_state import claim_hook_event, finish_hook_event, successful_se
 from recall_render import delivered_ids  # noqa: E402
 from recall_hooks import install_hooks, uninstall_hooks  # noqa: E402
 from storage import open_db_readonly  # noqa: E402
-from retention_policy import POLICY_FILE, excludes_source_sessions, load_retention_policy  # noqa: E402
+from retention_policy import POLICY_FILE, excludes_source_sessions, excludes_suggestion, load_retention_policy  # noqa: E402
 
 
 def _sync_recall_documents(conn: sqlite3.Connection, memory_root,
@@ -1010,13 +1010,25 @@ def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, ro
         return 0
 
     try:
-        snapshots = [
-            _curation_target_snapshot(memory_root, row, _find_text(conn, row[0]) if row[1] == "patch" else None)
-            for row in rows
-        ]
+        # A rule added after a suggestion was staged: its fields never reach the
+        # provider, and `dream retention --apply` rejects it.
+        policy = load_retention_policy(memory_root)
+        snapshots = []
+        for row in rows:
+            find_text = _find_text(conn, row[0]) if row[1] == "patch" else None
+            if excludes_suggestion(conn, policy, memory_root, target_path=row[2], source_sessions=row[5],
+                                   texts=(row[3], row[4], find_text)):
+                print(f"skipped #{row[0]}: excluded by local memory retention policy; "
+                      "dream retention --apply rejects it")
+                continue
+            snapshots.append(_curation_target_snapshot(memory_root, row, find_text))
+        if not snapshots:
+            conn.close()
+            print("No pending suggestions to curate.")
+            return 0
         prompt = build_curation_prompt(snapshots, memory_root)
         result = generate("review", prompt, CURATION_SCHEMA, config=args.config)
-        decisions = parse_curation_output(result.output, {row[0] for row in rows})
+        decisions = parse_curation_output(result.output, {snapshot["id"] for snapshot in snapshots})
         missing_merge_bodies = [
             sug_id for sug_id, decision in decisions.items()
             if decision.decision == "merge" and not isinstance(decision.body, str)
