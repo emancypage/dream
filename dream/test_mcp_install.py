@@ -722,3 +722,33 @@ def test_a_read_only_config_is_refused(home, tmp_path, capsys, client):
     assert rc == 1 and out == "" and "is read-only" in err
     assert mode == 0o444 and _backups(path) == []
     assert path.read_text(encoding="utf-8") in ('model = "x"\n', '{"theme": "x"}\n')
+
+
+def test_status_reports_each_file_client_without_writing(home, tmp_path):
+    """``mcp_install.status`` backs ``dream preflight``: it reads with the installers' parsers and writes nothing."""
+    assert [mcp_install.status(client) for client in mcp_install.FILE_CLIENTS] == ["not installed", "not installed"]
+    assert not list(home.iterdir())
+
+    mcp_install.install_codex()
+    mcp_install.install_opencode()
+    snapshot = _files(home)
+    assert [mcp_install.status(client) for client in mcp_install.FILE_CLIENTS] == ["installed", "installed"]
+
+    codex, opencode = mcp_install.codex_config_path(), mcp_install.opencode_config_path()
+    document = json.loads(opencode.read_text(encoding="utf-8"))
+    document["mcp"]["dream"]["enabled"] = False
+    opencode.write_text(json.dumps(document), encoding="utf-8")
+    assert mcp_install.status("opencode") == "installed, disabled"
+
+    codex.write_text('[mcp_servers.dream]\ncommand = "other"\n', encoding="utf-8")
+    opencode.write_text('{"mcp": {"dream": {"type": "remote", "url": "http://127.0.0.1:9"}}}', encoding="utf-8")
+    assert [mcp_install.status(client) for client in mcp_install.FILE_CLIENTS] == [
+        "has an entry not written by dream", "has an entry not written by dream"]
+
+    codex.write_text("[broken\n", encoding="utf-8")
+    snapshot = _files(home)
+    with pytest.raises(mcp_install.McpInstallError, match="not valid TOML"):
+        mcp_install.status("codex")
+    with pytest.raises(mcp_install.McpInstallError, match="no file-based status"):
+        mcp_install.status("claude")
+    assert _files(home) == snapshot

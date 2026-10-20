@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import sqlite3
 import unicodedata
 from pathlib import Path
 
@@ -37,6 +38,15 @@ def normalize_path_text(text: str) -> str:
     value = normalize_query_text(text).replace("/", " ").replace("-", " ")
     parts = [part for part in value.split() if part not in {".", ".."}]
     return " ".join(parts)
+
+
+def document_path_text(project_slug: str | None, source_path: str, text: str) -> str:
+    """The path-evidence haystack of one document, stored as ``recall_documents.path_text``.
+
+    Tokens are separated by single spaces, so a padded substring test is a
+    whole-token match.
+    """
+    return normalize_path_text(" ".join((project_slug or "", source_path, text)))
 
 
 def extract_structured_terms(text: str) -> tuple[str, ...]:
@@ -77,6 +87,16 @@ def _parse_time(value: str | None) -> float:
         return 0.0
 
 
+# Session starts match structure and paths over the FTS and dense candidates
+# plus this many of the most recent eligible documents, never the whole store.
+RECENT_POOL_SIZE = 500
+_SQL_CHUNK = 500
+_DOCUMENT_COLUMNS = (
+    "id, content_sha256, source_kind, trust_level, project_slug, "
+    "source_path, source_updated_at, indexed_at, source_version, text"
+)
+
+
 def _row_document(row) -> RecallDocument:
     return RecallDocument(
         id=row[0], content_sha256=row[1], source_kind=row[2], trust_level=row[3],
@@ -85,19 +105,70 @@ def _row_document(row) -> RecallDocument:
     )
 
 
+def _document_columns(conn) -> set[str]:
+    """The columns of ``recall_documents``; a missing table raises like any query on it."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(recall_documents)")}
+    if not columns:
+        raise sqlite3.OperationalError("no such table: recall_documents")
+    return columns
+
+
+def _load_pool(conn, ids, *, stored: bool) -> tuple[list[RecallDocument], dict[str, str]]:
+    """Load the documents with these IDs and, when ``stored``, their path text, in chunks.
+
+    The path text map holds only non-NULL values; a missing column (an
+    unmigrated, read-only database) or a NULL value is computed on demand.
+    """
+    ids = list(ids)
+    columns = _DOCUMENT_COLUMNS + (", path_text" if stored else "")
+    documents: list[RecallDocument] = []
+    path_texts: dict[str, str] = {}
+    for start in range(0, len(ids), _SQL_CHUNK):
+        chunk = ids[start:start + _SQL_CHUNK]
+        rows = conn.execute(
+            f"SELECT {columns} FROM recall_documents WHERE id IN ({','.join('?' for _ in chunk)})", chunk
+        ).fetchall()
+        for row in rows:
+            documents.append(_row_document(row))
+            if stored and row[10] is not None:
+                path_texts[row[0]] = row[10]
+    return documents, path_texts
+
+
 def _load_documents(conn, ids: list[str] | None = None) -> list[RecallDocument]:
-    sql = (
-        "SELECT id, content_sha256, source_kind, trust_level, project_slug, "
-        "source_path, source_updated_at, indexed_at, source_version, text "
-        "FROM recall_documents"
+    """Load every document, or the documents with these IDs (unknown IDs are skipped)."""
+    if ids is None:
+        return [_row_document(row) for row in conn.execute(f"SELECT {_DOCUMENT_COLUMNS} FROM recall_documents")]
+    return _load_pool(conn, ids, stored=False)[0]
+
+
+def _eligible_ids(conn, ids, query: RecallQuery, excluded: set[str]) -> set[str]:
+    """The subset of ``ids`` that exist and pass the exclusions and the raw-transcript rule."""
+    ids = list(dict.fromkeys(ids))
+    eligible: set[str] = set()
+    for start in range(0, len(ids), _SQL_CHUNK):
+        chunk = ids[start:start + _SQL_CHUNK]
+        for doc_id, kind in conn.execute(
+            f"SELECT id, source_kind FROM recall_documents WHERE id IN ({','.join('?' for _ in chunk)})", chunk
+        ):
+            if doc_id not in excluded and (query.allow_raw_transcript or kind != "raw_transcript"):
+                eligible.add(doc_id)
+    return eligible
+
+
+def _recent_ids(conn, query: RecallQuery, excluded: set[str], limit: int) -> list[str]:
+    """The ``limit`` most recent eligible document IDs by stored ``source_updated_at``.
+
+    Writers store UTC ISO-8601 timestamps, whose text order is chronological
+    to the second, so SQLite picks them without parsing every row. This only
+    chooses the session-start pool; the recency list orders by parsed time.
+    """
+    allowed = "" if query.allow_raw_transcript else " WHERE source_kind != 'raw_transcript'"
+    rows = conn.execute(
+        f"SELECT id FROM recall_documents{allowed} ORDER BY source_updated_at DESC, id LIMIT ?",
+        (limit + len(excluded),),
     )
-    params: list[str] = []
-    if ids is not None:
-        if not ids:
-            return []
-        sql += " WHERE id IN (" + ",".join("?" for _ in ids) + ")"
-        params = ids
-    return [_row_document(row) for row in conn.execute(sql, params).fetchall()]
+    return [doc_id for (doc_id,) in rows if doc_id not in excluded][:limit]
 
 
 def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | None = None,
@@ -114,13 +185,19 @@ def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | N
     ``usage`` (``recall_usage.usage_map``, passed only with
     ``recall.usage_tie_break``) never adds or removes a candidate: a higher
     select count only breaks exact ties after trust, before best component rank.
+
+    Structured and path evidence is matched over a bounded pool: on the
+    prompt path the FTS and dense candidates, at session start those plus the
+    ``RECENT_POOL_SIZE`` most recent eligible documents. A store with at most
+    that many eligible documents therefore ranks exactly as an unbounded scan.
+    Each pool document is scrubbed at most once, and path matching reads the
+    stored ``path_text`` when the column exists and is set.
     """
+    stored_path_text = "path_text" in _document_columns(conn)
     structured = extract_structured_terms(query.query_text)
     is_prompt = not query.hook_event.startswith("session-start")
     allowed = "d.source_kind != 'raw_transcript'" if not query.allow_raw_transcript else "1=1"
     excluded = set(query.excluded_source_ids)
-    all_docs = [d for d in _load_documents(conn) if d.id not in excluded and (query.allow_raw_transcript or d.source_kind != "raw_transcript")]
-    by_id = {doc.id: doc for doc in all_docs}
     lists: dict[str, list[str]] = {}
 
     fts = build_safe_fts_match(query.query_text)
@@ -131,20 +208,33 @@ def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | N
                 f"WHERE recall_documents_fts MATCH ? AND {allowed} ORDER BY bm25(recall_documents_fts), d.id LIMIT 500",
                 (fts,),
             ).fetchall()
-            lists["fts"] = [row[0] for row in rows if row[0] in by_id]
+            lists["fts"] = [row[0] for row in rows if row[0] not in excluded]
         except Exception:
             lists["fts"] = []
 
-    dense_ids = [doc_id for doc_id, _cosine in (dense or ()) if doc_id in by_id]
+    dense_pairs = list(dense or ())
+    dense_eligible = _eligible_ids(conn, [doc_id for doc_id, _cosine in dense_pairs], query, excluded) if dense_pairs else set()
+    dense_ids = [doc_id for doc_id, _cosine in dense_pairs if doc_id in dense_eligible]
 
-    if is_prompt:
-        topic_ids = set(lists.get("fts", ())) | set(dense_ids)
-        all_docs = [doc for doc in all_docs if doc.id in topic_ids]
+    pool = dict.fromkeys(lists.get("fts", ()))
+    pool.update(dict.fromkeys(dense_ids))
+    if not is_prompt:
+        pool.update(dict.fromkeys(_recent_ids(conn, query, excluded, RECENT_POOL_SIZE)))
+    all_docs, path_texts = _load_pool(conn, pool, stored=stored_path_text)
+    by_id = {doc.id: doc for doc in all_docs}
+    home = Path.home()
+    scrubbed: dict[str, str] = {}
+
+    def scrubbed_text(doc: RecallDocument) -> str:
+        value = scrubbed.get(doc.id)
+        if value is None:
+            value = scrubbed[doc.id] = scrub_text(doc.text, home)
+        return value
 
     if structured:
         matches = []
         for doc in all_docs:
-            text = scrub_text(doc.text, Path.home()).casefold()
+            text = scrubbed_text(doc).casefold()
             hits = sum(term in text for term in structured)
             if hits:
                 matches.append((doc.id, -hits))
@@ -153,13 +243,17 @@ def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | N
 
     path_query = normalize_path_text(" ".join((query.cwd or "", *query.repository_roots)))
     if path_query:
-        path_tokens = query_terms(path_query)
+        path_tokens = [f" {token} " for token in query_terms(path_query)]
         matches = []
-        for doc in all_docs:
-            haystack = normalize_path_text(" ".join((doc.project_slug or "", doc.source_path, doc.text)))
-            overlap = sum(token in haystack.split() for token in path_tokens)
-            if overlap:
-                matches.append((doc.id, -overlap))
+        if path_tokens:
+            for doc in all_docs:
+                haystack = path_texts.get(doc.id)
+                if haystack is None:
+                    haystack = document_path_text(doc.project_slug, doc.source_path, doc.text)
+                haystack = f" {haystack} "
+                overlap = sum(token in haystack for token in path_tokens)
+                if overlap:
+                    matches.append((doc.id, -overlap))
         matches.sort(key=lambda item: (item[1], item[0]))
         lists["paths"] = [item[0] for item in matches]
 
@@ -191,9 +285,8 @@ def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | N
     for doc_id, components in ranks.items():
         doc = by_id[doc_id]
         score = sum(1.0 / (60 + rank) for rank in components.values()) / count
-        excerpt = scrub_text(doc.text, Path.home())
         best = min(components.values())
-        result.append(RecallCandidate(doc, excerpt, dict(components), score, best))
+        result.append(RecallCandidate(doc, scrubbed_text(doc), dict(components), score, best))
     fts_first = is_prompt and not dense_ids
     result.sort(
         key=lambda candidate: (

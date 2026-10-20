@@ -121,7 +121,7 @@ h3{font-size:12px;font-family:var(--mono);letter-spacing:.12em;text-transform:up
   <section class="overview">
     <h2>The whole night on one page</h2>
     <div class="ov" id="ov"></div>
-    <p class="foot">Only 04:00 is a real schedule (from <code>dream.timer</code>, plus up to 15 minutes of random delay). The stage times after it are drawn for reading, not measured. The stages run one after another in <code>dream.service</code>. If one stage fails, the next ones still run, and the run is marked as failed health.</p>
+    <p class="foot">Only two times are real schedules: 04:00 from <code>dream.timer</code> and Sundays at 12:00 from <code>dream-audit.timer</code>, which you enable yourself; each adds up to 15 minutes of random delay. The stage times after 04:00 are drawn for reading, not measured. Embedding runs inside the ingest stage, not as a stage of its own. The stages run one after another in <code>dream.service</code>. If one stage fails, the next ones still run, and the run is marked as failed health.</p>
   </section>
 </main>
 
@@ -154,14 +154,26 @@ const STEPS = [
 
  {id:'ingest', short:'Ingest', level:'n1', time:'~04:00', stage:'N1 · light sleep',
   title:'Ingest: replay the day',
-  what:['dream ingest reads every enabled source. It keeps only the visible user and assistant turns. Tool calls and hidden text are dropped.',
-        'The turns go into a local SQLite database with a full-text index (FTS5). This stage makes no model calls.',
+  what:['dream ingest first counts which memories the hooks selected in earlier sessions. Each hook leaves a small marker; markers older than a day become counts in recall_usage and are then deleted.',
+        'Then it reads every enabled source. It keeps only the visible user and assistant turns. Tool calls and hidden text are dropped.',
+        'The turns go into a local SQLite database with a full-text index (FTS5), and the recall index is brought up to date. This stage makes no model calls.',
         'If one source fails, the others still enter the index. The failed one keeps its old version and is retried next night.'],
-  where:[['dream ingest',''],['~/.claude/dream.db','the Dream database'],['dream/sources/','codex_jsonl.py, opencode_sqlite.py, claude_jsonl.py']],
+  where:[['dream ingest',''],['~/.claude/dream.db','the Dream database, with recall_documents and recall_usage'],['dream/sources/','codex_jsonl.py, opencode_sqlite.py, claude_jsonl.py']],
   sleep:['Replay begins','In light sleep the senses go quiet and the brain starts to replay the day. The noise of the outside world is shut out, like the filter that drops tool noise and keeps what was said.'],
-  scene:{nodes:[['a',90,70,'codex-jsonl','Codex sessions','store'],['b',90,150,'opencode-sqlite','Open Code','store'],['c',90,230,'claude-jsonl','disabled by default','dim'],['f',340,150,'Filter','user + assistant only','check'],['x',340,262,'Dropped','tool calls, hidden text','dim'],['d',590,150,'dream.db','SQLite + FTS5','store']],
-   edges:[['a','f','msg'],['b','f','msg'],['c','f','msg'],['f','d','turn'],['f','x','noise']]},
+  scene:{nodes:[['a',90,70,'codex-jsonl','Codex sessions','store'],['b',90,150,'opencode-sqlite','Open Code','store'],['c',90,230,'claude-jsonl','disabled by default','dim'],['f',340,150,'Filter','user + assistant only','check'],['x',340,262,'Dropped','tool calls, hidden text','dim'],['h',340,40,'Hook markers','older than a day','check'],['d',590,150,'dream.db','FTS5 · recall · usage','store']],
+   edges:[['h','d','usage'],['a','f','msg'],['b','f','msg'],['c','f','msg'],['f','d','turn'],['f','x','noise']]},
   cap:'No model is called. Everything stays on your disk.'},
+
+ {id:'embed', short:'Embed', level:'n2', time:'~04:02', stage:'N2 · light sleep',
+  title:'Embed: keep the gist, not only the words',
+  what:['Off by default. When you turn on the local embedder, dream ingest ends by sending each new or changed memory and summary to an embedding server on your own machine, such as llama-server or Ollama.',
+        'Secrets are scrubbed out first, so not even the local server sees them. A server that is not on loopback is refused unless you set remote_data_egress = true.',
+        'The vectors go into recall_embeddings, tied to the model name and dimension. Later, a prompt is embedded once, and the nearest memories join recall as a fifth list. A Polish prompt can then find an English memory. If the server is down, recall stays as it was.'],
+  where:[['dream ingest','embeds after the recall index sync'],['dream embed --refresh','re-embed after a model change'],['[recall.embedder] enabled = false','in ~/.config/dream/config.toml']],
+  sleep:['Gist memory','Fuzzy-trace theory (Brainerd and Reyna) says we keep two traces of an experience: the exact words and the gist. The gist lasts longer. A vector is a gist: other words, even another language, can still land near it.'],
+  scene:{nodes:[['d',90,150,'recall_documents','memories + summaries','store'],['s',270,150,'Scrubber','secrets removed','check'],['e',450,85,'Local embedder','loopback only','model'],['x',450,225,'Remote server','needs explicit consent','dim'],['v',630,85,'recall_embeddings','float32 vectors','store']],
+   edges:[['d','s','text'],['s','e','text'],['e','v','vector'],['s','x','no']]},
+  cap:'Optional and local. Without it, recall stays lexical.'},
 
  {id:'distill', short:'Distill', level:'n2', time:'~04:05', stage:'N2 · light sleep',
   title:'Distill: mark what to keep',
@@ -177,11 +189,12 @@ const STEPS = [
  {id:'consolidate', short:'Consolidate', level:'n3', time:'~04:15', stage:'N3 · deep sleep',
   title:'Consolidate: move it to long-term memory',
   what:['dream consolidate gives the high-effort model two things: new distilled notes, and the current memory store.',
+        'By default that is the whole store. With consolidate.mode = "subset" it is MEMORY.md plus the 15 files most related to the new notes, and the model may also propose a patch: one exact passage replaced.',
         'The model writes suggestions: new memory files or edits to existing ones. It does not write memory directly.',
         'A ledger records which notes were used. Progress follows that ledger, not timestamps, so no note is lost or used twice.'],
-  where:[['dream consolidate',''],['.suggestions/','preview files for review'],['dream/prompts/consolidate.md','the prompt']],
+  where:[['dream consolidate',''],['[consolidate] mode = "full"','or "subset" with subset_files = 15'],['.suggestions/','preview files for review'],['dream/prompts/consolidate.md','the prompt; consolidate-subset.md in subset mode']],
   sleep:['Slow-wave sleep','Deep sleep has big, slow brain waves. One leading theory, systems consolidation, says memories replay from the hippocampus to the cortex here. That is where they last for years.'],
-  scene:{nodes:[['n',95,85,'Distilled notes','not yet consumed','store'],['k',95,215,'Current memory','memory/*.md','store'],['m',335,150,'Codex','consolidate · high','model'],['s',590,85,'Suggestions','.suggestions/','out'],['l',590,215,'Ledger','notes marked as used','check']],
+  scene:{nodes:[['n',95,85,'Distilled notes','not yet consumed','store'],['k',95,215,'Current memory','all files, or a subset','store'],['m',335,150,'Codex','consolidate · high','model'],['s',590,85,'Suggestions','.suggestions/','out'],['l',590,215,'Ledger','notes marked as used','check']],
    edges:[['n','m','facts'],['k','m','context'],['m','s','idea'],['m','l','ids']]},
   cap:'The deepest model call of the night. It sees what you already remember.'},
 
@@ -243,13 +256,24 @@ const STEPS = [
  {id:'recall', short:'Recall', level:'wake', time:'Next session', stage:'Awake',
   title:'Recall: the day remembers the night',
   what:['When a new session starts, the SessionStart hook adds the trusted character block and a small index of memory.',
-        'On your first prompt, the UserPromptSubmit hook searches dream.db. It ranks hits by text match, paths, projects, and recency (reciprocal rank fusion, k = 60).',
-        'The hook opens the database read-only. It has a time limit of 1.0 s at start and 1.5 s on the prompt. If anything fails, it adds nothing and the session goes on.'],
+        'On your first prompt, the UserPromptSubmit hook searches dream.db. It ranks hits by text match, paths, projects, and recency (reciprocal rank fusion, k = 60). With the embedder on and calibrated, meaning is a fifth list.',
+        'The hook opens the database read-only and has five seconds. If anything fails, it adds nothing and the session goes on. Each hook leaves a marker of the memories it selected; a later ingest counts them as usage.'],
   where:[['dream context session-start','SessionStart hook'],['dream context prompt','UserPromptSubmit hook'],['dream hooks install','writes the hook commands'],['[Dream recall — untrusted reference data]','how recalled text is labelled']],
   sleep:['Cue-dependent memory','A smell or a word can bring back a whole memory, like Proust and his madeleine cake. Your first prompt is the cue. Dream finds what matches it.'],
-  scene:{nodes:[['s',80,85,'New session','SessionStart · 1.0 s','person'],['p',80,220,'First prompt','UserPromptSubmit · 1.5 s','person'],['r',265,155,'Search dream.db','read-only · RRF','check'],['c',455,70,'Trusted character','constitution + pairs','store'],['u',455,240,'Dream recall','untrusted reference','out'],['g',635,155,'Agent','reads as context','model']],
+  scene:{nodes:[['s',80,85,'New session','SessionStart · 5 s','person'],['p',80,220,'First prompt','UserPromptSubmit · 5 s','person'],['r',265,155,'Search dream.db','read-only · RRF','check'],['c',455,70,'Trusted character','constitution + pairs','store'],['u',455,240,'Dream recall','untrusted reference','out'],['g',635,155,'Agent','reads as context','model']],
    edges:[['s','c','start'],['s','r','index'],['p','r','cue'],['r','u','hits'],['c','g',''],['u','g','']]},
   cap:'Recall never writes to the database and never blocks your session.'},
+
+ {id:'audit', short:'Audit', level:'wake', time:'Sundays 12:00, weekly', stage:'Awake',
+  title:'Weekly audit: look back over everything',
+  what:['In subset mode a night sees only part of the store. So once a week, dream audit reads all of it, in chunks of whole files, and looks for memories that went stale.',
+        'Each file comes with its recall usage: when recall last chose it, or never, and how often. The audit may only propose to remove a file or patch a passage. Those are suggestions, reviewed like any other.',
+        'Usage is evidence, not a verdict. Nothing is deleted because nobody recalled it, and a removal is dropped while the file is younger than 21 days. dream status --usage lists files unused for 90 days.'],
+  where:[['dream-audit.timer','Sundays 12:00, Persistent=true; installed, not enabled'],['dream audit','skips while consolidate.mode = "full"'],['[stages.audit]','which model audits'],['dream status --usage','read-only list of unused files']],
+  sleep:['Reconsolidation','A recalled memory becomes open to change for a while and is then stored again, sometimes updated (Nader and colleagues, 2000). The audit is that second look: old files are opened again, checked against what recall really used, and patched or let go.'],
+  scene:{nodes:[['t',90,150,'dream-audit.timer','weekly','check'],['c',280,80,'Whole store','chunks of whole files','store'],['u',280,220,'recall_usage','last recalled · count','store'],['m',465,150,'Codex','audit · high','model'],['s',635,150,'remove / patch','suggestions only','out']],
+   edges:[['t','c','run'],['c','m','files'],['u','m','usage'],['m','s','idea']]},
+  cap:'Usage informs the audit. Removal still waits for review.'},
 
  {id:'forget', short:'Forget', level:'wake', time:'Any time', stage:'Awake',
   title:'Forgetting on purpose',
@@ -295,7 +319,8 @@ function drawSky(t){
     sctx.globalAlpha = 1;
   }
 }
-function nightness(t){ const a = 1/STEPS.length*1, b = 1/STEPS.length*8; return (t>=a*.9 && t<=b) ? 1 : 0; }
+const NIGHT_FIRST = STEPS.findIndex(s=>s.id==='bed'), NIGHT_END = STEPS.findIndex(s=>s.id==='wake');
+function nightness(t){ const a = NIGHT_FIRST/STEPS.length, b = NIGHT_END/STEPS.length; return (t>=a*.9 && t<=b) ? 1 : 0; }
 
 /* ---------- hypnogram ---------- */
 const hyp = document.getElementById('hyp'), NS = 'http://www.w3.org/2000/svg';
@@ -303,8 +328,8 @@ const X0 = 92, X1 = 990, Y = lv => 30 + lv*40, segW = (X1-X0)/STEPS.length;
 function el(tag, attrs, parent){ const e = document.createElementNS(NS, tag); for(const k in attrs) e.setAttribute(k, attrs[k]); if(parent) parent.appendChild(e); return e; }
 function buildHyp(){
   // night shading
-  el('rect',{x:X0+segW*1,y:12,width:segW*7,height:182,fill:'rgba(164,138,240,.07)',rx:6},hyp);
-  el('text',{x:X0+segW*1+8,y:24,fill:css('--muted'),'font-size':11,'font-family':'JetBrains Mono, monospace'},hyp).textContent='night run · dream.service';
+  el('rect',{x:X0+segW*NIGHT_FIRST,y:12,width:segW*(NIGHT_END-NIGHT_FIRST),height:182,fill:'rgba(164,138,240,.07)',rx:6},hyp);
+  el('text',{x:X0+segW*NIGHT_FIRST+8,y:24,fill:css('--muted'),'font-size':11,'font-family':'JetBrains Mono, monospace'},hyp).textContent='night run · dream.service';
   LEVEL_NAME.forEach((n,i)=>{
     el('line',{x1:X0,x2:X1,y1:Y(i),y2:Y(i),stroke:css('--line'),'stroke-dasharray':'2 5'},hyp);
     el('text',{x:X0-10,y:Y(i)+4,'text-anchor':'end',fill:css('--muted'),'font-size':12,'font-family':'Figtree, sans-serif'},hyp).textContent=n;

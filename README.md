@@ -85,10 +85,46 @@ Changing provider/model configuration does not automatically re-run every histor
 
 Legacy compatibility variables remain accepted: `DREAM_BACKEND`, `CLAUDE_DREAM_DB`, and `DREAM_MEMORY_ROOT`.
 
+### Recall and consolidation settings
+
+The packaged defaults keep the earlier behaviour: the embedder is off, usage
+does not reorder results, consolidation sends the whole store, and no local
+model provider is configured. `dream preflight` reports the embedder, whether
+the MCP server entry is in the Codex or OpenCode configuration (Claude Code
+keeps its own: `claude mcp get dream`) and the consolidation mode.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `recall.usage_tie_break` | `false` | Use harvested recall usage to break exact ranking ties (after trust). Harvesting and audit annotations run either way. Turn it on only after a calibrated eval shows no regression. |
+| `recall.embedder.enabled` | `false` | Turn on the dense candidate list. |
+| `recall.embedder.type` | `"none"` | `"openai-compatible"` is the only other value: a local embedding server such as `llama-server --embedding` or Ollama. |
+| `recall.embedder.remote_data_egress` | `false` | Must be `true` for a `base_url` that is not loopback (`127.0.0.0/8`, `::1` or `localhost`); otherwise the embedder is a configuration error and recall stays lexical. |
+| `recall.embedder.base_url` | `"http://127.0.0.1:8081"` | `http` or `https`; requests go to `/v1/embeddings`. |
+| `recall.embedder.model` | `"bge-m3"` | Model name sent to the server; part of the vector fingerprint. A placeholder until the private eval picks a model. |
+| `recall.embedder.dimension` | `1024` | Vector length, 1 to 4096; every response must match it. Part of the fingerprint. |
+| `recall.embedder.timeout_seconds` | `1.5` | Wall-clock bound on one query embedding, at most 3 s (hooks time out after 5 s). |
+| `recall.embedder.dense_candidates` | `200` | Length of the dense list fused with the lexical lists. |
+| `recall.embedder.api_key_env` | unset | Name of an environment variable holding a bearer token; the value is never stored or logged. |
+| `consolidate.mode` | `"full"` | `"full"` sends the whole store nightly, byte-identical to earlier releases. `"subset"` sends `MEMORY.md` plus related topic files and leaves the staleness audit to the weekly `dream audit`. `dream consolidate --mode` overrides it for one run. |
+| `consolidate.subset_files` | `15` | Topic files sent in subset mode, besides `MEMORY.md` and files whose name a finding mentions. |
+| `stages.audit` | `provider = "codex"`, `reasoning_effort = "high"`, `timeout_seconds = 1800` | The model stage of `dream audit`, with the same keys as every stage. |
+| `providers.<name>.type = "openai-compatible"` | not configured | A local OpenAI-compatible generation server (llama-server, Ollama, vLLM) that a stage can route to. Keys: `base_url` (required), `model`, `api_key_env`, `remote_data_egress` (default `false`, same loopback rule) and `timeout_seconds` (default 600). `default-config.toml` has a commented `[providers.local-qwen]` example. |
+
+Embedder problems never break recall or ingest: an invalid `[recall.embedder]`
+table disables the embedder, recall stays lexical, and the `recall.embedder`
+preflight check and the recall diagnostics name the problem. The dense list reaches hooks and agent queries only after
+`dream recall-calibrate --mode lexical_plus_embedder --apply` has stored a
+threshold for the current model and dimension.
+
 ## Privacy and data flow
 
 - **Local reads.** `dream ingest` and `dream search` read only local transcript stores (by default Codex JSONL under `~/.codex/sessions` and Open Code SQLite at `~/.local/share/opencode/opencode.db`) and the local Dream SQLite database. They never transmit anything.
 - **Model calls send content.** The `distill` and `consolidate` stages send selected session content to the model provider configured for that stage — by default the Codex CLI against your ChatGPT subscription. Distillation sends the filtered transcript of a session; consolidation sends the distilled notes plus the current memory store. The review stage uses its configured provider and sends pending suggestions plus bounded target context.
+- **Local embedder (off by default).** With `[recall.embedder]` enabled, `dream ingest` and `dream embed` send the scrubbed text of approved memories and distilled summaries (raw transcripts only with `recall.allow_raw_transcript_prompt = true`) to the embedding server, and prompt hooks and agent queries send the scrubbed query. Only loopback URLs are accepted unless `remote_data_egress = true`. Vectors stay in the local database.
+- **Local generation provider.** A stage routed to an `openai-compatible` provider sends that stage's prompt to its `base_url`, again loopback only unless `remote_data_egress = true`.
+- **Private eval fixture.** `dream eval-build` sends sampled approved memories and summaries, with the retention policy, to the configured `distill` provider to write test questions, and stores copies of those memories in `~/.config/dream/eval/private.json` (file mode 0600, directory 0700), outside the repository. `.gitignore` also excludes `dream/fixtures/private*`. `dream recall-calibrate` refuses public fixtures and anything under `dream/fixtures/`, evaluates on an in-memory copy, and writes to the live database only with `--apply`.
+- **Weekly audit and subset mode.** `dream audit` sends every topic file, in chunks of at most 200,000 characters (a larger file gets a chunk of its own), with the `MEMORY.md` index and per-file usage annotations, to the `audit` stage provider. Subset consolidation sends `MEMORY.md`, the remaining index lines and the related topic files (at most `subset_files`, plus files a finding names) instead of the whole store.
+- **Recall usage.** `dream ingest` counts which documents the hooks selected, from hook markers older than 24 hours, into the local `recall_usage` table and deletes those markers. `dream recall` and agent queries are never counted. Usage only annotates and breaks ties; it never deletes anything.
 - **Everything else stays local.** The SQLite database (`~/.claude/dream.db` by default), suggestion previews (`.suggestions/`), and the memory store remain on your machine.
 - **Check your configuration first.** Before the first run, review the `[[sources]]` roots and the `[stages.*]`/`[providers.*]` entries in `~/.config/dream/config.toml` so you know which transcripts are read and where their content is sent.
 - **Local and external effects.** `estimate`, `search`, `status`, `preflight`, `context`, `recall`, `mcp serve`, and `suggestions list` only read the persistent local data. Automatic recall, `dream recall` and the MCP server open SQLite through an immutable read-only connection; the hooks' small deduplication markers live under `/tmp`, and `dream recall` and the MCP server leave none. `mcp install` and `mcp uninstall` edit one client's configuration file, with a backup. `ingest` reads transcripts and updates the local SQLite index without calling a model. `distill`, `consolidate`, and configured curation make model calls and write local results. Suggestion review commands update local review state; `accept`, `merge`, and configured apply operations can also update memory files, with backups before live-memory writes.
@@ -113,10 +149,11 @@ claude-jsonl
 
 The pipeline stages are:
 
-1. `ingest`: discover configured sources (Codex JSONL, Open Code SQLite, optional Claude JSONL), filter to visible user/assistant turns, and index messages with SQLite FTS5.
+1. `ingest`: count recall usage from old hook markers, discover configured sources (Codex JSONL, Open Code SQLite, optional Claude JSONL), filter to visible user/assistant turns, and index messages with SQLite FTS5. It then synchronizes the recall index and, when the local embedder is enabled, embeds new or changed recall documents.
 2. `distill`: call the provider configured for the `distill` stage once per changed session revision.
-3. `consolidate`: call the configured `consolidate` provider and produce suggestions.
+3. `consolidate`: call the configured `consolidate` provider and produce suggestions, from the whole store (`full`) or from `MEMORY.md` plus related files (`subset`, which can also propose exact-span `patch` edits).
 4. `suggestions`: inspect and resolve suggestions with file-version preconditions and backups.
+5. `audit` (weekly, optional): review the whole store in chunks for stale files and propose only `remove` and `patch` suggestions. Needed only with `consolidate.mode = "subset"`.
 
 Consolidation uses an explicit ledger of consumed distillation identities. It does not use session timestamps as its progress cursor and does not silently consume truncated batches.
 
@@ -173,7 +210,27 @@ dream recall "release checklist" --project api --kinds approved_memory --limit 3
 dream mcp install --client codex
 dream mcp uninstall --client codex
 dream recall-eval --fixtures dream/fixtures/recall/public.json
+dream eval-build --limit 100
+dream recall-eval --fixtures ~/.config/dream/eval/private.json --by-language
+dream recall-calibrate --fixtures ~/.config/dream/eval/private.json --mode lexical --apply
+dream embed
+dream embed --refresh
+dream consolidate --mode subset
+dream audit
+dream status --usage
 ```
+
+### Recall evaluation, embeddings and the weekly audit
+
+- `dream eval-build [--limit N] [--languages en,pl] [--questions-per-file 3] [--output PATH] [--yes]` builds the private held-out fixture from the live recall index. It makes one `distill` model call per sampled document; without `--limit` it needs `--yes`.
+- `dream recall-eval --fixtures PATH --by-language` adds Recall@1, Recall@5, MRR, forbidden results and p95 latency for each mode (`lexical`, plus `lexical_plus_embedder` when the embedder is on) and language (`en`, `pl`, `all`). It runs on an in-memory copy and never opens the live database.
+- `dream recall-calibrate --fixtures PATH --mode MODE [--output FILE] [--apply]` computes the selection threshold for one mode. Without `--apply` it only prints the record (and writes `--output`); `--apply` is the only writer of `recall_calibrations`. Rerun it with `--mode lexical_plus_embedder` after changing the embedder model or dimension and after `dream embed --refresh`.
+- `dream embed [--refresh]` synchronizes the recall index, then stores vectors for documents that have none under the current embedder (`--refresh` re-embeds everything, the step after swapping a model behind the same name). Nightly ingest does the incremental part on its own.
+- `dream consolidate --mode full|subset` overrides `consolidate.mode` for one run.
+- `dream audit [--force] [--model MODEL]` runs the weekly staleness audit. With `consolidate.mode = "full"` it exits without a model call unless `--force` is given, because the nightly run already audits the whole store.
+- `dream status --usage` lists approved memory files that automatic recall has not selected in the last 90 days, with their index lines and the start of the observation window. It only reads.
+
+Agents can also query approved memory during a session with `dream recall` or the MCP server; see [Mid-session recall for agents](#mid-session-recall-for-agents).
 
 ### Excluding a topic from local memory
 
@@ -261,12 +318,22 @@ reading the SQLite index. The generated setting is written to the user-local
 repository source of truth. Re-run `dream hooks install` after upgrading an
 installation that was created with an older timeout.
 
-Optional `recall.embedder` and `recall.reranker` adapters are disabled by default,
-cache by content hash and adapter fingerprint, accept at most 100 candidates, and
-fall back to lexical results on unavailable adapters, invalid output, missing
-calibration, or adapter errors. Set `remote_data_egress = true` only after
+Optional `recall.embedder` and `recall.reranker` adapters are disabled by default
+and fall back to lexical results on unavailable adapters, invalid output, missing
+calibration, or adapter errors. The embedder talks to a local OpenAI-compatible
+server through the standard library. Its vectors are stored per content hash and
+fingerprint (`openai-compatible:<model>:<dimension>`), and the nearest ones join
+the four lexical lists (FTS, structure, paths, recency) as a fifth reciprocal-rank
+list, on the prompt path only. Hooks make at most one embedding request (the
+query) and never embed documents. Set `remote_data_egress = true` only after
 reviewing the adapter's data-flow implications; Dream does not add a model package
 or network dependency.
+
+Session-start recall matches structure and path evidence over the FTS matches
+plus the 500 most recent eligible documents rather than the whole store, and
+the synchronized `path_text` column holds each document's normalized path text.
+`dream/test_recall_query.py` holds the session-start path to 150 ms and the
+prompt path to 250 ms at p95 on a synthetic 10,000-document store.
 
 Search indexed conversations:
 
@@ -377,7 +444,7 @@ Existing paths remain the defaults during migration:
 - DB: `~/.claude/dream.db`;
 - memory: `~/.claude/projects/<home-slug>/memory/` (the packaged default resolves the home slug for the running user).
 
-These are storage locations, not runtime dependencies on Claude Code. Schema upgrades are additive, versioned, and create a consistent SQLite backup before modifying a legacy on-disk database.
+These are storage locations, not runtime dependencies on Claude Code. Schema upgrades are additive and create a consistent SQLite backup before modifying a legacy on-disk database. The recall upgrade's columns and tables (embedding blobs, recall usage, patch spans, stored path text) are detected by their shape rather than by a new version row, and only a writing command migrates them: hooks and other read-only commands work unchanged on a database that has not been migrated yet.
 
 Each session records source, external identity, content revision, and parser version. Each distillation records source revision, prompt version, provider, model, usage when available, and duration.
 
@@ -400,6 +467,19 @@ The review stage asks its configured provider for accept/reject/merge/defer deci
 ./install.sh
 systemctl --user daemon-reload
 systemctl --user enable --now dream.timer
+```
+
+`dream ingest` also counts recall usage and, when the embedder is enabled,
+embeds new or changed recall documents, so the nightly unit needs no extra stage.
+
+The weekly staleness audit has its own units. `install.sh` copies
+`dream-audit.service` and `dream-audit.timer` (Sundays at 12:00,
+`Persistent=true`, up to 15 minutes of random delay) but enables nothing. The
+service runs `dream audit` directly, outside the nightly run metrics. Enable it
+when you switch to `consolidate.mode = "subset"`:
+
+```bash
+systemctl --user enable --now dream-audit.timer
 ```
 
 On macOS, schedule the same commands with `launchd` or cron.
@@ -426,6 +506,10 @@ python3 dream/monitoring_dashboard.py /path/to/rpi-fleet.json
 
 Both patchers are idempotent, reject ambiguous targets, and preserve unrelated
 dashboard panels. Back up the live files before applying generated output.
+
+`dream_recall_documents_unused_90d` counts approved memory documents that automatic
+recall has not selected in the last 90 days. Like every exporter metric it carries
+no document IDs or paths.
 
 The short-review panel shows `dream_character_short_drafts_pending`. The exporter
 reads the current eligible draft count on every scrape, so approval updates the
@@ -455,6 +539,9 @@ Paths are relative to `dream/`.
 | `recall_context.py`, `recall_hooks.py` | fail-open context execution and Codex hook management |
 | `mcp_server.py`, `mcp_install.py` | read-only MCP stdio server and client configuration installers |
 | `recall_eval.py`, `recall_adapters.py` | fixture evaluation, calibration, and optional adapter contracts |
+| `eval_build.py` | private held-out recall fixture builder |
+| `recall_embeddings.py` | float32 vector store and the dense candidate scan |
+| `recall_usage.py` | recall usage harvest, tie-break map and unused-memory report |
 | `metrics.py`, `stage_runner.py` | run-state persistence and Prometheus exporter |
 | `monitoring_prometheus.py`, `monitoring_dashboard.py` | idempotent Prometheus and Grafana patchers |
 

@@ -23,6 +23,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from recall_embeddings import embedding_text, has_vector_blob, store_vector
+from recall_query import document_path_text
 from retention_policy import load_retention_policy
 
 # One fixed namespace for every stable document ID, regardless of source kind.
@@ -240,12 +241,14 @@ def _collect_transcripts(conn: sqlite3.Connection) -> list[dict]:
 
 
 def _upsert_document(conn: sqlite3.Connection, row: dict, indexed_at: str) -> None:
+    """Insert or update one document row together with its normalized ``path_text``."""
     conn.execute(
         """
         INSERT INTO recall_documents(
             id, content_sha256, source_kind, trust_level, project_slug,
-            source_path, source_updated_at, indexed_at, source_version, text
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            source_path, source_updated_at, indexed_at, source_version, text,
+            path_text
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             content_sha256=excluded.content_sha256,
             source_kind=excluded.source_kind,
@@ -255,15 +258,33 @@ def _upsert_document(conn: sqlite3.Connection, row: dict, indexed_at: str) -> No
             source_updated_at=excluded.source_updated_at,
             indexed_at=excluded.indexed_at,
             source_version=excluded.source_version,
-            text=excluded.text
+            text=excluded.text,
+            path_text=excluded.path_text
         """,
         (
             row["id"], row["content_sha256"], row["source_kind"],
             row["trust_level"], row["project_slug"], row["source_path"],
             row["source_updated_at"], indexed_at, row["source_version"],
             row["text"],
+            document_path_text(row["project_slug"], row["source_path"], row["text"]),
         ),
     )
+
+
+def _backfill_path_text(conn: sqlite3.Connection) -> int:
+    """Fill ``path_text`` for rows that have none (rows indexed before the column existed).
+
+    ``path_text`` is not an FTS column and no trigger watches it, so this
+    never touches the FTS index. Returns the number of rows filled.
+    """
+    rows = conn.execute(
+        "SELECT id, project_slug, source_path, text FROM recall_documents WHERE path_text IS NULL"
+    ).fetchall()
+    conn.executemany(
+        "UPDATE recall_documents SET path_text=? WHERE id=?",
+        [(document_path_text(slug, path, text), doc_id) for doc_id, slug, path, text in rows],
+    )
+    return len(rows)
 
 
 def _fts_index_state(conn: sqlite3.Connection) -> tuple[bool, bool] | None:
@@ -395,6 +416,7 @@ def synchronize_recall_documents(
             _upsert_document(conn, row, indexed_at)
         for doc_id in stale_ids:
             conn.execute("DELETE FROM recall_documents WHERE id=?", (doc_id,))
+        _backfill_path_text(conn)
         # Vectors follow their document revision: removed, excluded or edited
         # documents leave no embedding behind.
         conn.execute(

@@ -55,7 +55,13 @@ automatic recall unless duplicate injection is intentional.
 - For automatic context recall, use `dream context session-start` or `dream context prompt` with the hook payload on standard input; hook failures are fail-open and must not block the caller.
 - Automatic recall is read-only against the persistent SQLite database; write operations belong to the host-side scheduled pipeline. Do not move the database to `/tmp` or ask the user to launch Codex with extra writable-directory flags as a normal setup step.
 - For Codex hook management, use only `dream hooks install` and `dream hooks uninstall`; review the exact generated commands through Codex `/hooks` before trusting them.
-- For recall evaluation, use `dream recall-eval --fixtures PATH`; never use a public fixture as calibration input.
+- For recall evaluation, use `dream recall-eval --fixtures PATH`, with `--by-language` for per-mode and per-language metrics; never use a public fixture as calibration input.
+- To build the private eval fixture, run `dream eval-build --limit N` only when the user asks: it makes one distill-provider call per sampled document and writes `~/.config/dream/eval/private.json`. Never copy that file into a repository.
+- To calibrate, run `dream recall-calibrate --fixtures ~/.config/dream/eval/private.json --mode MODE` as a preview; add `--apply` only when the user asks to store the threshold.
+- When the local embedder is enabled, `dream embed` stores missing vectors and `dream embed --refresh` re-embeds after a model change; recalibrate `--mode lexical_plus_embedder` afterwards.
+- For the weekly staleness audit, run `dream audit`; it skips while `consolidate.mode = "full"`, so pass `--force` only when the user asks. `dream consolidate --mode subset|full` overrides the configured mode for one run.
+- For memories that recall never selects, run `dream status --usage`. It only reads; usage is evidence for review, never a reason to delete on its own.
+- `dream preflight` also reports whether the embedder is enabled, whether the MCP server entry is in the Codex or OpenCode config (for Claude Code, `claude mcp get dream`) and the consolidation mode.
 
 Return concise stage results. Preserve exact provider, authentication, schema, conflict, and migration errors instead of guessing a remedy.
 

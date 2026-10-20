@@ -149,6 +149,7 @@ def _backup_before_schema_migration(conn: sqlite3.Connection, path: Path) -> Pat
         or "vector_blob" not in _table_columns(conn, "recall_embeddings")
         or not _table_columns(conn, "recall_usage")
         or not _table_columns(conn, "recall_usage_markers")
+        or "path_text" not in _table_columns(conn, "recall_documents")
     )
     migrations = _table_columns(conn, "schema_migrations")
     version = conn.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0] if migrations else 0
@@ -198,6 +199,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "recall_embeddings": {
             "vector_blob": "BLOB",
             "dimension": "INTEGER",
+        },
+        # Pre-normalized path evidence, filled by the next sync. Read-only
+        # paths detect the column and compute a NULL value on the fly.
+        "recall_documents": {
+            "path_text": "TEXT",
         },
     }
     with conn:
@@ -1345,6 +1351,10 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     for name, ok, detail in recall_preflight(args.config, args.db):
         print(f"{'ok' if ok else 'FAIL'}  {name}: {detail}")
         failed = failed or not ok
+    consolidate = args.config.consolidate_settings()
+    mode = consolidate.mode if consolidate.mode == "full" else (
+        f"{consolidate.mode} ({consolidate.subset_files} topic files; the weekly dream audit covers the whole store)")
+    print(f"ok  consolidate.mode: {mode}")
     return 1 if failed else 0
 
 

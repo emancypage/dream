@@ -487,6 +487,32 @@ def codex_memories_check(codex_home: Path | None = None) -> tuple[bool, str]:
     return True, "native Codex Memories disabled"
 
 
+def mcp_install_status() -> tuple[bool, str]:
+    """Where the Dream MCP server entry is installed, from ``mcp_install.status``; read-only.
+
+    Checks the Codex and OpenCode configuration files that ``dream mcp
+    install`` edits and writes nothing. Claude Code keeps its own registry,
+    which only ``claude mcp get dream`` shows, so it is named, not checked.
+    Always ``ok``: the server is optional.
+    """
+    import mcp_install
+
+    installed: list[str] = []
+    notes: list[str] = []
+    for client in mcp_install.FILE_CLIENTS:
+        try:
+            state = mcp_install.status(client)
+        except mcp_install.McpInstallError as exc:
+            notes.append(f"{client}: {' '.join(str(exc).split())[:160]}")
+            continue
+        if state.startswith("installed"):
+            installed.append(client if state == "installed" else f"{client} ({state.split(', ', 1)[1]})")
+        elif state != "not installed":
+            notes.append(f"{client}: {state}")
+    detail = "installed for " + ", ".join(installed) if installed else "not installed for codex or opencode"
+    return True, "; ".join([detail, *notes, "for Claude Code run `claude mcp get dream`"])
+
+
 def recall_preflight(config, db_path) -> list[tuple[str, bool, str]]:
     checks: list[tuple[str, bool, str]] = []
     path = Path(db_path).expanduser()
@@ -505,6 +531,7 @@ def recall_preflight(config, db_path) -> list[tuple[str, bool, str]]:
     checks.append(("recall.embedder", *embedder_preflight(config)))
     reranker = config.recall_settings().reranker
     checks.append(("recall.reranker", not reranker.enabled or reranker.type == "none", "disabled" if not reranker.enabled else f"adapter type {reranker.type}"))
+    checks.append(("recall.mcp", *mcp_install_status()))
     executable = shutil.which("codex")
     version_ok = False
     detail = "codex executable not found"

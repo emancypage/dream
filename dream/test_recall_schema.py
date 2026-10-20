@@ -170,6 +170,7 @@ def test_recall_tables_created_with_expected_columns(tmp_path):
         "indexed_at": {"notnull": 1, "pk": 0},
         "source_version": {"notnull": 1, "pk": 0},
         "text": {"notnull": 1, "pk": 0},
+        "path_text": {"notnull": 0, "pk": 0},
     }
     assert _columns(conn, "recall_events") == {
         "session_id": {"notnull": 1, "pk": 1},

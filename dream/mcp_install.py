@@ -601,6 +601,42 @@ def uninstall_claude() -> McpInstallReport:
     raise _claude_failure(argv, None, returncode, output)
 
 
+# --- status -------------------------------------------------------------------------------------
+
+# Clients whose entry lives in a file Dream can read; Claude Code keeps its own registry.
+FILE_CLIENTS = ("codex", "opencode")
+
+
+def status(client: str, path: Path | None = None) -> str:
+    """Whether a file-based client carries the Dream entry; read-only, for ``dream preflight``.
+
+    Returns ``installed``, ``installed, disabled`` (OpenCode ``"enabled": false``),
+    ``not installed`` or ``has an entry not written by dream``. It reads the
+    file ``install`` and ``uninstall`` edit, with their parsers, and writes
+    nothing. A file it cannot read or parse raises ``McpInstallError``.
+    Claude Code is not checked: ``claude mcp get dream`` shows its entry.
+    """
+    if client == "codex":
+        path = _target(path or codex_config_path(), install=False)
+        current = _read(path, "TOML")
+        if current is None:
+            return "not installed"
+        document = _parse_toml(current.body, path)
+        if _split_codex(current.body, path)[1] is not None:
+            return "installed"
+        return "has an entry not written by dream" if _dream_entry(document) is not None else "not installed"
+    if client == "opencode":
+        path = _target(path or opencode_config_path(), install=False)
+        _current, document = _read_opencode(path)
+        entry = (document.get("mcp") or {}).get(SERVER_NAME)
+        if entry is None:
+            return "not installed"
+        if not _owned_opencode(entry):
+            return "has an entry not written by dream"
+        return "installed, disabled" if entry.get("enabled") is False else "installed"
+    raise McpInstallError(f"no file-based status for client {client!r}; expected one of {', '.join(FILE_CLIENTS)}")
+
+
 def install(client: str, path: Path | None = None, launch: ServerLaunch | None = None) -> McpInstallReport:
     if client == "codex":
         return install_codex(path, launch)

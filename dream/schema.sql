@@ -156,7 +156,8 @@ CREATE TABLE IF NOT EXISTS recall_documents (
     source_updated_at TEXT NOT NULL,     -- UTC source timestamp
     indexed_at        TEXT NOT NULL,     -- UTC index timestamp
     source_version    TEXT NOT NULL,     -- ingest / distillation / file-revision identifier
-    text              TEXT NOT NULL      -- canonical searchable content (pre-render redaction)
+    text              TEXT NOT NULL,     -- canonical searchable content (pre-render redaction)
+    path_text         TEXT               -- recall_query.document_path_text(); NULL: computed when read
 );
 
 CREATE TABLE IF NOT EXISTS recall_events (
