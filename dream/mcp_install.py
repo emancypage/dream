@@ -10,16 +10,18 @@ unrelated entry as it was. Line endings, a UTF-8 byte order mark, the JSON
 indentation and the trailing-newline state of the file are kept, so an
 install followed by an uninstall restores a Codex file byte for byte.
 Installing an identical entry again writes nothing. Uninstall removes only
-the entry Dream wrote. Every failure, including an unwritable directory or a
-``claude`` that hangs or cannot start, raises ``McpInstallError`` with nothing
-written.
+the entry Dream wrote; for Claude Code that is the user-scoped entry, checked
+with ``claude mcp get`` before ``claude mcp remove``. Every failure, including
+an unwritable directory or a ``claude`` that hangs or cannot start, raises
+``McpInstallError`` with nothing written.
 
 The entry runs the ``dream`` launcher found on ``PATH`` by its absolute path,
 or ``dream`` by name when none is found. ``DREAM_CONFIG``,
 ``DREAM_MEMORY_ROOT`` and ``CLAUDE_DREAM_DB``, when set at install time, are
 recorded in the client's environment table, so the server reads the same
-store. Nothing here starts the server: each report names the client's own
-restart or check step.
+store. Explicit ``--config`` and ``--db`` options win over those variables and
+are recorded as absolute paths in the same table. Nothing here starts the
+server: each report names the client's own restart or check step.
 """
 
 from __future__ import annotations
@@ -42,6 +44,8 @@ SERVER_NAME = "dream"
 SERVE_ARGS = ("mcp", "serve")
 # Variables that choose Dream's configuration and store; recorded so the client's server sees them too.
 RECORDED_ENV = ("DREAM_CONFIG", "DREAM_MEMORY_ROOT", "CLAUDE_DREAM_DB")
+# The variable each explicit option is recorded as; the server reads them as the options would be read.
+OPTION_ENV = {"--config": "DREAM_CONFIG", "--db": "CLAUDE_DREAM_DB"}
 
 CODEX_BEGIN = "# >>> dream mcp server: managed by `dream mcp install`; remove with `dream mcp uninstall` >>>"
 CODEX_END = "# <<< dream mcp server <<<"
@@ -50,10 +54,17 @@ _CLAUDE_TIMEOUT_SECONDS = 60
 _OUTPUT_CODEPOINTS = 400
 # Claude Code's own messages for this server; anything else is a failure.
 _CLAUDE_EXISTS = re.compile(rf"MCP server ['\"]?{SERVER_NAME}['\"]? already exists", re.IGNORECASE)
-_CLAUDE_NOT_FOUND = re.compile(rf"found with name:?\s*['\"]?{SERVER_NAME}['\"]?(?![\w-])", re.IGNORECASE)
+# Older releases say "No ... MCP server found with name: dream"; Claude Code 2.1 says
+# 'No MCP server named "dream"', with " in user scope" from remove.
+_CLAUDE_NOT_FOUND = re.compile(rf"(?:found with name:?|no mcp server named)\s*['\"]?{SERVER_NAME}['\"]?(?![\w-])",
+                               re.IGNORECASE)
 _CLAUDE_OURS_INLINE = re.compile(rf"(?:^|[\s/'\"]){SERVER_NAME}['\"]?\s+mcp\s+serve(?![\w-])", re.MULTILINE)
 _CLAUDE_COMMAND_LINE = re.compile(rf"^\s*command:\s*(?:\S*/)?{SERVER_NAME}\s*$", re.IGNORECASE | re.MULTILINE)
 _CLAUDE_ARGS_LINE = re.compile(r"^\s*args:\s*mcp\s+serve\s*$", re.IGNORECASE | re.MULTILINE)
+# `claude mcp get` names the scope of the entry it resolved; a local or project
+# entry of the same name hides the user-scoped one.
+_CLAUDE_SCOPE_LINE = re.compile(r"^\s*scope:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+_CLAUDE_USER_SCOPE = re.compile(r"user config\b", re.IGNORECASE)
 _SHELL_STOPS = (126, 127)  # the command or its interpreter could not run
 
 _CLIENT_NAMES = {"codex": "Codex", "opencode": "OpenCode", "claude": "Claude Code"}
@@ -79,11 +90,16 @@ class ClientMissing(McpInstallError):
 
 @dataclass(frozen=True)
 class ServerLaunch:
-    """How the client starts the server: the launcher and the recorded environment."""
+    """How the client starts the server: the launcher and the recorded environment.
+
+    ``options`` names the ``env`` entries that came from explicit options
+    rather than from the current environment.
+    """
 
     command: str
     on_path: bool
     env: dict[str, str] = field(default_factory=dict)
+    options: tuple[str, ...] = ()
 
     @property
     def argv(self) -> list[str]:
@@ -100,13 +116,25 @@ class McpInstallReport:
     notes: tuple[str, ...] = ()
 
 
-def server_launch() -> ServerLaunch:
-    """The ``dream`` launcher on ``PATH`` (absolute) and the Dream variables set now."""
-    env = {name: os.environ[name] for name in RECORDED_ENV if os.environ.get(name)}
+def server_launch(*, config_path: str | os.PathLike | None = None,
+                  db_path: str | os.PathLike | None = None) -> ServerLaunch:
+    """The ``dream`` launcher on ``PATH`` (absolute) and the Dream variables set now.
+
+    ``config_path`` and ``db_path`` are the explicit ``--config`` and ``--db``
+    options. Each is recorded as an absolute path, so the client finds the
+    same profile from any working directory, and replaces the variable of
+    the same name from the environment, as the option did for this command.
+    """
+    chosen = {OPTION_ENV["--config"]: config_path, OPTION_ENV["--db"]: db_path}
+    options = {name: os.path.abspath(os.path.expanduser(os.fspath(value)))
+               for name, value in chosen.items() if value}
+    env = {name: options.get(name) or os.environ[name]
+           for name in RECORDED_ENV if name in options or os.environ.get(name)}
+    recorded = tuple(name for name in env if name in options)
     found = shutil.which(SERVER_NAME)
     if found:
-        return ServerLaunch(os.path.abspath(found), True, env)
-    return ServerLaunch(SERVER_NAME, False, env)
+        return ServerLaunch(os.path.abspath(found), True, env, recorded)
+    return ServerLaunch(SERVER_NAME, False, env, recorded)
 
 
 def next_step(client: str, launch: ServerLaunch) -> str:
@@ -119,9 +147,15 @@ def next_step(client: str, launch: ServerLaunch) -> str:
 
 
 def _env_notes(launch: ServerLaunch, table: str) -> tuple[str, ...]:
-    if not launch.env:
-        return ()
-    return (f"Recorded {', '.join(launch.env)} from the current environment in the entry's {table}.",)
+    notes = []
+    inherited = [name for name in launch.env if name not in launch.options]
+    if inherited:
+        notes.append(f"Recorded {', '.join(inherited)} from the current environment in the entry's {table}.")
+    if launch.options:
+        flags = {name: flag for flag, name in OPTION_ENV.items()}
+        named = ", ".join(f"{name} (from {flags[name]})" for name in launch.options)
+        notes.append(f"Recorded {named} as absolute paths in the entry's {table}.")
+    return tuple(notes)
 
 
 def codex_config_path() -> Path:
@@ -525,7 +559,9 @@ def _claude_display(argv: list[str], launch: ServerLaunch | None = None) -> str:
     parts = []
     for part in argv:
         name = part.split("=", 1)[0]
-        if launch is not None and "=" in part and name in launch.env and part == f"{name}={launch.env[name]}":
+        # A value from an explicit option is not in the shell's environment, so it is spelled out.
+        if (launch is not None and "=" in part and name in launch.env and name not in launch.options
+                and part == f"{name}={launch.env[name]}"):
             parts.append(f'{name}="${name}"')
         else:
             parts.append(shlex.quote(part))
@@ -592,7 +628,33 @@ def install_claude(launch: ServerLaunch | None = None) -> McpInstallReport:
 
 
 def uninstall_claude() -> McpInstallReport:
+    """Remove the user-scoped ``dream`` server, but only when it runs Dream.
+
+    ``claude mcp get dream`` must show the user-scoped entry with the ``mcp
+    serve`` command, as install checks before it keeps an existing entry. An
+    entry of another tool is left in place. A local or project entry of the
+    same name hides the user-scoped one from ``get``, so Dream cannot check
+    the entry it would remove and removes nothing.
+    """
     argv = ["claude", "mcp", "remove", "--scope", "user", SERVER_NAME]
+    if shutil.which("claude") is None:
+        raise ClientMissing(_claude_display(argv))
+    get_argv = ["claude", "mcp", "get", SERVER_NAME]
+    get_code, get_output = _run_claude(get_argv)
+    if get_code != 0:
+        if get_code not in _SHELL_STOPS and _CLAUDE_NOT_FOUND.search(get_output):
+            return McpInstallReport("claude", False, None, None, "not installed")
+        raise _claude_failure(get_argv, None, get_code, get_output)
+    scope = _CLAUDE_SCOPE_LINE.search(get_output)
+    if scope is None or not _CLAUDE_USER_SCOPE.match(scope.group(1)):
+        where = f"the {scope.group(1)} entry" if scope else "an entry without a scope"
+        raise McpInstallError(
+            f"`claude mcp get {SERVER_NAME}` shows {where}, which hides the user-scoped entry, so dream cannot "
+            f"check that entry before removing it; remove it yourself if it runs `dream mcp serve`:\n  "
+            f"{_claude_display(argv)}")
+    if not _claude_entry_is_ours(get_output):
+        return McpInstallReport("claude", False, None, None,
+                                f"left a user-scoped {SERVER_NAME} server not written by dream")
     returncode, output = _run_claude(argv)
     if returncode == 0:
         return McpInstallReport("claude", True, None, None, "removed")

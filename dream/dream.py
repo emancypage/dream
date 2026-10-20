@@ -1693,7 +1693,9 @@ def cmd_mcp(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
     path = Path(args.path).expanduser() if args.path else None
-    launch = mcp_install.server_launch()
+    # Explicit --config and --db choose the profile the client's server reads too.
+    launch = mcp_install.server_launch(config_path=getattr(args, "config_option", None),
+                                       db_path=getattr(args, "db_option", None))
     try:
         if args.mcp_cmd == "install":
             report = mcp_install.install(args.client, path, launch)
@@ -1912,6 +1914,8 @@ def main(argv: list[str] | None = None) -> int:
     register_character(sub)
 
     args = p.parse_args(argv)
+    # The options as given; args.config and args.db are replaced by what they resolve to.
+    args.config_option, args.db_option = args.config, args.db
     try:
         args.config = load_config(Path(args.config).expanduser() if args.config else None)
     except Exception as exc:

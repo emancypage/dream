@@ -14,6 +14,7 @@ import shutil
 import stat
 import tomllib
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -41,9 +42,15 @@ needs_permissions = pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() =
                                        reason="root ignores directory permissions")
 
 
-def _main(capsys, tmp_path, *argv):
+def _main(capsys, tmp_path, *argv, options=()):
+    """Run ``dream [options] mcp argv``; the default configuration path is a missing file under tmp_path.
+
+    No ``--config`` by default: an explicit one is recorded in the entry.
+    """
+    import config
     from dream import main
-    rc = main(["--config", str(tmp_path / "no-config.toml"), "mcp", *argv])
+    with mock.patch.object(config, "DEFAULT_CONFIG_PATH", tmp_path / "no-config.toml"):
+        rc = main([*options, "mcp", *argv])
     captured = capsys.readouterr()
     return rc, captured.out, captured.err
 
@@ -361,6 +368,7 @@ def claude(home, tmp_path):
 
 _ADD = ["mcp", "add", "--scope", "user", "dream", "--", "dream", "mcp", "serve"]
 _REMOVE = ["mcp", "remove", "--scope", "user", "dream"]
+_GET = ["mcp", "get", "dream"]
 _EXISTS = "echo 'MCP server dream already exists in user config' >&2; exit 1"
 _GET_OURS = ("printf 'dream:\\n  Scope: User config\\n  Status: Connected\\n  Type: stdio\\n  Command: dream\\n"
              "  Args: mcp serve\\n'")
@@ -410,13 +418,59 @@ def test_claude_uninstall_removes_only_the_dream_entry(home, tmp_path, capsys, c
     codex.parent.mkdir()
     codex.write_text(_CODEX_CONFIG, encoding="utf-8")
     before = _files(home)
+    claude.set(get=_GET_OURS)
     rc, out, _err = _main(capsys, tmp_path, "uninstall", "--client", "claude")
     assert rc == 0 and "Removed" in out
-    assert claude.calls() == [_REMOVE]
+    assert claude.calls() == [_GET, _REMOVE]
     assert _files(home) == before
-    claude.set(remove="echo 'No user-scoped MCP server found with name: dream' >&2; exit 1")
+    # Removed by someone else between the check and the removal.
+    claude.set(get=_GET_OURS, remove="echo 'No user-scoped MCP server found with name: dream' >&2; exit 1")
     rc, out, _err = _main(capsys, tmp_path, "uninstall", "--client", "claude")
     assert rc == 0 and "not installed" in out
+
+
+@pytest.mark.parametrize("get", [
+    "echo 'No MCP server found with name: dream' >&2; exit 1",
+    # Claude Code 2.1 wording, with and without a suggestion.
+    """echo 'No MCP server named "dream". Run `claude mcp add` to add one.' >&2; exit 1""",
+    """echo 'No MCP server named "dream". Did you mean "dream-tools"? Run `claude mcp list` to see all.' >&2; exit 1""",
+])
+def test_claude_uninstall_without_a_dream_server_removes_nothing(home, tmp_path, capsys, claude, get):
+    claude.set(get=get)
+    rc, out, _err = _main(capsys, tmp_path, "uninstall", "--client", "claude")
+    assert rc == 0 and "not installed" in out
+    assert claude.calls() == [_GET]
+
+
+def test_claude_uninstall_reports_a_server_removed_meanwhile_in_the_current_wording(home, tmp_path, capsys, claude):
+    claude.set(get=_GET_OURS, remove="""echo 'No MCP server named "dream" in user scope' >&2; exit 1""")
+    rc, out, _err = _main(capsys, tmp_path, "uninstall", "--client", "claude")
+    assert rc == 0 and "not installed" in out
+
+
+def test_claude_uninstall_leaves_a_foreign_user_scoped_server(home, tmp_path, capsys, claude):
+    claude.set(get=_GET_FOREIGN)
+    rc, out, err = _main(capsys, tmp_path, "uninstall", "--client", "claude")
+    assert (rc, err) == (0, "")
+    assert "Nothing to remove for claude: left a user-scoped dream server not written by dream." in out
+    assert claude.calls() == [_GET]
+
+
+@pytest.mark.parametrize("get, shown", [
+    ("printf 'dream:\\n  Scope: Local config (private to you in this project)\\n  Type: stdio\\n"
+     "  Command: dream\\n  Args: mcp serve\\n'", "the Local config (private to you in this project) entry"),
+    ("printf 'dream:\\n  Scope: Project config (shared via .mcp.json)\\n  Type: stdio\\n"
+     "  Command: npx\\n  Args: other-server\\n'", "the Project config (shared via .mcp.json) entry"),
+    ("printf 'dream: dream mcp serve - Connected\\n'", "an entry without a scope"),
+])
+def test_claude_uninstall_removes_nothing_when_another_scope_hides_the_user_entry(home, tmp_path, capsys, claude,
+                                                                                    get, shown):
+    claude.set(get=get)
+    rc, out, err = _main(capsys, tmp_path, "uninstall", "--client", "claude")
+    assert rc == 1 and out == ""
+    assert shown in err and "hides the user-scoped entry" in err
+    assert "claude mcp remove --scope user dream" in err
+    assert claude.calls() == [_GET]
 
 
 @pytest.mark.parametrize("remove, code", [
@@ -424,12 +478,19 @@ def test_claude_uninstall_removes_only_the_dream_entry(home, tmp_path, capsys, c
     ("echo 'Error: no credentials found; run claude login' >&2; exit 1", 1),
     ("echo 'No user-scoped MCP server found with name: dream' >&2; exit 127", 127),
     ("echo 'No MCP server found with name: dreamer' >&2; exit 1", 1),
+    ("""echo 'No MCP server named "dreamer". Did you mean "dream"?' >&2; exit 1""", 1),
 ])
 def test_claude_uninstall_failures_are_not_reported_as_not_installed(home, tmp_path, capsys, claude, remove, code):
-    claude.set(remove=remove)
+    claude.set(get=_GET_OURS, remove=remove)
     rc, out, err = _main(capsys, tmp_path, "uninstall", "--client", "claude")
     assert rc == 1 and out == "" and "not installed" not in err
     assert f"failed with exit code {code}" in err
+    # The same outputs from the ownership check are failures too, and nothing is removed.
+    claude.set(get=remove, remove="exit 0")
+    rc, out, err = _main(capsys, tmp_path, "uninstall", "--client", "claude")
+    assert rc == 1 and out == "" and "not installed" not in err
+    assert f"`claude mcp get dream` failed with exit code {code}" in err
+    assert _REMOVE not in claude.calls()[-1:]
 
 
 def test_claude_that_hangs_or_cannot_start_is_an_error(home, tmp_path, capsys, claude, monkeypatch):
@@ -524,8 +585,37 @@ def test_install_works_with_a_broken_dream_configuration(home, tmp_path, capsys)
     broken = tmp_path / "broken.toml"
     broken.write_text("[recall\n", encoding="utf-8")
     assert main(["--config", str(broken), "mcp", "install", "--client", "codex"]) == 0
-    assert tomllib.loads((home / ".codex" / "config.toml").read_text())["mcp_servers"]["dream"] == DREAM_ENTRY
+    # The explicit profile is kept, so the server reports the same configuration error per tool call.
+    entry = tomllib.loads((home / ".codex" / "config.toml").read_text())["mcp_servers"]["dream"]
+    assert entry == {**DREAM_ENTRY, "env": {"DREAM_CONFIG": str(broken)}}
     capsys.readouterr()
+
+
+def test_explicit_config_and_db_options_are_recorded_as_absolute_paths(home, tmp_path, capsys, claude, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DREAM_CONFIG", str(tmp_path / "env-profile.toml"))
+    monkeypatch.setenv("CLAUDE_DREAM_DB", str(tmp_path / "env.db"))
+    monkeypatch.setenv("DREAM_MEMORY_ROOT", str(tmp_path / "memory"))
+    options = ("--config", "profiles/work.toml", "--db", "~/stores/work.db")
+    recorded = {"DREAM_CONFIG": str(tmp_path / "profiles" / "work.toml"), "DREAM_MEMORY_ROOT": str(tmp_path / "memory"),
+                "CLAUDE_DREAM_DB": str(home / "stores" / "work.db")}
+    for client in ("codex", "opencode", "claude"):
+        rc, out, err = _main(capsys, tmp_path, "install", "--client", client, options=options)
+        assert rc == 0, err
+        assert "Recorded DREAM_MEMORY_ROOT from the current environment" in out
+        assert "Recorded DREAM_CONFIG (from --config), CLAUDE_DREAM_DB (from --db) as absolute paths" in out
+    codex = tomllib.loads((home / ".codex" / "config.toml").read_text(encoding="utf-8"))
+    assert codex["mcp_servers"]["dream"]["env"] == recorded
+    opencode = json.loads((home / ".config" / "opencode" / "opencode.json").read_text(encoding="utf-8"))
+    assert opencode["mcp"]["dream"]["environment"] == recorded
+    assert claude.calls()[-1] == ["mcp", "add", "--scope", "user", "dream",
+                                  *[part for name, value in recorded.items() for part in ("-e", f"{name}={value}")],
+                                  "--", "dream", "mcp", "serve"]
+    # Without claude, the manual command spells out the option paths and names only the inherited variable.
+    claude.script.unlink()
+    rc, _out, err = _main(capsys, tmp_path, "install", "--client", "claude", options=options)
+    assert rc == 1 and '-e DREAM_MEMORY_ROOT="$DREAM_MEMORY_ROOT"' in err
+    assert f"-e DREAM_CONFIG={recorded['DREAM_CONFIG']}" in err and f"-e CLAUDE_DREAM_DB={recorded['CLAUDE_DREAM_DB']}" in err
 
 
 # --- byte preservation ------------------------------------------------------------------------------
