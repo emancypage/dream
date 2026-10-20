@@ -14,7 +14,7 @@ from dataclasses import replace
 from typing import Protocol, Sequence, runtime_checkable
 
 from config import has_url_extras, is_loopback_url
-from recall_embeddings import EMBED_TEXT_MAX_CODEPOINTS, MAX_DIMENSION, has_vector_blob, store_vector, stored_vector
+from recall_embeddings import EMBED_TEXT_MAX_CODEPOINTS, MAX_DIMENSION, embedding_text, has_vector_blob, store_vector, stored_vector
 from recall_types import RecallCandidate, RecallQuery
 
 
@@ -85,8 +85,17 @@ def _short(value, limit: int = 80) -> str:
 BATCH_TIMEOUT_FLOOR_SECONDS = 60.0
 
 
-def _abort(connection) -> None:
-    """Wake a worker blocked on the socket and drop the connection."""
+class _Aborted(Exception):
+    """The caller gave up on this exchange; the worker stops at its next step."""
+
+
+def _abort(connection, aborted: threading.Event) -> None:
+    """Tell the worker to stop, wake it if it is blocked on the socket, and drop the connection.
+
+    A worker still inside ``connect()`` finishes connecting (bounded by the
+    socket timeout), sees the event and closes without sending anything.
+    """
+    aborted.set()
     sock = getattr(connection, "sock", None)
     if sock is not None:
         try:
@@ -99,7 +108,7 @@ def _abort(connection) -> None:
         pass
 
 
-def _read_bounded(response, limit: int, *, raise_on_overflow: bool = True) -> bytes:
+def _read_bounded(response, limit: int, *, raise_on_overflow: bool = True, aborted: threading.Event | None = None) -> bytes:
     """Read at most ``limit`` bytes in small reads; reject a larger body."""
     declared = response.getheader("Content-Length")
     if raise_on_overflow and declared and declared.isdigit() and int(declared) > limit:
@@ -107,6 +116,8 @@ def _read_bounded(response, limit: int, *, raise_on_overflow: bool = True) -> by
     chunks: list[bytes] = []
     total = 0
     while total <= limit:
+        if aborted is not None and aborted.is_set():
+            raise _Aborted()
         chunk = response.read1(min(65536, limit + 1 - total))
         if not chunk:
             break
@@ -202,11 +213,12 @@ class OpenAICompatibleEmbedder:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         connection = self._connection(timeout)
+        aborted = threading.Event()
         outcome: dict = {}
 
         def exchange() -> None:
             try:
-                outcome["raw"] = self._exchange(connection, body, headers, self._response_limit(len(items)), token)
+                outcome["raw"] = self._exchange(connection, body, headers, self._response_limit(len(items)), token, aborted)
             except BaseException as exc:  # handed to the caller's thread
                 outcome["error"] = exc
 
@@ -214,7 +226,7 @@ class OpenAICompatibleEmbedder:
         worker.start()
         worker.join(timeout)
         if worker.is_alive():
-            _abort(connection)
+            _abort(connection, aborted)
             raise EmbedderUnavailable("embedding server timed out")
         if "error" in outcome:
             raise outcome["error"]
@@ -227,18 +239,31 @@ class OpenAICompatibleEmbedder:
                                                context=ssl.create_default_context())
         return http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
 
-    def _exchange(self, connection, body: bytes, headers: dict, limit: int, token) -> bytes:
-        """One request on a fresh connection; transport failures become EmbedderUnavailable."""
+    def _exchange(self, connection, body: bytes, headers: dict, limit: int, token, aborted: threading.Event) -> bytes | None:
+        """One request on a fresh connection; transport failures become EmbedderUnavailable.
+
+        The worker checks ``aborted`` after connecting and before every read,
+        so it never carries on alone once the caller has given up.
+        """
         try:
+            connection.connect()
+            if aborted.is_set():
+                return None
             connection.request("POST", self._endpoint.path, body=body, headers=headers)
+            if aborted.is_set():
+                return None
             response = connection.getresponse()
+            if aborted.is_set():
+                return None
             if not 200 <= response.status < 300:
                 # Redirects are never followed: any non-2xx answer is unavailability.
                 # Read past the excerpt by the key's length so an echoed key is redacted whole.
-                raw = _read_bounded(response, 512 + len(token or ""), raise_on_overflow=False)
+                raw = _read_bounded(response, 512 + len(token or ""), raise_on_overflow=False, aborted=aborted)
                 excerpt = _redacted_excerpt(raw, token)
                 raise EmbedderUnavailable(f"embedding server answered HTTP {response.status}" + (f": {excerpt}" if excerpt else ""))
-            return _read_bounded(response, limit)
+            return _read_bounded(response, limit, aborted=aborted)
+        except _Aborted:
+            return None
         except AdapterError:
             raise
         except (TimeoutError, socket.timeout):
@@ -339,7 +364,7 @@ def embedder_fallback_reason(exc: Exception) -> str:
     return "embedder-unavailable" if isinstance(exc, EmbedderUnavailable) else f"embedder-error:{type(exc).__name__}"
 
 
-def apply_optional_adapters(conn, query: RecallQuery, candidates: list[RecallCandidate], settings, *, embedder=None, reranker=None, allow_cache_writes: bool = True, query_vector=None) -> tuple[list[RecallCandidate], str, str | None]:
+def apply_optional_adapters(conn, query: RecallQuery, candidates: list[RecallCandidate], settings, *, embedder=None, reranker=None, allow_cache_writes: bool = False, query_vector=None) -> tuple[list[RecallCandidate], str, str | None]:
     """Enhance lexical candidates, preserving them unchanged on any adapter error.
 
     The embedder rescores the top 100 candidates that have a stored vector.
@@ -357,7 +382,8 @@ def apply_optional_adapters(conn, query: RecallQuery, candidates: list[RecallCan
         else:
             try:
                 fingerprint = adapter_fingerprint(embedder)
-                vector_for_query = _validate_vector(query_vector) if query_vector is not None else embed_query(embedder, query.query_text)
+                vector_for_query = (_validate_vector(query_vector) if query_vector is not None
+                                    else embed_query(embedder, embedding_text(query.query_text)))
                 rescored = []
                 changed = False
                 has_blob = has_vector_blob(conn)

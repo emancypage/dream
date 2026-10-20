@@ -34,7 +34,8 @@ def test_embedder_is_cached_and_broken_reranker_falls_back(tmp_path):
     from dream import open_db
     conn = open_db(tmp_path / "dream.db")
     query = RecallQuery("query", "s", "prompt", None, (), 4000, frozenset(), False)
-    values, mode, fallback = apply_optional_adapters(conn, query, [_candidate()], _settings(embed=True, rerank=True), embedder=FakeEmbedder(), reranker=BrokenReranker())
+    values, mode, fallback = apply_optional_adapters(conn, query, [_candidate()], _settings(embed=True, rerank=True), embedder=FakeEmbedder(),
+                                                     reranker=BrokenReranker(), allow_cache_writes=True)
     assert values and mode == "lexical_plus_embedder"
     assert fallback and "reranker-error" in fallback
     assert conn.execute("SELECT COUNT(*) FROM recall_embeddings").fetchone()[0] == 1
@@ -86,7 +87,7 @@ def test_cached_embedding_is_stored_as_a_float32_blob(tmp_path):
     from dream import open_db
     conn = open_db(tmp_path / "dream.db")
     query = RecallQuery("query", "s", "prompt", None, (), 4000, frozenset(), False)
-    apply_optional_adapters(conn, query, [_candidate()], _settings(embed=True), embedder=FakeEmbedder())
+    apply_optional_adapters(conn, query, [_candidate()], _settings(embed=True), embedder=FakeEmbedder(), allow_cache_writes=True)
     row = conn.execute("SELECT vector_json, length(vector_blob), dimension FROM recall_embeddings").fetchone()
     assert row == ("[]", 8, 2)
 
@@ -120,3 +121,16 @@ def test_unreachable_embedder_reports_unavailable_during_rescore(tmp_path):
     query = RecallQuery("query", "s", "prompt", None, (), 4000, frozenset(), False)
     values, mode, fallback = apply_optional_adapters(conn, query, [_candidate()], _settings(embed=True), embedder=Down())
     assert values == [_candidate()] and mode == "lexical" and fallback == "embedder-unavailable"
+
+
+def test_adapters_never_write_by_default_and_embed_the_scrubbed_query(tmp_path):
+    import inspect
+    from dream import open_db
+    assert inspect.signature(apply_optional_adapters).parameters["allow_cache_writes"].default is False
+    conn = open_db(tmp_path / "dream.db")
+    embedder = FakeEmbedder()
+    query = RecallQuery("postgres GITHUB_TOKEN=ghp_query_secret_value", "s", "prompt", None, (), 4000, frozenset(), False)
+    apply_optional_adapters(conn, query, [_candidate()], _settings(embed=True), embedder=embedder)
+    assert conn.execute("SELECT COUNT(*) FROM recall_embeddings").fetchone()[0] == 0
+    (sent,) = embedder.calls
+    assert sent == [sent[0]] and "ghp_query_secret_value" not in sent[0] and "postgres" in sent[0]

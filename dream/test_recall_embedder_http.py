@@ -1169,3 +1169,39 @@ def test_with_adapters_switches_one_adapter_and_keeps_the_other():
     both = with_adapters(settings, embedder=True, reranker=True)
     assert both.embedder.enabled and both.reranker.enabled
     assert with_adapters(settings) == settings
+
+
+def test_an_abort_during_a_slow_connect_leaves_no_worker_and_sends_nothing(embedding_server):
+    import http.client
+
+    class SlowConnect(http.client.HTTPConnection):
+        def connect(self):
+            time.sleep(0.4)
+            super().connect()
+
+    class SlowConnectEmbedder(OpenAICompatibleEmbedder):
+        def _connection(self, timeout):
+            return SlowConnect(self._endpoint.hostname, self._endpoint.port, timeout=timeout)
+
+    embedder = SlowConnectEmbedder(embedding_server.url, MODEL, DIMENSION, 0.1)
+    started = time.perf_counter()
+    with pytest.raises(EmbedderUnavailable, match="timed out"):
+        embedder.embed(["postgres"])
+    assert time.perf_counter() - started < 0.1 + 0.3
+    workers = [thread for thread in threading.enumerate() if thread.name == "dream-embedder"]
+    for worker in workers:
+        worker.join(1.0)
+    assert not [thread for thread in workers if thread.is_alive()]
+    # The worker connected after the caller gave up and closed without sending the request.
+    assert embedding_server.requests == []
+
+
+def test_aborted_calls_leave_no_workers_behind(drip_server):
+    url = drip_server("header-drip")
+    for _ in range(5):
+        with pytest.raises(EmbedderUnavailable):
+            OpenAICompatibleEmbedder(url, MODEL, DIMENSION, 0.2).embed(["postgres"])
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and any(thread.name == "dream-embedder" for thread in threading.enumerate()):
+        time.sleep(0.02)
+    assert not [thread for thread in threading.enumerate() if thread.name == "dream-embedder"]
