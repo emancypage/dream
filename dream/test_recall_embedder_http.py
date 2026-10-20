@@ -1142,6 +1142,19 @@ def test_a_down_embedder_writes_one_diagnostic_per_window(tmp_path, embedding_se
     assert [line["fallback_reason"] for line in lines] == ["embedder-unavailable"]
 
 
+def test_a_dense_scan_timeout_leaves_one_diagnostic(tmp_path, embedding_server, monkeypatch, capsys):
+    import recall_context
+    memory, _db_dir, db_path = _hook_store(tmp_path, embedding_server)
+    config = _cli_config(tmp_path, embedding_server.url)
+    # A deadline already in the past makes every scan time out.
+    monkeypatch.setattr(recall_context, "DENSE_SCAN_DEADLINE_SECONDS", -1.0)
+    for index in range(2):
+        rc, _out, _elapsed = _timed_hook(monkeypatch, capsys, tmp_path, config, db_path, memory, "postgresql migrations", f"run-{index}")
+        assert rc == 0
+    lines = [json.loads(line) for line in (tmp_path / "diagnostics.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [line["fallback_reason"] for line in lines] == ["dense-scan-timeout"]
+
+
 def test_session_start_with_a_calibrated_embedder_never_uses_the_dense_list(tmp_path, embedding_server):
     conn, memory = _memory_store(tmp_path, _ENGLISH)
     embed_recall_documents(conn, make_embedder(embedding_server.url), include_raw_transcripts=False)

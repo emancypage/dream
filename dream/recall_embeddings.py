@@ -176,10 +176,11 @@ def dense_candidates(conn, query_vector, fingerprint: str, allowed_kinds, limit:
         "JOIN recall_documents d ON d.id = e.document_id AND d.content_sha256 = e.content_sha256 "
         "WHERE e.adapter_fingerprint = ? AND d.source_kind IN (" + ",".join("?" for _ in kinds) + ")",
         (fingerprint, *kinds),
-    ).fetchall()
+    )
     _check_deadline(deadline)
     mul = operator.mul
     scored: list[tuple[str, float]] = []
+    # Iterating the cursor keeps the deadline checks running while rows are fetched.
     for position, (document_id, blob, row_dimension, raw) in enumerate(rows):
         if deadline is not None and position % _DEADLINE_STRIDE == 0:
             _check_deadline(deadline)

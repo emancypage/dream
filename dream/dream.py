@@ -1614,7 +1614,7 @@ def cmd_context(args: argparse.Namespace) -> int:
                              memory_root=args.config.memory_root,
                              constitution_path=args.config.data["character"]["constitution_path"])
         fallback_reason = result.diagnostics.fallback_reason or ("embedder-misconfigured" if embedder_problem else None)
-        if embedder_problem or str(fallback_reason).startswith(("embedder-unavailable", "embedder-error")):
+        if embedder_problem or str(fallback_reason).startswith(("embedder-unavailable", "embedder-error", "dense-scan-timeout")):
             try:
                 # One line per reason every ten minutes while the embedder stays down.
                 if not recent_diagnostic(settings, fallback_reason):
