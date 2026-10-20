@@ -1,9 +1,16 @@
 """Tests for the consolidate prompt templates: the staleness audit and recall usage annotations."""
-import sys
+import json
+import os
+import re
+import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).parent))
-from consolidate import _load_prompt  # noqa: E402
+import consolidate as C
+import dream
+from config import load_config
+from consolidate import _load_prompt
+from recall_documents import stable_document_id, synchronize_recall_documents
 
 
 def test_prompt_has_staleness_audit_section():
@@ -34,17 +41,6 @@ def test_prompt_substitution_leaves_no_placeholders():
 
 
 # ------------------------------------------------------------ recall usage annotations
-
-import json  # noqa: E402
-import os  # noqa: E402
-import re  # noqa: E402
-import sqlite3  # noqa: E402
-from types import SimpleNamespace  # noqa: E402
-
-import consolidate as C  # noqa: E402
-import dream  # noqa: E402
-from config import load_config  # noqa: E402
-from recall_documents import stable_document_id, synchronize_recall_documents  # noqa: E402
 
 FILE_BLOCK = re.compile(r"^### FILE: (?P<name>.+)\n(?P<next>.*)$", re.MULTILINE)
 
@@ -157,3 +153,19 @@ def test_a_never_recalled_file_is_still_held_back_by_the_grace_period(tmp_path, 
     assert [(s.kind, s.target_path) for s in suggestions] == [("remove", "project_gamma.md")]
     assert (root / "project_beta.md").exists() and (root / "project_gamma.md").exists()
     assert conn.execute("SELECT status FROM suggestions").fetchall() == [("pending",)]
+
+
+def test_audit_chunks_stay_within_the_limit_with_usage_annotations(tmp_path, monkeypatch):
+    root = tmp_path / "memory"
+    root.mkdir()
+    for i in range(40):
+        (root / f"project_{i:02d}.md").write_text(f"Topic {i:02d} facts. " + "x" * 120 + "\n", encoding="utf-8")
+    files = C.memory_files(root, constitution_path=None)
+    widest = "last recalled: 2026-10-20; recalls: 999999"
+    limit = 1_000
+    chunks = C.audit_chunks(files, limit)
+    assert sorted(entry.path.name for chunk in chunks for entry in chunk) == sorted(e.path.name for e in files)
+    for chunk in chunks:
+        rendered = "\n---\n".join(C.render_memory_file(entry.path.name, entry.body, annotation=widest)
+                                  for entry in chunk)
+        assert len(chunk) == 1 or len(rendered) <= limit

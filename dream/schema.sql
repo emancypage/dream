@@ -242,6 +242,16 @@ CREATE TABLE IF NOT EXISTS recall_usage (
     select_count      INTEGER NOT NULL CHECK (select_count > 0)
 );
 
+-- Ledger of hook markers already counted into recall_usage, written in the same
+-- transaction as the counts. A marker found here is deleted, never recounted.
+-- Keyed by marker file name and finish time; rows older than 30 days are pruned.
+CREATE TABLE IF NOT EXISTS recall_usage_markers (
+    name        TEXT NOT NULL,           -- marker file name in the hook state directory
+    finished_at TEXT NOT NULL,           -- the marker's finished_at, YYYY-MM-DDTHH:MM:SSZ
+    counted_at  TEXT NOT NULL,           -- when the harvest counted it, same format
+    PRIMARY KEY (name, finished_at)
+);
+
 CREATE TABLE IF NOT EXISTS character_constitutions (
  id TEXT PRIMARY KEY,
  work_key TEXT UNIQUE,

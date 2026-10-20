@@ -5,7 +5,11 @@ Each successful hook run leaves a lifecycle marker (``recall_hook_state``)
 naming the selected document IDs. ``dream ingest`` harvests the markers that
 are old enough that no live session still relies on them, upserts one
 ``recall_usage`` row per selected document, and then deletes exactly the
-markers it counted. Interactive queries leave no markers and never count.
+markers it counted. Counting is exactly-once: harvests hold an exclusive lock
+on the marker directory, and every counted marker is recorded in the
+``recall_usage_markers`` ledger in the same transaction as its counts, so a
+crash or a failed delete after the commit never counts a marker twice.
+Interactive queries leave no markers and never count.
 
 Usage is only evidence. With ``recall.usage_tie_break`` it breaks exact ranking
 ties; it annotates the subset and audit prompts; it feeds the read-only
@@ -16,6 +20,7 @@ hides or demotes a memory.
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
 import json
 import os
 import sqlite3
@@ -35,6 +40,9 @@ SINCE_KEY = "recall_usage_since"
 INDEX_FILE = "MEMORY.md"
 # Bounds one harvest; the remaining markers wait for the next run.
 MAX_MARKERS_PER_HARVEST = 10_000
+# Ledger rows outlive their markers by far: the OS temp cleaner removes old
+# markers within days, and a counted marker is deleted by the same harvest.
+LEDGER_RETENTION = dt.timedelta(days=30)
 # recall_hook_state writes at most 256 IDs of at most 256 characters each.
 _MAX_SELECTED_IDS = 256
 _MAX_ID_LENGTH = 256
@@ -97,6 +105,9 @@ def _open_marker_root(marker_root: Path) -> int | None:
     The directory itself must not be a symlink, must belong to this user and
     must not be writable by anyone else; every later step works relative to
     this descriptor, so the directory cannot be swapped underneath a harvest.
+    The descriptor holds an exclusive lock, so two harvests (a manual
+    ``dream ingest`` during the nightly run) never work on the same markers;
+    closing it releases the lock. Hooks lock their own per-event files only.
     """
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
@@ -114,6 +125,16 @@ def _open_marker_root(marker_root: Path) -> int | None:
     if not _owned(st) or (st.st_mode & 0o022) or (st.st_mode & 0o300) != 0o300:
         os.close(fd)
         _log("marker directory skipped (not owned by this user, writable by others, or not writable)")
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        _log("another harvest is running; its markers are left to it")
+        return None
+    except OSError as exc:
+        os.close(fd)
+        _log(f"marker directory skipped ({type(exc).__name__}: cannot lock it)")
         return None
     return fd
 
@@ -188,16 +209,37 @@ def _read_marker(dir_fd: int, name: str, cutoff: dt.datetime) -> _Marker | None:
     return _Marker(name, (st.st_dev, st.st_ino, st.st_mtime_ns), _stamp(finished), ids)
 
 
-def _record(conn: sqlite3.Connection, markers: list[_Marker]) -> None:
-    """Count every marker in one transaction; the first counted marker opens the window."""
+def _record(conn: sqlite3.Connection, markers: list[_Marker], now: dt.datetime | None = None) -> list[_Marker]:
+    """Count each marker not counted before, in one transaction; return the newly counted ones.
+
+    The ledger insert and the counts commit together, so the ledger is the
+    proof that a marker was counted: a marker already in it (its delete failed
+    or the process died after the commit) is only deleted, never recounted.
+    The ledger is keyed by marker name and finish time, because a session that
+    resumes after its marker was harvested writes a new marker under the same
+    name. The first counted marker opens the observation window.
+    """
+    now = _aware(now or _utcnow())
+    counted_at = _stamp(now)
+    counted: list[_Marker] = []
     with conn:
+        conn.execute("DELETE FROM recall_usage_markers WHERE counted_at < ?", (_stamp(now - LEDGER_RETENTION),))
         for marker in markers:
+            fresh = conn.execute(
+                "INSERT OR IGNORE INTO recall_usage_markers(name, finished_at, counted_at) VALUES (?, ?, ?)",
+                (marker.name, marker.finished_at, counted_at),
+            ).rowcount
+            if not fresh:
+                continue
+            counted.append(marker)
             for document_id in marker.selected_ids:
                 conn.execute(_UPSERT, (document_id, marker.finished_at, marker.finished_at))
-        conn.execute(
-            "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
-            (SINCE_KEY, min(marker.finished_at for marker in markers)),
-        )
+        if counted:
+            conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
+                (SINCE_KEY, min(marker.finished_at for marker in counted)),
+            )
+    return counted
 
 
 def _delete_counted(dir_fd: int, markers: list[_Marker]) -> None:
@@ -221,10 +263,11 @@ def _delete_counted(dir_fd: int, markers: list[_Marker]) -> None:
 def harvest(conn: sqlite3.Connection, marker_root, *, now: dt.datetime | None = None) -> int:
     """Count old succeeded hook markers into recall_usage; return how many were counted.
 
-    Write path only (``dream ingest``). A marker is counted once per selected
-    document ID and deleted only after its counts are committed. Fresh,
-    running, failed, malformed, foreign, symlinked or otherwise unexpected
-    entries are skipped and left in place. A missing directory counts nothing.
+    Write path only (``dream ingest``). A marker is counted exactly once, once
+    per selected document ID, and deleted only after its counts and its ledger
+    row are committed. Fresh, running, failed, malformed, foreign, symlinked or
+    otherwise unexpected entries are skipped and left in place. A missing or
+    locked directory counts nothing.
     """
     now = _aware(now or _utcnow())
     cutoff = now - HARVEST_MIN_AGE
@@ -242,9 +285,11 @@ def harvest(conn: sqlite3.Connection, marker_root, *, now: dt.datetime | None = 
                 break
         if not markers:
             return 0
-        _record(conn, markers)
+        counted = _record(conn, markers, now)
+        # Every marker read here is now in the ledger: the new ones were just
+        # counted, the rest were counted by an earlier harvest.
         _delete_counted(dir_fd, markers)
-        return len(markers)
+        return len(counted)
     finally:
         os.close(dir_fd)
 
@@ -287,7 +332,12 @@ def usage_since(conn: sqlite3.Connection) -> str | None:
 
 
 def memory_document_id(name: str) -> str:
-    """The recall document ID of a memory file, by its path relative to the memory root."""
+    """The recall document ID of a memory file, by its path relative to the memory root.
+
+    Consolidation passes bare filenames because ``consolidate.memory_files``
+    lists top-level files only, where the name is the relative path. A nested
+    file would need its path relative to the memory root (``notes/api.md``).
+    """
     return stable_document_id("approved_memory", f"memory:{name}")
 
 

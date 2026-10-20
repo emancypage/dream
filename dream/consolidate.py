@@ -671,16 +671,21 @@ def _consolidate_subset(
 # ------------------------------------------------------------ weekly audit
 
 
+# Room for the recall usage line run_audit adds under each file header.
+_ANNOTATION_ALLOWANCE = len("last recalled: 2026-10-20; recalls: 999999\n")
+
+
 def audit_chunks(files: list[MemoryFile], limit: int) -> list[list[MemoryFile]]:
     """Pack whole files, in order, into chunks whose rendered size stays within limit.
 
-    A file larger than the limit gets a chunk to itself and is never split.
+    Each file's size includes an allowance for its usage annotation. A file
+    larger than the limit gets a chunk to itself and is never split.
     """
     chunks: list[list[MemoryFile]] = []
     current: list[MemoryFile] = []
     size = 0
     for entry in files:
-        rendered = len(render_memory_file(entry.path.name, entry.body))
+        rendered = len(render_memory_file(entry.path.name, entry.body)) + _ANNOTATION_ALLOWANCE
         added = rendered + (len("\n---\n") if current else 0)
         if current and size + added > limit:
             chunks.append(current)

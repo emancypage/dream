@@ -342,18 +342,21 @@ def _recall_usage_lines(conn: sqlite3.Connection) -> list[str]:
     """The unused-memory gauge: a bare count, never a document id or path.
 
     Omitted while usage is unknown (database not migrated, no marker harvested
-    yet, unreadable recall tables), so a dashboard never reads that as zero.
+    yet, unreadable recall tables) and while the observation window is shorter
+    than the 90 days the gauge counts, so a dashboard never reads a partial
+    window as "unused for 90 days".
     """
     from recall_usage import UNUSED_DAYS, usage_report
     try:
         report = usage_report(conn)
     except (ValueError, sqlite3.Error):
         return []
-    if report.state != "observed":
+    if report.state != "observed" or report.window_shorter_than_days:
         return []
     return [
         f"# HELP dream_recall_documents_unused_90d Approved memory documents automatic recall "
-        f"has not selected in the last {UNUSED_DAYS} days.",
+        f"has not selected in the last {UNUSED_DAYS} days; only exported once usage has been "
+        f"observed for at least {UNUSED_DAYS} days.",
         "# TYPE dream_recall_documents_unused_90d gauge",
         f"dream_recall_documents_unused_90d {len(report.unused)}",
     ]

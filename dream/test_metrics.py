@@ -187,11 +187,10 @@ class MetricsStateTest(unittest.TestCase):
         return root.joinpath(*parts) if parts else root / "dream-status.json"
 
 
-
 class RecallUsageGaugeTest(unittest.TestCase):
     GAUGE = "dream_recall_documents_unused_90d"
 
-    def _store(self, *, since=True, migrated=True):
+    def _store(self, *, since="2026-07-01T00:00:00Z", migrated=True):
         import datetime as dt
         import dream
         from config import load_config
@@ -210,7 +209,7 @@ class RecallUsageGaugeTest(unittest.TestCase):
         conn.execute("INSERT INTO recall_usage VALUES (?, ?, ?, 4)",
                      (stable_document_id("approved_memory", "memory:project_used.md"), recent, recent))
         if since:
-            conn.execute("INSERT INTO meta(key, value) VALUES ('recall_usage_since', '2026-07-01T00:00:00Z')")
+            conn.execute("INSERT INTO meta(key, value) VALUES ('recall_usage_since', ?)", (since,))
         if not migrated:
             conn.execute("DROP TABLE recall_usage")
         conn.commit()
@@ -234,8 +233,25 @@ class RecallUsageGaugeTest(unittest.TestCase):
             self.assertNotIn(stable_document_id("approved_memory", f"memory:{name}"), text)
         self.assertNotIn(str(root), text)
 
+    def test_gauge_needs_a_full_90_day_observation_window(self):
+        import datetime as dt
+
+        now = dt.datetime.now(dt.timezone.utc)
+        for days, expected in ((91, [f"{self.GAUGE} 2"]), (89, [])):
+            since = (now - dt.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            root, config = self._store(since=since)
+            text = metrics.collect_metrics(root / "run.json", config=config)
+            self.assertEqual(self._gauge_lines(text), expected, days)
+            self.assertEqual(f"# TYPE {self.GAUGE} gauge" in text, bool(expected))
+
+    def test_gauge_help_says_it_needs_a_full_window(self):
+        root, config = self._store()
+        text = metrics.collect_metrics(root / "run.json", config=config)
+        [help_line] = [line for line in text.splitlines() if line.startswith(f"# HELP {self.GAUGE} ")]
+        self.assertIn("observed for at least 90 days", help_line)
+
     def test_gauge_is_omitted_when_usage_is_unknown(self):
-        for kwargs in ({"since": False}, {"migrated": False}):
+        for kwargs in ({"since": None}, {"migrated": False}):
             root, config = self._store(**kwargs)
             text = metrics.collect_metrics(root / "run.json", config=config)
             self.assertEqual(self._gauge_lines(text), [], kwargs)

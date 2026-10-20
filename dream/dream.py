@@ -145,6 +145,7 @@ def _backup_before_schema_migration(conn: sqlite3.Connection, path: Path) -> Pat
         or "find_text" not in _table_columns(conn, "suggestions")
         or "vector_blob" not in _table_columns(conn, "recall_embeddings")
         or not _table_columns(conn, "recall_usage")
+        or not _table_columns(conn, "recall_usage_markers")
     )
     migrations = _table_columns(conn, "schema_migrations")
     version = conn.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0] if migrations else 0

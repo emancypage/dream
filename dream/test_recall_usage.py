@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import io
 import json
 import os
@@ -254,6 +255,132 @@ def test_a_failed_write_deletes_no_marker(tmp_path):
     assert marker.exists()
 
 
+def _ledger(conn):
+    return conn.execute("SELECT name, finished_at, counted_at FROM recall_usage_markers ORDER BY name").fetchall()
+
+
+def test_counted_markers_are_recorded_in_the_ledger_with_their_counts(tmp_path):
+    root = _root(tmp_path)
+    _marker(root, "one", ids=("doc-a",))
+    conn = _db(tmp_path)
+    assert recall_usage.harvest(conn, root, now=NOW) == 1
+    assert _ledger(conn) == [("one.json", "2026-10-19T06:00:00Z", "2026-10-20T12:00:00Z")]
+
+
+def test_a_crash_after_the_commit_never_counts_a_marker_twice(tmp_path, monkeypatch):
+    root = _root(tmp_path)
+    marker = _marker(root, "one", ids=("doc-a",))
+    conn = _db(tmp_path)
+
+    def killed(*args):
+        raise KeyboardInterrupt("killed after the commit")
+
+    monkeypatch.setattr(recall_usage, "_delete_counted", killed)
+    with pytest.raises(KeyboardInterrupt):
+        recall_usage.harvest(conn, root, now=NOW)
+    assert marker.exists()
+    monkeypatch.undo()
+
+    assert recall_usage.harvest(conn, root, now=NOW) == 0
+    assert _usage(conn) == {"doc-a": (1, "2026-10-19T06:00:00Z", "2026-10-19T06:00:00Z")}
+    assert not marker.exists()
+
+
+def test_a_failed_delete_never_counts_a_marker_twice(tmp_path, monkeypatch):
+    root = _root(tmp_path)
+    marker = _marker(root, "one", ids=("doc-a",))
+    conn = _db(tmp_path)
+    monkeypatch.setattr(recall_usage, "_delete_counted", lambda dir_fd, markers: None)
+    assert recall_usage.harvest(conn, root, now=NOW) == 1
+    assert recall_usage.harvest(conn, root, now=NOW + dt.timedelta(days=1)) == 0
+    assert marker.exists()
+    monkeypatch.undo()
+
+    assert recall_usage.harvest(conn, root, now=NOW + dt.timedelta(days=2)) == 0
+    assert _usage(conn) == {"doc-a": (1, "2026-10-19T06:00:00Z", "2026-10-19T06:00:00Z")}
+    assert not marker.exists()
+
+
+def _interleave(monkeypatch, second):
+    """Run ``second()`` while the outer harvest holds its marker list, before it writes."""
+    real = recall_usage._record
+    results = []
+
+    def record(conn, markers, now=None):
+        monkeypatch.setattr(recall_usage, "_record", real)
+        results.append(second())
+        return real(conn, markers, now)
+
+    monkeypatch.setattr(recall_usage, "_record", record)
+    return results
+
+
+def test_a_concurrent_harvest_finds_the_directory_locked(tmp_path, monkeypatch, capsys):
+    root = _root(tmp_path)
+    _marker(root, "one", ids=("doc-a",))
+    conn = _db(tmp_path)
+    other = dream.open_db(tmp_path / "dream.db")
+    inner = _interleave(monkeypatch, lambda: recall_usage.harvest(other, root, now=NOW))
+    assert recall_usage.harvest(conn, root, now=NOW) == 1
+    assert inner == [0]
+    assert "another harvest is running" in capsys.readouterr().err
+    assert {doc: row[0] for doc, row in _usage(conn).items()} == {"doc-a": 1}
+
+
+def test_the_ledger_alone_keeps_interleaved_harvests_exactly_once(tmp_path, monkeypatch):
+    # Even if the directory lock were bypassed, the ledger insert decides who counts.
+    root = _root(tmp_path)
+    _marker(root, "one", ids=("doc-a",))
+    _marker(root, "two", ids=("doc-b",))
+    conn = _db(tmp_path)
+    other = dream.open_db(tmp_path / "dream.db")
+    monkeypatch.setattr(recall_usage.fcntl, "flock", lambda fd, operation: None)
+    inner = _interleave(monkeypatch, lambda: recall_usage.harvest(other, root, now=NOW))
+    assert recall_usage.harvest(conn, root, now=NOW) == 0
+    assert inner == [2]
+    assert {doc: row[0] for doc, row in _usage(conn).items()} == {"doc-a": 1, "doc-b": 1}
+    assert list(root.glob("*.json")) == []
+
+
+def test_a_held_directory_lock_defers_the_harvest(tmp_path, capsys):
+    root = _root(tmp_path)
+    marker = _marker(root, "one", ids=("doc-a",))
+    conn = _db(tmp_path)
+    held = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert recall_usage.harvest(conn, root, now=NOW) == 0
+        assert marker.exists() and _usage(conn) == {}
+        assert "another harvest is running" in capsys.readouterr().err
+    finally:
+        os.close(held)
+    assert recall_usage.harvest(conn, root, now=NOW) == 1
+    assert not marker.exists()
+
+
+def test_a_resumed_session_marker_under_the_same_name_is_counted_again(tmp_path):
+    root = _root(tmp_path)
+    _marker(root, "session", ids=("doc-a",), finished=OLD)
+    conn = _db(tmp_path)
+    assert recall_usage.harvest(conn, root, now=NOW) == 1
+    _marker(root, "session", ids=("doc-a",), finished=NOW + dt.timedelta(days=1))
+    assert recall_usage.harvest(conn, root, now=NOW + dt.timedelta(days=3)) == 1
+    assert _usage(conn)["doc-a"][0] == 2
+
+
+def test_ledger_rows_older_than_30_days_are_pruned(tmp_path):
+    root = _root(tmp_path)
+    conn = _db(tmp_path)
+    conn.executemany("INSERT INTO recall_usage_markers VALUES (?, ?, ?)", [
+        ("stale.json", "2026-09-01T00:00:00Z", _stamp(NOW - dt.timedelta(days=31))),
+        ("recent.json", "2026-09-25T00:00:00Z", _stamp(NOW - dt.timedelta(days=29))),
+    ])
+    conn.commit()
+    _marker(root, "one")
+    assert recall_usage.harvest(conn, root, now=NOW) == 1
+    assert [row[0] for row in _ledger(conn)] == ["one.json", "recent.json"]
+
+
 def test_markers_written_by_the_hook_state_module_are_harvested(tmp_path, monkeypatch):
     root = tmp_path / "hook-state"
     monkeypatch.setenv("DREAM_RECALL_STATE_ROOT", str(root))
@@ -329,6 +456,7 @@ def _unmigrated(tmp_path) -> Path:
     path = tmp_path / "legacy.db"
     conn = dream.open_db(path)
     conn.execute("DROP TABLE recall_usage")
+    conn.execute("DROP TABLE recall_usage_markers")
     conn.commit()
     conn.close()
     for backup in tmp_path.glob("legacy.db.bak-*"):
@@ -390,23 +518,26 @@ def test_hook_context_with_the_tie_break_on_reads_a_read_only_unmigrated_databas
         store.chmod(0o755)
 
 
-def test_migration_backs_up_once_then_adds_recall_usage(tmp_path):
+@pytest.mark.parametrize("table, columns", [
+    ("recall_usage", {"document_id", "first_selected_at", "last_selected_at", "select_count"}),
+    ("recall_usage_markers", {"name", "finished_at", "counted_at"}),
+])
+def test_migration_backs_up_once_then_adds_the_usage_tables(tmp_path, table, columns):
     db_path = tmp_path / "dream.db"
     conn = dream.open_db(db_path)
-    conn.execute("DROP TABLE recall_usage")
+    conn.execute(f"DROP TABLE {table}")
     conn.commit()
     conn.close()
     assert not list(tmp_path.glob("dream.db.bak-*"))
 
     conn = dream.open_db(db_path)
-    assert {row[1] for row in conn.execute("PRAGMA table_info(recall_usage)")} == {
-        "document_id", "first_selected_at", "last_selected_at", "select_count"}
+    assert {row[1] for row in conn.execute(f"PRAGMA table_info({table})")} == columns
     assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 4
     conn.close()
     [backup] = list(tmp_path.glob("dream.db.bak-provider-migration-*"))
     legacy = sqlite3.connect(backup)
     try:
-        assert legacy.execute("SELECT name FROM sqlite_master WHERE name='recall_usage'").fetchone() is None
+        assert legacy.execute("SELECT name FROM sqlite_master WHERE name=?", (table,)).fetchone() is None
     finally:
         legacy.close()
     dream.open_db(db_path).close()
