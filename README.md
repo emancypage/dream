@@ -81,7 +81,7 @@ model = "my-model-id"
 
 Model names belong to configuration, not the core. Configuration precedence is CLI override (`dream distill --model X` / `dream consolidate --model X`), stage-specific environment variable (`DREAM_DISTILL_MODEL`, `DREAM_CONSOLIDATE_MODEL`), TOML, then packaged defaults. Unknown provider/source types and unknown options fail explicitly.
 
-Changing provider/model configuration does not automatically re-run every historical session. Use `dream distill --refresh` for an explicit provenance refresh; changed transcript revisions are always re-distilled. For an `openai-compatible` route the refresh compares the provider name, `base_url` and the effective model (the stage's `model`, else the provider's).
+Changing provider/model configuration does not automatically re-run every historical session. Use `dream distill --refresh` for an explicit provenance refresh; changed transcript revisions are always re-distilled. For an `openai-compatible` route the refresh compares the provider name, `base_url` and the effective model (the stage's `model`, else the provider's), and that route also enters the distillation key, so a session refreshed for another endpoint is consolidated again even when the server reports the same model.
 
 Legacy compatibility variables remain accepted: `DREAM_BACKEND`, `CLAUDE_DREAM_DB`, and `DREAM_MEMORY_ROOT`.
 
@@ -108,7 +108,7 @@ keeps its own: `claude mcp get dream`) and the consolidation mode.
 | `consolidate.mode` | `"full"` | `"full"` sends the whole store nightly, byte-identical to earlier releases. `"subset"` sends `MEMORY.md` plus related topic files and leaves the staleness audit to the weekly `dream audit`. `dream consolidate --mode` overrides it for one run. |
 | `consolidate.subset_files` | `15` | Topic files sent in subset mode, besides `MEMORY.md` and files whose name a finding mentions. |
 | `stages.audit` | `provider = "codex"`, `reasoning_effort = "high"`, `timeout_seconds = 1800` | The model stage of `dream audit`, with the same keys as every stage. |
-| `providers.<name>.type = "openai-compatible"` | not configured | A local OpenAI-compatible generation server (llama-server, Ollama, vLLM) that a stage can route to. Keys: `base_url` (required), `model`, `api_key_env`, `remote_data_egress` (default `false`, same loopback rule) and `timeout_seconds` (default 600). `default-config.toml` has a commented `[providers.local-qwen]` example. |
+| `providers.<name>.type = "openai-compatible"` | not configured | A local OpenAI-compatible generation server (llama-server, Ollama, vLLM) that a stage can route to. Keys: `base_url` (required), `model`, `api_key_env`, `remote_data_egress` (default `false`, same loopback rule) and `timeout_seconds` (default 600), one wall-clock bound on the whole call, the `json_object` retry included. `default-config.toml` has a commented `[providers.local-qwen]` example. |
 
 Embedder problems never break recall or ingest: an invalid `[recall.embedder]`
 table disables the embedder, recall stays lexical, and the `recall.embedder`
@@ -436,8 +436,11 @@ command when `claude` is not on `PATH`. `<dream>` is the absolute path of the
 and the client must find it on its own `PATH`. When `DREAM_CONFIG`,
 `DREAM_MEMORY_ROOT` or `CLAUDE_DREAM_DB` is set, install records it in the
 entry's environment (Codex `env`, OpenCode `environment`, Claude `-e`) and
-prints the names, not the values. `--path` points codex or opencode at another
-file.
+prints the names, not the values. Explicit global options win over those
+variables: `dream --config FILE --db FILE mcp install ...` records them as
+absolute `DREAM_CONFIG` and `CLAUDE_DREAM_DB` paths, so the client's server
+reads the same profile from any working directory. `--path` points codex or
+opencode at another file.
 
 Install refuses malformed files, foreign `dream` entries, `[[mcp_servers]]`
 arrays, read-only files and dangling symlinks, re-parses the result before an atomic replace,
@@ -451,7 +454,10 @@ is: uninstall and install again to refresh it); every other
 `claude` failure is reported with its output. Claude Code keeps its own file,
 so Dream makes no backup there. `dream mcp uninstall --client ...` removes only
 the Dream entry and is the rollback; for Codex it restores the file byte for
-byte. Neither command starts the server: restart the client and check its MCP
+byte. For Claude Code it first runs `claude mcp get dream` and removes the
+user-scoped server only when that shows it running `mcp serve`; a foreign entry
+is left in place, and a local or project `dream` entry that hides the user one
+stops the uninstall with the command to run yourself. Neither command starts the server: restart the client and check its MCP
 list (`/mcp` in Codex and Claude Code, `opencode mcp list`).
 
 ## Data and compatibility
