@@ -3,28 +3,63 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 
 from recall_scrub import scrub_text
 from recall_query import query_terms
 
 _BOUNDARY = re.compile(r'(?<=[.!?])\s+|\n+|"\s*,\s*"')
-# A line of document text that starts like a recall marker or provenance
-# line, after optional whitespace or invisible format characters. Any line
-# break a reader may honour counts, not only "\n".
-_BREAKS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
-_FORGED_HEADER = re.compile(
-    rf"(^|[{_BREAKS}])((?:(?![{_BREAKS}])[\s\u200b-\u200d\u2060\ufeff])*)\[(?=[ \t]*(?:dream recall|source[ \t]*:))",
-    re.IGNORECASE,
-)
+# What a line that imitates a recall marker or provenance line reads as once
+# it is folded: compatibility forms decomposed, invisible characters dropped,
+# whitespace collapsed and case folded.
+_FORGED_HEADER = re.compile(r"\[ ?(?:dream ?recall|source ?:)")
+_INVISIBLE_CATEGORIES = frozenset({"Cf", "Mn", "Me"})
+# Letters and symbols that render blank.
+_BLANK_CHARACTERS = frozenset("\u115f\u1160\u3164\uffa0\u2800")
+# "[dreamrecall" is the longest visible prefix the pattern needs.
+_FOLDED_PREFIX = 16
+
+
+def _folded_prefix(line: str) -> str:
+    """The start of ``line`` as a reader sees it, without invisible characters.
+
+    NFKD rather than NFKC: a combining mark is then always a separate
+    character and is dropped, so "[s\u0307ource:" folds like "[source:". The
+    scan stops at the first visible character other than "[", so ordinary
+    lines cost a few steps.
+    """
+    folded: list[str] = []
+    visible = 0
+    for char in line:
+        for part in unicodedata.normalize("NFKD", char):
+            if part.isspace():
+                if folded and folded[-1] != " ":
+                    folded.append(" ")
+                continue
+            if unicodedata.category(part) in _INVISIBLE_CATEGORIES or part in _BLANK_CHARACTERS:
+                continue
+            if not folded and part != "[":
+                return ""
+            folded.append(part)
+            visible += 1
+        if visible >= _FOLDED_PREFIX:
+            break
+    return "".join(folded).casefold()
 
 
 def neutralize_forged_headers(text: str) -> str:
-    """Escape the "[" of excerpt lines that imitate a marker or provenance line.
+    """Prefix "\\" to every line that imitates a recall marker or provenance line.
 
-    A document cannot forge a second trusted-looking block: such a line is
-    rendered as "\\[source: ..." instead. Text without such lines is unchanged.
+    A document cannot forge a second trusted-looking block: lines are split
+    on every line break ``str.splitlines`` honours and judged on their folded
+    form, so invisible characters, compatibility forms and case do not hide
+    a forgery. The original line is kept after the backslash, so a second
+    pass changes nothing, and text without such lines is returned unchanged.
     """
-    return _FORGED_HEADER.sub(lambda match: match.group(1) + match.group(2) + "\\[", text)
+    lines = text.splitlines(keepends=True)
+    if not any(_FORGED_HEADER.match(_folded_prefix(line)) for line in lines):
+        return text
+    return "".join("\\" + line if _FORGED_HEADER.match(_folded_prefix(line)) else line for line in lines)
 
 
 def make_excerpt(text: str, normalized_query: str, max_codepoints: int) -> str:
@@ -68,9 +103,13 @@ def render_context(candidates, budget_codepoints: int, query_text: str) -> str:
         remaining = budget_codepoints - used - (2 if blocks else 0) - len(header)
         if remaining <= 0:
             continue
-        # An escape adds one code point per forged line; the budget check below still holds.
-        excerpt = neutralize_forged_headers(
-            make_excerpt(candidate.scrubbed_excerpt or doc.text, query_text, min(1000, remaining)))
+        # Forged lines are escaped before excerpting, because the excerpt joins
+        # chunks with spaces and would move a forged line start mid-line, and
+        # again after it, because a chunk the excerpt puts first starts a line.
+        # Each escape adds one code point. The total budget check runs after
+        # escaping, so an over-budget block is dropped, never truncated.
+        source_text = neutralize_forged_headers(candidate.scrubbed_excerpt or doc.text)
+        excerpt = neutralize_forged_headers(make_excerpt(source_text, query_text, min(1000, remaining)))
         block = header + excerpt
         if not excerpt or used + (2 if blocks else 0) + len(block) > budget_codepoints:
             continue
