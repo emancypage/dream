@@ -33,6 +33,7 @@ BARE_TOKENS = {
     "openai lowercase": _join("sk", "-", "abcdefghijklmnopqrstuvwx"),
     "openai project": _join("sk", "-proj-", _MIXED, "_", _MIXED, "-", _MIXED),
     "openai service account": _join("sk", "-svcacct-", _MIXED, "-", _MIXED),
+    "openai user key": _join("sk", "-None-", _MIXED, "_", _MIXED, "Zz9Y"),
     "anthropic": _join("sk", "-ant-", "api03-", "Ab-", _MIXED, _MIXED, _MIXED),
     "github classic": _join("gh", "p_", _MIXED, "K1m2N3o4P5q6R7s8"),
     "github oauth": _join("gh", "o_", _MIXED, "K1m2N3o4P5q6R7s8"),
@@ -43,6 +44,7 @@ BARE_TOKENS = {
     "slack bot": _join("xo", "xb-", "123456789012-", "1234567890123-", "AbCdEfGhIjKlMnOpQrStUvWx"),
     "slack user": _join("xo", "xp-", "123456789012-", "1234567890123-", "1234567890123-", "0123456789abcdef"),
     "slack app": _join("xo", "xa-", "2-", "123456789012-", "AbCdEfGhIjKl"),
+    "slack app-level": _join("xa", "pp-", "1-", "A0123456789-", "1234567890123-", "0123456789abcdef" * 4),
 }
 
 
@@ -57,7 +59,13 @@ def test_bare_provider_tokens_are_redacted(tmp_path, name, template):
 @pytest.mark.parametrize("text", [
     "pip install scikit-learn; import sk-learn style APIs",
     "the sk-learn-compatible-estimator-wrapper-module pattern",
-    "task-abcdefghijklmnopqrstuvwxyz and desk-1234567890abcdefghij",
+    _join("ta", "sk-", "abcdefghijklmnopqrstuvwxyz and ", "de", "sk-", "1234567890", "abcdefghij"),
+    "the sk-admin-dashboard-settings-panel component",
+    "CSS: .sk-proj-management-dashboard-v2-final { color: red }",
+    "Branch feature/sk-proj-onboarding-checklist-redesign merged.",
+    _join("sk", "-proj-", "lowercase-and-digits-only-0123456789-abcdefghij"),
+    _join("sk", "-None-", "NoDigitsInThisLongMixedCaseKebabStyleNameHere"),
+    _join("xa", "pp-", "1-", "short"), "xapp-store-review-notes-for-the-release",
     _join("sk", "-proj-", "short"),
     _join("sk", "-ant-", "api03-", "short"),
     _join("sk", "-", "live-", "0123456789abcdef"),

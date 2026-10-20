@@ -24,16 +24,21 @@ _KEY_VALUE = re.compile(
 )
 # Provider tokens without a label. Each needs its provider's prefix plus a
 # realistic length and charset, so words and identifiers that merely share a
-# prefix (sk-learn, xoxo, ASIAN) stay readable.
+# prefix (sk-learn, xoxo, ASIAN) stay readable. Prefixed OpenAI keys also need
+# an uppercase letter and a digit, because kebab-case names such as
+# sk-admin-dashboard-settings-panel share the prefix and the charset.
 _BARE_TOKEN = re.compile(
     r"(?<![A-Za-z0-9_-])(?:"
-    r"sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}"  # OpenAI project, service account and admin keys
+    r"sk-(?:proj|svcacct|admin|None)-(?=[a-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{40,}"  # OpenAI prefixed keys
     r"|sk-ant-[a-z]{3,5}\d{2}-[A-Za-z0-9_-]{20,}"  # Anthropic keys
     r"|sk-[A-Za-z0-9]{20,}[A-Za-z0-9_-]*"  # OpenAI legacy keys
     r"|gh[pousr]_[A-Za-z0-9]{30,}"  # GitHub tokens
     r"|github_pat_[A-Za-z0-9_]{40,}"  # GitHub fine-grained tokens
-    r"|(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9])"  # AWS access key IDs
+    # AWS access key IDs. An accepted trade-off: a rare all-caps constant of
+    # exactly 20 letters and digits that starts with AKIA or ASIA matches too.
+    r"|(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9])"
     r"|xox[abeprs]-(?=[A-Za-z0-9-]*\d)[A-Za-z0-9-]{10,}"  # Slack tokens
+    r"|xapp-\d-[A-Za-z0-9-]{20,}"  # Slack app-level tokens
     r")"
 )
 
