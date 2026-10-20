@@ -435,3 +435,21 @@ def test_nightly_service_is_unchanged_by_the_audit():
     service = (ROOT / "systemd" / "dream.service").read_text(encoding="utf-8")
     assert "dream audit" not in service
     assert "%h/.local/bin/dream consolidate" in service
+
+
+def test_status_reports_the_weekly_audit_apart_from_nightly_consolidation(tmp_path, capsys):
+    db_path = tmp_path / "dream.db"
+    conn = dream.open_db(db_path)
+    conn.executemany(
+        "INSERT INTO consolidation_runs(run_id, provider, model, created_at) VALUES (?, 'fake', 'm', ?)",
+        [("nightly-1", "2026-10-18 03:00:00"), ("audit-abc-chunk1", "2026-10-19 12:00:00")],
+    )
+    conn.commit()
+    conn.close()
+
+    config = load_config(tmp_path / "missing.toml", overrides={
+        "storage": {"db_path": str(db_path), "memory_root": str(tmp_path / "memory")}})
+    dream.cmd_status(argparse.Namespace(db=db_path, config=config, usage=False))
+    out = capsys.readouterr().out
+    assert "Last consolidate:   2026-10-18 03:00:00" in out
+    assert "Last audit:         2026-10-19 12:00:00" in out

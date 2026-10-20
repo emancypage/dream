@@ -1291,8 +1291,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     accepted = scalar("SELECT COUNT(*) FROM suggestions WHERE status='accepted'")
     print(f"Suggestions pending: {pending}")
     print(f"Suggestions accepted:{accepted}")
-    last = conn.execute("SELECT MAX(created_at) FROM consolidation_runs").fetchone()
+    last = conn.execute("SELECT MAX(created_at) FROM consolidation_runs WHERE run_id NOT LIKE 'audit-%'").fetchone()
     print(f"Last consolidate:   {last[0] if last and last[0] else 'never'}")
+    audit = conn.execute("SELECT MAX(created_at) FROM consolidation_runs WHERE run_id LIKE 'audit-%'").fetchone()
+    if audit and audit[0]:
+        print(f"Last audit:         {audit[0]}")
     distill_route = args.config.stage("distill")
     consolidate_route = args.config.stage("consolidate")
     print(f"Distill route:      {distill_route['provider']} / {distill_route.get('model') or '(provider default)'}")
