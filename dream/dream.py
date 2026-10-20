@@ -1582,7 +1582,6 @@ def cmd_context(args: argparse.Namespace) -> int:
         # Building the embedder contacts nothing; an unusable one means lexical recall.
         embedder, embedder_problem = configured_embedder(args.config)
         if embedder_problem:
-            from recall_context import with_adapters
             settings = with_adapters(settings, embedder=False)
         result = run_context(conn, query, settings, explain=explain, embedder=embedder, allow_cache_writes=False,
                              memory_root=args.config.memory_root,

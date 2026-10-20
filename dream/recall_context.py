@@ -348,11 +348,7 @@ def recall_for_agent(conn, settings, *, query_text, cwd, memory_root, constituti
     if isinstance(limit, bool) or not isinstance(limit, int):
         raise ValueError("limit must be an integer")
     limit = max(1, min(AGENT_QUERY_MAX_LIMIT, limit))
-    if not settings.enabled:
-        raise RecallUnavailable("recall disabled")
-    missing = missing_recall_tables(conn)
-    if missing:
-        raise RecallUnavailable("recall tables missing: " + ", ".join(missing))
+    _agent_store_ready(conn, settings)
     allow_raw = settings.allow_raw_transcript_prompt and "raw_transcript" in allowed
     query = RecallQuery(query_text, None, AGENT_QUERY_EVENT, str(cwd) if cwd else None, (project,) if project else (),
                         int(budget_codepoints), frozenset(), allow_raw)
