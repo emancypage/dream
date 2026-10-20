@@ -137,6 +137,30 @@ def _occurrences(text: str, needle: str) -> int:
     return count
 
 
+_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+
+
+def _lf(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _lf_offsets(text: str) -> tuple[str, list[int]]:
+    """``text`` with CRLF and lone CR read as LF, and each character's raw offset (plus the end)."""
+    chars: list[str] = []
+    offsets: list[int] = []
+    index = 0
+    while index < len(text):
+        offsets.append(index)
+        if text[index] == "\r":
+            chars.append("\n")
+            index += 2 if text.startswith("\r\n", index) else 1
+        else:
+            chars.append(text[index])
+            index += 1
+    offsets.append(len(text))
+    return "".join(chars), offsets
+
+
 def patch_text(text: str, find: str, replace: str, *, allow_empty: bool = False) -> str:
     """Return text with the single NFC-normalized occurrence of find replaced.
 
@@ -144,19 +168,40 @@ def patch_text(text: str, find: str, replace: str, *, allow_empty: bool = False)
     NFC so that matching never rewrites bytes outside the replaced span; zero or
     several matches are ambiguous and never applied as a best guess. A patch
     may not empty a file: that would bypass the `remove` grace period.
+
+    Models see memory files with CRLF and lone CR read as LF, so in a file
+    that has them the match is found on that view and mapped back to its raw
+    span. Only that span is rewritten, and the replacement takes the line
+    ending of the span (else the file's first one). Callers may pass raw or
+    newline-translated text: both find the same match. LF-only text is
+    matched and patched exactly as before.
     """
     if not find:
         raise PatchError("patch find text is empty")
     if unicodedata.normalize("NFC", text) != text:
         raise PatchError("target file is not NFC-normalized")
     needle = unicodedata.normalize("NFC", find)
-    count = _occurrences(text, needle)
+    replacement = unicodedata.normalize("NFC", replace)
+    if "\r" in text:
+        shown, offsets = _lf_offsets(text)
+        needle = _lf(needle)
+    else:
+        shown, offsets = text, None
+    count = _occurrences(shown, needle)
     if count != 1:
         raise PatchError(f"find text matches {count} places")
     if not replace and not allow_empty:
         raise PatchError("empty replacement without a stated deletion in the rationale")
-    patched = text.replace(needle, unicodedata.normalize("NFC", replace), 1)
-    if not _without_frontmatter(patched).strip():
+    if offsets is None:
+        patched = text.replace(needle, replacement, 1)
+        check = patched
+    else:
+        start = shown.find(needle)
+        raw_start, raw_end = offsets[start], offsets[start + len(needle)]
+        ending = _LINE_BREAK.search(text[raw_start:raw_end]) or _LINE_BREAK.search(text)
+        patched = text[:raw_start] + _lf(replacement).replace("\n", ending.group(0)) + text[raw_end:]
+        check = _lf(patched)
+    if not _without_frontmatter(check).strip():
         raise PatchEmptiesFile("patch would empty the file; propose remove")
     return patched
 
@@ -338,9 +383,6 @@ INDEX_FILE = "MEMORY.md"
 _QUERY_FIELDS = ("preferences", "projects", "decisions", "user_facts")
 # build_safe_fts_match reads only the first 32 terms of a query.
 _FTS_QUERY_TERMS = 32
-# Bounds the rank_lexical calls one subset selection makes; slug matching still
-# reads every finding.
-MAX_SUBSET_QUERIES = 8
 _INDEX_LINK = re.compile(r"\]\(([^)]+\.md)\)")
 _FRONTMATTER_NAME = re.compile(r"^name:\s*['\"]?([^'\"\n]+?)['\"]?\s*$", re.MULTILINE)
 
@@ -363,37 +405,65 @@ def _batch_findings(batch: list[tuple[str, str, dict, str]], fields=None) -> lis
     return findings
 
 
+def _term_spans(finding: str) -> list[str]:
+    """The finding itself, or consecutive whitespace-separated spans of it with at most 32 terms each.
+
+    Spans keep the original words, so paths and other structured terms survive.
+    """
+    if len(query_terms(finding)) <= _FTS_QUERY_TERMS:
+        return [finding]
+    spans: list[str] = []
+    current: list[str] = []
+    terms: set[str] = set()
+    for word in finding.split():
+        word_terms = set(query_terms(word))
+        if current and len(terms | word_terms) > _FTS_QUERY_TERMS:
+            spans.append(" ".join(current))
+            current, terms = [], set()
+        current.append(word)
+        terms |= word_terms
+    if current:
+        spans.append(" ".join(current))
+    return spans
+
+
 def _query_groups(findings: list[str]) -> list[str]:
-    """Pack whole findings into query texts that rank_lexical reads completely.
+    """Pack findings into query texts that rank_lexical reads completely.
 
     One query joining every finding would be cut to its first 32 terms, so the
-    subset would reflect only the first finding or two of a batch.
+    subset would reflect only the first finding or two of a batch. A finding
+    with more terms than one query reads is split into spans first. Every
+    finding of the batch lands in some group, and every group is ranked,
+    because consolidation consumes the whole batch.
     """
     groups: list[str] = []
     current: list[str] = []
     terms: set[str] = set()
-    for finding in findings:
-        finding_terms = set(query_terms(finding))
-        if not finding_terms:
+    for piece in (span for finding in findings for span in _term_spans(finding)):
+        piece_terms = set(query_terms(piece))
+        if not piece_terms:
             continue
-        if current and len(terms | finding_terms) > _FTS_QUERY_TERMS:
+        if current and len(terms | piece_terms) > _FTS_QUERY_TERMS:
             groups.append(" ".join(current))
             current, terms = [], set()
-        current.append(finding)
-        terms |= finding_terms
+        current.append(piece)
+        terms |= piece_terms
     if current:
         groups.append(" ".join(current))
     return groups
 
 
-def _dense_for_subset(conn: sqlite3.Connection, query_text: str, embedder, *, limit: int = 200):
+def _dense_for_subset(conn: sqlite3.Connection, query_text: str, embedder, eligible: set[str], *, limit: int = 200):
     """Return the dense candidate list for one subset query, or None.
 
     The dense list (approved memory under the embedder's current fingerprint)
     is passed to rank_lexical when an embedder is configured. Without one (the
     packaged default), or on any embedder or vector-store failure, subset
     selection stays lexical. Subset selection has no score threshold, so it
-    needs no calibration row.
+    needs no calibration row. Only documents of the ``eligible`` topic files
+    (never MEMORY.md, which is always shown) take places under ``limit``, so
+    vectors of files deleted or excluded since the last index sync cannot
+    crowd out an eligible match.
     """
     if embedder is None:
         return None
@@ -404,7 +474,14 @@ def _dense_for_subset(conn: sqlite3.Connection, query_text: str, embedder, *, li
         if not has_vectors(conn, fingerprint, ("approved_memory",)):
             return []  # nothing embedded yet: no request to the server
         vector = embed_query(embedder, embedding_text(query_text))
-        return dense_candidates(conn, vector, fingerprint, ("approved_memory",), limit=limit)
+        topics = eligible - {INDEX_FILE}
+
+        def current_topics(ids):
+            marks = ",".join("?" for _ in ids)
+            rows = conn.execute(f"SELECT id, source_path FROM recall_documents WHERE id IN ({marks})", list(ids))
+            return {document_id for document_id, source_path in rows if source_path in topics}
+
+        return dense_candidates(conn, vector, fingerprint, ("approved_memory",), limit=limit, eligible=current_topics)
     except Exception as exc:
         print(f"subset selection: dense candidates unavailable ({type(exc).__name__}); ranking lexically",
               file=sys.stderr)
@@ -423,7 +500,7 @@ def _ranked_memory_files(conn, groups: list[str], eligible: set[str], limit: int
         query = RecallQuery(text, None, "consolidate-subset", None, (), 0, frozenset(), False)
         # Only the files closest in meaning count as dense evidence, so a long
         # tail of weak matches cannot crowd out lexical ones.
-        dense = _dense_for_subset(conn, text, embedder, limit=2 * limit)
+        dense = _dense_for_subset(conn, text, embedder, eligible, limit=2 * limit)
         if dense is None:
             # Off, or failed: one failure is reported once, not once per group.
             embedder = None
@@ -474,10 +551,6 @@ def select_memory_subset(
     by_name = {entry.path.name: entry for entry in files}
     selected: list[str] = [INDEX_FILE] if INDEX_FILE in by_name else []
     groups = _query_groups(_batch_findings(batch, _QUERY_FIELDS))
-    if len(groups) > MAX_SUBSET_QUERIES:
-        print(f"subset selection: ranking by the first {MAX_SUBSET_QUERIES} of {len(groups)} finding groups",
-              file=sys.stderr)
-        groups = groups[:MAX_SUBSET_QUERIES]
     if groups:
         try:
             selected += _ranked_memory_files(conn, groups, set(by_name), settings.subset_files, embedder)

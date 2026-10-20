@@ -140,6 +140,43 @@ def test_states_deletion(rationale, expected):
     assert states_deletion(rationale) is expected
 
 
+
+# CRLF files: models see them with LF line endings, the writer gets the raw bytes.
+CRLF_BODY = BODY.replace("\n", "\r\n")
+SHOWN_FIND = "the build host.\nRollbacks need"
+SHOWN_REPLACE = "the release runner.\nRollbacks require"
+
+
+def test_patch_text_maps_a_match_in_the_lf_view_back_to_the_raw_crlf_span():
+    patched = patch_text(CRLF_BODY, SHOWN_FIND, SHOWN_REPLACE)
+    assert patched == CRLF_BODY.replace("the build host.\r\nRollbacks need", "the release runner.\r\nRollbacks require")
+    # Raw and newline-translated text find the same match, so the preview and the writer agree.
+    assert patch_text(BODY, SHOWN_FIND, SHOWN_REPLACE) == patched.replace("\r\n", "\n")
+    with pytest.raises(PatchError, match="matches 2 places"):
+        patch_text(CRLF_BODY, "the", "x")
+
+
+def test_patch_text_on_a_crlf_file_still_refuses_to_empty_it():
+    with pytest.raises(PatchError, match="empty the file"):
+        patch_text("---\r\nname: x\r\n---\r\n\r\nOnly line.\r\n", "Only line.", "", allow_empty=True)
+
+
+def test_apply_patch_keeps_crlf_line_endings_and_every_byte_outside_the_span(tmp_path):
+    target = tmp_path / "deploy.md"
+    target.write_bytes(CRLF_BODY.encode("utf-8"))
+    apply_patch(target, SHOWN_FIND, SHOWN_REPLACE, expected_sha=_sha(target))
+    assert target.read_bytes() == CRLF_BODY.replace(
+        "the build host.\r\nRollbacks need", "the release runner.\r\nRollbacks require").encode("utf-8")
+
+
+def test_accept_applies_a_multiline_patch_to_an_unchanged_crlf_file(tmp_path):
+    root, db_path, config = _fixture(tmp_path, find=SHOWN_FIND, body=SHOWN_REPLACE, content=CRLF_BODY)
+    assert _suggestions(root, db_path, config, "accept", id=1) == 0
+    assert _row(db_path)[0] == "accepted"
+    assert (root / "deploy.md").read_bytes() == CRLF_BODY.replace(
+        "the build host.\r\nRollbacks need", "the release runner.\r\nRollbacks require").encode("utf-8")
+
+
 # ------------------------------------------------------------ review paths
 
 

@@ -241,14 +241,35 @@ def test_select_memory_subset_requires_the_constitution_path(tmp_path):
         C.select_memory_subset(conn, root, [], ConsolidateSettings(mode="subset"))
 
 
-def test_subset_query_groups_are_capped(tmp_path, monkeypatch):
+def test_every_subset_query_group_is_ranked(tmp_path, monkeypatch):
     root, conn = _store(tmp_path)
     calls = []
     real = C.rank_lexical
     monkeypatch.setattr(C, "rank_lexical", lambda conn, query, **kw: calls.append(query) or real(conn, query))
     findings = [" ".join(f"term{i}x{j}" for j in range(30)) for i in range(20)]
     _select(conn, root, _batch(*findings), ConsolidateSettings(mode="subset", subset_files=3))
-    assert len(calls) == C.MAX_SUBSET_QUERIES == 8
+    # Two 30-term findings never share a 32-term query, so each finding is its own group.
+    assert len(calls) == 20
+
+
+def test_a_finding_after_the_eighth_query_group_still_ranks_its_file(tmp_path):
+    root, conn = _store(tmp_path)
+    filler = [" ".join(f"noise{i}x{j}" for j in range(30)) for i in range(8)]
+    batch = _batch(*filler, "The kw57 migration finished.")
+    assert len(C._query_groups(C._batch_findings(batch, C._QUERY_FIELDS))) == 9
+    selected = _select(conn, root, batch, ConsolidateSettings(mode="subset", subset_files=3))
+    assert _topic_name(57) in _names(selected)
+
+
+def test_a_finding_longer_than_one_query_ranks_its_later_terms(tmp_path):
+    from recall_query import query_terms
+    root, conn = _store(tmp_path)
+    finding = " ".join(f"noise{j}" for j in range(40)) + " then the kw44 rollout"
+    groups = C._query_groups([finding])
+    assert len(groups) == 2 and all(len(query_terms(group)) <= 32 for group in groups)
+    assert " ".join(groups).split() == finding.split()
+    selected = _select(conn, root, _batch(finding), ConsolidateSettings(mode="subset", subset_files=3))
+    assert _topic_name(44) in _names(selected)
 
 
 def test_subset_always_contains_memory_md_first(tmp_path):
@@ -356,7 +377,7 @@ def test_stale_index_entries_for_deleted_or_excluded_files_are_skipped(tmp_path)
 
 def test_dense_hook_is_off_without_an_embedder_and_fails_open(tmp_path):
     root, conn = _store(tmp_path)
-    assert C._dense_for_subset(conn, "kw03", None) is None
+    assert C._dense_for_subset(conn, "kw03", None, {_topic_name(3)}) is None
 
     class BrokenEmbedder:
         fingerprint = "broken"
@@ -366,7 +387,7 @@ def test_dense_hook_is_off_without_an_embedder_and_fails_open(tmp_path):
             raise RuntimeError("server down")
 
     # Nothing is embedded under "broken": no request, and ranking stays lexical.
-    assert not C._dense_for_subset(conn, "kw03", BrokenEmbedder())
+    assert not C._dense_for_subset(conn, "kw03", BrokenEmbedder(), {_topic_name(3)})
     selected = _select(
         conn, root, _batch("kw03 moved"), ConsolidateSettings(mode="subset", subset_files=2), embedder=BrokenEmbedder()
     )
@@ -430,6 +451,40 @@ def test_failing_embedder_keeps_the_lexical_subset_and_is_tried_once(tmp_path, c
     assert len(down.calls) == 1
     err = [line for line in capsys.readouterr().err.splitlines() if line]
     assert len(err) == 1 and "dense candidates unavailable" in err[0]
+
+
+class _StaleIndexEmbedder(_MeaningEmbedder):
+    """The query, the stale files and MEMORY.md share one axis; the eligible file is close to it."""
+
+    def embed(self, texts):
+        self.calls.append(list(texts))
+        vectors = []
+        for text in texts:
+            folded = text.casefold()
+            if "baza" in folded or "danych" in folded:
+                vectors.append([1.0, 0.0, 0.0])
+            elif "postgresql" in folded:
+                vectors.append([0.8, 0.6, 0.0])
+            else:
+                vectors.append([0.0, 0.0, 1.0])
+        return vectors
+
+
+def test_stale_and_index_vectors_never_take_the_dense_places_of_an_eligible_file(tmp_path):
+    from recall_documents import embed_recall_documents
+    stale = {f"project_database_old{i}.md": f"Archive {i}: PostgreSQL baza danych notes.\n" for i in (1, 2)}
+    root, conn = _store(tmp_path, sync=False, extra={_DATABASE_FILE: _DATABASE_BODY, **stale})
+    with (root / "MEMORY.md").open("a", encoding="utf-8") as index:
+        index.write("- [Database](project_database.md) — baza danych\n")
+    synchronize_recall_documents(conn, root, include_raw_transcripts=False, constitution_path=None)
+    embedder = _StaleIndexEmbedder()
+    assert embed_recall_documents(conn, embedder, include_raw_transcripts=False).error is None
+    for name in stale:
+        (root / name).unlink()  # deleted after the last index sync, so their vectors remain
+    # subset_files = 1 gives two dense places; the stale files and MEMORY.md are closer than the eligible file.
+    settings = ConsolidateSettings(mode="subset", subset_files=1)
+    selected = _names(_select(conn, root, _batch("baza danych przeniesiona na nowy serwer"), settings, embedder=embedder))
+    assert selected == ["MEMORY.md", _DATABASE_FILE]
 
 
 def _subset_cli(tmp_path, monkeypatch, config_lines):
@@ -966,3 +1021,29 @@ def test_matching_summaries_cannot_crowd_memory_files_out_of_subset_ranking(tmp_
     selected = _names(_select(conn, root, _batch("Checked the kubernetes rollout again"),
                               ConsolidateSettings(mode="subset", subset_files=3)))
     assert selected[:2] == ["MEMORY.md", "deploy.md"]
+
+
+def test_a_crlf_file_patched_with_text_copied_from_the_prompt_previews_and_applies(tmp_path, monkeypatch):
+    _fixed_clock(monkeypatch)
+    crlf = ("---\r\nname: runbook\r\n---\r\n\r\nDeploys run from the build host.\r\n"
+            "Rollbacks need the on-call lead.\r\nKeep the checklist.\r\n")
+    root, conn = _store(tmp_path, extra={"runbook.md": crlf})
+    _distill(conn, "s-1", {"projects": ["runbook.md: deploys moved to the release runner"]})
+    shown = "Deploys run from the build host.\nRollbacks need the on-call lead."
+    output = {"suggestions": [_suggestion(
+        "patch", "runbook.md", "Deploys run from the release runner.\nRollbacks need the release manager.",
+        "runner renamed", find=shown)]}
+    prompts = []
+    monkeypatch.setattr(C, "generate", lambda stage, prompt, schema, **kw: prompts.append(prompt) or SimpleNamespace(
+        output=output, provider="fake", model="fake"))
+    [s] = C.consolidate(conn, root, config=_config(tmp_path, root, mode="subset"))
+    assert shown in prompts[0] and "\r" not in prompts[0]
+    sug_id, kind, target, body, sug_file = conn.execute(
+        "SELECT id, kind, target_path, body, sug_file FROM suggestions").fetchone()
+    preview = (root / ".suggestions" / sug_file).read_text(encoding="utf-8")
+    assert "cannot apply" not in preview and "+Rollbacks need the release manager." in preview
+    assert dream._apply_suggestion(conn, root, root / ".suggestions", sug_id, kind, target, body, sug_file,
+                                   sync_recall=False, constitution_path=None)
+    assert (root / "runbook.md").read_bytes() == crlf.replace(
+        "Deploys run from the build host.\r\nRollbacks need the on-call lead.",
+        "Deploys run from the release runner.\r\nRollbacks need the release manager.").encode("utf-8")
