@@ -1310,3 +1310,30 @@ def test_nightly_curation_with_the_embedder_off_contacts_nothing(tmp_path, embed
     _distilled_store(tmp_path)
     rc, captured = _curate(tmp_path, load_config(tmp_path / "missing.toml"), monkeypatch, capsys)
     assert rc == 0 and embedding_server.requests == [] and "recall embed" not in captured.err
+
+
+def test_standalone_curation_applies_the_current_retention_policy_before_embedding(
+        tmp_path, embedding_server, monkeypatch, capsys):
+    # Indexed while the embedder was off, excluded afterwards, curated before the next ingest.
+    from dream import open_db
+    from retention_policy import POLICY_FILE
+    memory = _distilled_store(tmp_path)
+    (memory / POLICY_FILE).write_text(json.dumps({"memory_paths": ["hobby.md"], "text_markers": ["deployment checklist"]}),
+                                      encoding="utf-8")
+    rc, captured = _curate(tmp_path, _cli_config(tmp_path, embedding_server.url), monkeypatch, capsys)
+    assert rc == 0 and "suggest-only" in captured.out
+    assert embedding_server.posted_inputs() == [_ENGLISH["api.md"]]
+    conn = open_db(tmp_path / "dream.db")
+    try:
+        assert {row[0] for row in conn.execute("SELECT source_path FROM recall_documents")} == {"api.md"}
+    finally:
+        conn.close()
+
+
+def test_standalone_curation_skips_embedding_when_the_sync_fails(tmp_path, embedding_server, monkeypatch, capsys):
+    from retention_policy import POLICY_FILE
+    memory = _distilled_store(tmp_path)
+    (memory / POLICY_FILE).write_text("{not json", encoding="utf-8")
+    rc, captured = _curate(tmp_path, _cli_config(tmp_path, embedding_server.url), monkeypatch, capsys)
+    assert rc == 0 and embedding_server.requests == []
+    assert [line for line in captured.err.splitlines() if line][0].startswith("recall sync skipped:")

@@ -1052,13 +1052,16 @@ def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, ro
         write_conn.close()
 
 
-def _embed_after_curation(args: argparse.Namespace) -> None:
+def _embed_after_curation(args: argparse.Namespace, memory_root: Path) -> None:
     """The nightly embed step after curation, the last stage that changes recall documents.
 
     Distillation and accepted suggestions synchronize the recall index without
     embedding, and synchronization drops the vectors of changed documents, so
-    this embeds what changed since ingest. Nothing is opened when the embedder
-    is off; any failure prints one line and leaves curation's result alone.
+    this embeds what changed since ingest. It synchronizes first, as ingest
+    and ``dream embed`` do, so a retention exclusion added since the last sync
+    removes its documents before any text leaves the process; a failed sync
+    embeds nothing. Nothing is opened when the embedder is off; any failure
+    prints one line and leaves curation's result alone.
     """
     if getattr(args, "dry_run", False) or not Path(args.db).exists():
         return
@@ -1071,7 +1074,9 @@ def _embed_after_curation(args: argparse.Namespace) -> None:
         print(f"recall embed skipped: {type(e).__name__}: {e}", file=sys.stderr)
         return
     try:
-        _embed_recall_documents(conn, args.config)
+        if _sync_recall_documents(conn, memory_root,
+                                  constitution_path=args.config.data["character"]["constitution_path"]):
+            _embed_recall_documents(conn, args.config)
     finally:
         conn.close()
 
@@ -1094,7 +1099,7 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
             print(f"curation error: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
         result = _cmd_curate_configured(args, conn, memory_root, rows)
-        _embed_after_curation(args)
+        _embed_after_curation(args, memory_root)
         return result
 
     conn = open_db_readonly(args.db) if args.suggestions_cmd == "list" else open_db(args.db)
