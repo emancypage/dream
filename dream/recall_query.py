@@ -165,31 +165,50 @@ def _kinds_clause(kinds, column: str) -> tuple[str, tuple[str, ...]]:
     return f" AND {column} IN ({','.join('?' for _ in names)})", names
 
 
-def _recent_ids(conn, query: RecallQuery, excluded: set[str], limit: int, kinds=None) -> list[str]:
+def _recent_ids(conn, query: RecallQuery, excluded: set[str], limit: int, kinds=None,
+                document_filter=None) -> list[str]:
     """The ``limit`` most recent eligible document IDs by stored ``source_updated_at``.
 
     Writers store UTC ISO-8601 timestamps, whose text order is chronological
     to the second, so SQLite picks them without parsing every row. This only
     chooses the session-start pool; the recency list orders by parsed time.
+    ``document_filter`` (the live retention policy and constitution guard) is
+    applied in chunks of the newest rows until ``limit`` pass, so documents
+    excluded since the last sync never take an eligible document's place.
     """
     allowed = "" if query.allow_raw_transcript else " WHERE source_kind != 'raw_transcript'"
     kind_clause, kind_params = _kinds_clause(kinds, "source_kind")
     if kind_clause and not allowed:
         allowed, kind_clause = " WHERE " + kind_clause[len(" AND "):], ""
-    rows = conn.execute(
-        f"SELECT id FROM recall_documents{allowed}{kind_clause} ORDER BY source_updated_at DESC, id LIMIT ?",
-        (*kind_params, limit + len(excluded)),
-    )
-    return [doc_id for (doc_id,) in rows if doc_id not in excluded][:limit]
+    sql = f"SELECT id FROM recall_documents{allowed}{kind_clause} ORDER BY source_updated_at DESC, id"
+    if document_filter is None:
+        rows = conn.execute(sql + " LIMIT ?", (*kind_params, limit + len(excluded)))
+        return [doc_id for (doc_id,) in rows if doc_id not in excluded][:limit]
+    cursor = conn.execute(sql, kind_params)
+    recent: list[str] = []
+    try:
+        while len(recent) < limit:
+            rows = cursor.fetchmany(limit)
+            if not rows:
+                break
+            chunk = [doc_id for (doc_id,) in rows if doc_id not in excluded]
+            passed = {doc.id for doc in _load_documents(conn, chunk) if document_filter(doc)}
+            recent.extend(doc_id for doc_id in chunk if doc_id in passed)
+    finally:
+        cursor.close()
+    return recent[:limit]
 
 
 def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | None = None,
-                 usage=None, kinds=None) -> list[RecallCandidate]:
+                 usage=None, kinds=None, document_filter=None) -> list[RecallCandidate]:
     """Rank prompt topics by FTS; use fused project signals for session starts.
 
     ``kinds`` (None: every kind) is a hard source-kind filter bound into the
     full-text query and the recent pool, so documents of other kinds never
     take a place under their limits. Without it the queries are unchanged.
+    ``document_filter`` (None: no check) is the live eligibility test the
+    session-start recent pool applies before its limit; callers still filter
+    the ranked candidates themselves.
 
     ``dense`` is an optional pre-computed ``[(document_id, cosine)]`` list in
     rank order. Its eligible IDs (the same exclusions and raw-transcript rule)
@@ -238,7 +257,7 @@ def rank_lexical(conn, query: RecallQuery, *, dense: list[tuple[str, float]] | N
     pool = dict.fromkeys(lists.get("fts", ()))
     pool.update(dict.fromkeys(dense_ids))
     if not is_prompt:
-        pool.update(dict.fromkeys(_recent_ids(conn, query, excluded, RECENT_POOL_SIZE, kinds)))
+        pool.update(dict.fromkeys(_recent_ids(conn, query, excluded, RECENT_POOL_SIZE, kinds, document_filter)))
     all_docs, path_texts = _load_pool(conn, pool, stored=stored_path_text)
     by_id = {doc.id: doc for doc in all_docs}
     # On a connection that is not immutable a writer can delete a row between

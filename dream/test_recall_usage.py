@@ -764,7 +764,7 @@ def test_retrieve_keeps_the_usage_tie_break_through_the_embedder_rescore(tmp_pat
     conn.commit()
     seen = {}
 
-    def tied_ranking(conn, query, *, dense=None, usage=None, kinds=None):
+    def tied_ranking(conn, query, *, dense=None, usage=None, kinds=None, document_filter=None):
         seen["rank"], seen["dense"] = usage, dense
         return _tied_candidates()
 

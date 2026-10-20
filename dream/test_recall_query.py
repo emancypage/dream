@@ -643,6 +643,36 @@ def test_session_start_pool_is_bounded_on_a_large_store(large_store, monkeypatch
     assert not ({row["id"] for row in billing} - fts_ids - recent_ids) & ids
 
 
+def test_retention_excluded_rows_never_fill_the_session_start_pool(tmp_path):
+    """A stale index (policy changed, no sync yet) still gives eligible documents the recent pool's places."""
+    from config import load_config
+    from recall_context import run_context
+    from retention_policy import POLICY_FILE
+    from dream import open_db
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    conn = open_db(tmp_path / "dream.db")
+    rows = [(f"excluded-{n:04d}", "-work-secretproj", f"2026-10-19T{n // 60 % 24:02d}:{n % 60:02d}:00Z",
+             f"Secret project note {n}.") for n in range(RECENT_POOL_SIZE)]
+    # Older, and tied to the session only by its project slug, which full-text search does not index.
+    rows.append(("allowed", "-srv-zeta", "2026-01-01T00:00:00Z", "Prefers short release notes."))
+    for doc_id, project, updated, text in rows:
+        conn.execute(
+            "INSERT INTO recall_documents(id, content_sha256, source_kind, trust_level, project_slug, source_path, "
+            "source_updated_at, indexed_at, source_version, text) VALUES (?, ?, 'distilled_summary', "
+            "'model_distilled', ?, ?, ?, ?, 'v1', ?)",
+            (doc_id, doc_id, project, f"distilled:{doc_id}", updated, updated, text),
+        )
+    conn.commit()
+    (memory / POLICY_FILE).write_text(json.dumps({"project_slugs": ["-work-secretproj"]}), encoding="utf-8")
+    query = RecallQuery("/srv/zeta", "s1", "session-start:startup", "/srv/zeta", ("/srv/zeta",), 6000,
+                        frozenset(), False)
+    result = run_context(conn, query, load_config(tmp_path / "missing.toml").recall_settings(),
+                         memory_root=memory, constitution_path=None)
+    assert [candidate.document.id for candidate in result.selected] == ["allowed"]
+    conn.close()
+
+
 def _second_worst_ms(run, runs: int) -> float:
     """The p95 of ``runs`` timed calls after a warm-up: the second-worst of 20."""
     run()

@@ -19,7 +19,7 @@ from recall_render import _render_blocks
 from recall_query import _load_documents, rank_lexical
 from recall_scrub import scrub_text
 from recall_select import calibration_for, embedder_calibration_version, select_recall_candidates
-from recall_types import RecallCandidate, RecallDiagnostics, RecallQuery, RecallResult
+from recall_types import RecallCandidate, RecallDiagnostics, RecallDocument, RecallQuery, RecallResult
 from recall_usage import usage_map
 from storage import open_db_readonly
 from retention_policy import load_retention_policy
@@ -157,11 +157,12 @@ def retrieve(conn, query: RecallQuery, settings, calibrations, *, embedder=None,
 
     ``keep`` filters ranked candidates (retention policy, constitution) before
     adapters and selection. ``kinds`` and ``document_filter`` apply the same
-    eligibility to the dense scan before its limit, so excluded documents
-    never take an eligible one's place. The recall hooks and the evaluator
-    share this pipeline, so a fixture measures exactly what a session
-    receives. Only the evaluator and calibration, which compute the embedder
-    mode's threshold, pass ``require_calibration=False``.
+    eligibility to the dense scan and the session-start recent pool before
+    their limits, so excluded documents never take an eligible one's place.
+    The recall hooks and the evaluator share this pipeline, so a fixture
+    measures exactly what a session receives. Only the evaluator and
+    calibration, which compute the embedder mode's threshold, pass
+    ``require_calibration=False``.
     """
     dense = query_vector = fallback = None
     adapter_settings = settings
@@ -175,7 +176,7 @@ def retrieve(conn, query: RecallQuery, settings, calibrations, *, embedder=None,
     # Usage only reorders exact ties, and only once switched on; an unmigrated
     # or read-only database without recall_usage simply yields no usage.
     usage = usage_map(conn) if getattr(settings, "usage_tie_break", False) else None
-    candidates = rank_lexical(conn, query, dense=dense, usage=usage, kinds=kinds)
+    candidates = rank_lexical(conn, query, dense=dense, usage=usage, kinds=kinds, document_filter=document_filter)
     if keep is not None:
         candidates = [candidate for candidate in candidates if keep(candidate)]
     candidates, mode, adapter_fallback = apply_optional_adapters(
@@ -239,9 +240,10 @@ def document_allowed(document, *, policy, memory_root, constitution_path, is_con
 
         def is_constitution(source_path) -> bool:
             return is_constitution_source(source_path, memory_root=memory_root, constitution_path=constitution_path)
+    # The policy test is the cheap one; the guard and the memory-path test resolve paths.
     return not (
-        is_constitution(document.source_path)
-        or policy.excludes(source_path=document.source_path, project_slug=document.project_slug, text=document.text)
+        policy.excludes(source_path=document.source_path, project_slug=document.project_slug, text=document.text)
+        or is_constitution(document.source_path)
         or (document.source_kind == "approved_memory" and memory_root is not None
             and policy.excludes_memory_path(memory_root, document.source_path))
     )
@@ -267,12 +269,17 @@ def _run_context(conn, query: RecallQuery, settings, explain: bool = False, *, e
     started = time.perf_counter()
     policy = load_retention_policy(memory_root)
     is_constitution = constitution_guard(memory_root, constitution_path)
+    # The recent pool and the ranked candidates check many of the same
+    # documents; each identical document is checked (and its path resolved) once.
+    allowed: dict[RecallDocument, bool] = {}
 
     def servable(document) -> bool:
         if kinds is not None and document.source_kind not in kinds:
             return False
-        return document_allowed(document, policy=policy, memory_root=memory_root,
-                                constitution_path=constitution_path, is_constitution=is_constitution)
+        if document not in allowed:
+            allowed[document] = document_allowed(document, policy=policy, memory_root=memory_root,
+                                                 constitution_path=constitution_path, is_constitution=is_constitution)
+        return allowed[document]
 
     def keep(candidate) -> bool:
         return servable(candidate.document)
