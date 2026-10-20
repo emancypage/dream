@@ -230,7 +230,7 @@ CREATE TRIGGER IF NOT EXISTS recall_documents_ad AFTER DELETE ON recall_document
             old.source_updated_at, old.indexed_at, old.source_version);
 END;
 
--- How often automatic recall selected each document, harvested by `dream ingest`
+-- How often automatic recall delivered each document, harvested by `dream ingest`
 -- from the hook lifecycle markers (hooks are read-only and never write here).
 -- Keyed by the stable recall document ID, so usage survives edits to a file.
 -- Evidence only: it breaks exact ranking ties (recall.usage_tie_break), annotates

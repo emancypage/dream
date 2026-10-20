@@ -154,7 +154,7 @@ const STEPS = [
 
  {id:'ingest', short:'Ingest', level:'n1', time:'~04:00', stage:'N1 · light sleep',
   title:'Ingest: replay the day',
-  what:['dream ingest first counts which memories the hooks selected in earlier sessions. Each hook leaves a small marker; markers older than a day become counts in recall_usage and are then deleted.',
+  what:['dream ingest first counts which memories the hooks delivered in earlier sessions. Each hook leaves a small marker; markers older than a day become counts in recall_usage and are then deleted.',
         'Then it reads every enabled source. It keeps only the visible user and assistant turns. Tool calls and hidden text are dropped.',
         'The turns go into a local SQLite database with a full-text index (FTS5), and the recall index is brought up to date. This stage makes no model calls.',
         'If one source fails, the others still enter the index. The failed one keeps its old version and is retried next night.'],
@@ -257,7 +257,7 @@ const STEPS = [
   title:'Recall: the day remembers the night',
   what:['When a new session starts, the SessionStart hook adds the trusted character block and a small index of memory.',
         'On your first prompt, the UserPromptSubmit hook searches dream.db. It ranks hits by text match, paths, projects, and recency (reciprocal rank fusion, k = 60). With the embedder on and calibrated, meaning is a fifth list.',
-        'The hook opens the database read-only and has five seconds. If anything fails, it adds nothing and the session goes on. Each hook leaves a marker of the memories it selected; a later ingest counts them as usage.'],
+        'The hook opens the database read-only and has five seconds. If anything fails, it adds nothing and the session goes on. Each hook leaves a marker of the memories it selected and delivered; a later ingest counts the delivered ones as usage.'],
   where:[['dream context session-start','SessionStart hook'],['dream context prompt','UserPromptSubmit hook'],['dream hooks install','writes the hook commands'],['[Dream recall — untrusted reference data]','how recalled text is labelled']],
   sleep:['Cue-dependent memory','A smell or a word can bring back a whole memory, like Proust and his madeleine cake. Your first prompt is the cue. Dream finds what matches it.'],
   scene:{nodes:[['s',80,85,'New session','SessionStart · 5 s','person'],['p',80,220,'First prompt','UserPromptSubmit · 5 s','person'],['r',265,155,'Search dream.db','read-only · RRF','check'],['c',455,70,'Trusted character','constitution + pairs','store'],['u',455,240,'Dream recall','untrusted reference','out'],['g',635,155,'Agent','reads as context','model']],

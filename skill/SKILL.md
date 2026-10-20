@@ -60,7 +60,7 @@ automatic recall unless duplicate injection is intentional.
 - To calibrate, run `dream recall-calibrate --fixtures ~/.config/dream/eval/private.json --mode MODE` as a preview; add `--apply` only when the user asks to store the threshold.
 - When the local embedder is enabled, `dream embed` stores missing vectors and `dream embed --refresh` re-embeds after a model change; recalibrate `--mode lexical_plus_embedder` afterwards.
 - For the weekly staleness audit, run `dream audit`; it skips while `consolidate.mode = "full"`, so pass `--force` only when the user asks. `dream consolidate --mode subset|full` overrides the configured mode for one run.
-- For memories that recall never selects, run `dream status --usage`. It only reads; usage is evidence for review, never a reason to delete on its own.
+- For memories that recall never delivers, run `dream status --usage`. It only reads; usage is evidence for review, never a reason to delete on its own.
 - `dream preflight` also reports whether the embedder is enabled, whether the MCP server entry is in the Codex or OpenCode config (for Claude Code, `claude mcp get dream`) and the consolidation mode.
 
 Return concise stage results. Preserve exact provider, authentication, schema, conflict, and migration errors instead of guessing a remedy.

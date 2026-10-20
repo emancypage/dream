@@ -33,7 +33,7 @@ resolved, dead, or superseded. A single closed fact inside a live file earns a
   you are not shown file timestamps, and age is checked separately, in code, after
   you respond.
 - Each file carries a `last recalled: <date or never>; recalls: <n>` line under its
-  header: how often automatic recall selected it for a session since the observation
+  header: how often automatic recall delivered it to a session since the observation
   start given below. You may cite it next to closure language quoted from the file,
   but it is never a reason on its own to remove or patch anything: rarely recalled
   `feedback`, `user` and `reference` entries are durable by design, and a file can

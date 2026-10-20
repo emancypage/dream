@@ -355,7 +355,7 @@ def _recall_usage_lines(conn: sqlite3.Connection) -> list[str]:
         return []
     return [
         f"# HELP dream_recall_documents_unused_90d Approved memory documents automatic recall "
-        f"has not selected in the last {UNUSED_DAYS} days; only exported once usage has been "
+        f"has not delivered in the last {UNUSED_DAYS} days; only exported once usage has been "
         f"observed for at least {UNUSED_DAYS} days.",
         "# TYPE dream_recall_documents_unused_90d gauge",
         f"dream_recall_documents_unused_90d {len(report.unused)}",

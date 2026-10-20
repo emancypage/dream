@@ -1,10 +1,12 @@
 """Recall usage harvested from hook markers: evidence that never deletes a memory.
 
-Hooks open the database read-only, so they cannot count what they select.
+Hooks open the database read-only, so they cannot count what they deliver.
 Each successful hook run leaves a lifecycle marker (``recall_hook_state``)
-naming the selected document IDs. ``dream ingest`` harvests the markers that
-are old enough that no live session still relies on them, upserts one
-``recall_usage`` row per selected document, and then deletes exactly the
+naming the selected document IDs and the delivered ones, those whose block
+reached the agent. ``dream ingest`` harvests the markers that are
+old enough that no live session still relies on them, upserts one
+``recall_usage`` row per delivered document (per selected document for a
+marker written before delivered IDs existed), and then deletes exactly the
 markers it counted. Counting is exactly-once: harvests hold an exclusive lock
 on the marker directory, and every counted marker is recorded in the
 ``recall_usage_markers`` ledger in the same transaction as its counts, so a
@@ -96,7 +98,7 @@ class _Marker(NamedTuple):
     name: str
     identity: tuple[int, int, int]  # (st_dev, st_ino, st_mtime_ns) of the file that was counted
     finished_at: str
-    selected_ids: tuple[str, ...]
+    document_ids: tuple[str, ...]  # what the marker counts: delivered blocks, or the selection for old markers
 
 
 def _open_marker_root(marker_root: Path) -> int | None:
@@ -155,8 +157,15 @@ def _candidate_names(dir_fd: int) -> list[str]:
     return sorted(names)
 
 
-def _selected_ids(payload: dict) -> tuple[str, ...] | None:
-    values = payload.get("selected_ids")
+def _counted_ids(payload: dict) -> tuple[str, ...] | None:
+    """The IDs a marker counts: its delivered blocks, or its selection when it predates them.
+
+    Hooks record ``selected_ids`` (the selection, which drives the prompt-path
+    exclusion) and ``delivered_ids`` (the blocks that reached the agent).
+    Usage counts delivered blocks; markers written before ``delivered_ids``
+    existed fall back to the selection.
+    """
+    values = payload["delivered_ids"] if "delivered_ids" in payload else payload.get("selected_ids")
     if not isinstance(values, list) or len(values) > _MAX_SELECTED_IDS:
         return None
     if not all(isinstance(value, str) and 0 < len(value) <= _MAX_ID_LENGTH for value in values):
@@ -203,7 +212,7 @@ def _read_marker(dir_fd: int, name: str, cutoff: dt.datetime) -> _Marker | None:
     finished = _parse(payload.get("finished_at"))
     if finished is None or finished >= cutoff:
         return None
-    ids = _selected_ids(payload)
+    ids = _counted_ids(payload)
     if ids is None:
         return None
     return _Marker(name, (st.st_dev, st.st_ino, st.st_mtime_ns), _stamp(finished), ids)
@@ -237,7 +246,7 @@ def _record(conn: sqlite3.Connection, markers: list[_Marker], now: dt.datetime |
                 )
                 continue
             counted.append(marker)
-            for document_id in marker.selected_ids:
+            for document_id in marker.document_ids:
                 conn.execute(_UPSERT, (document_id, marker.finished_at, marker.finished_at))
         if counted:
             conn.execute(
@@ -271,7 +280,7 @@ def harvest(conn: sqlite3.Connection, marker_root, *, now: dt.datetime | None = 
     """Count old succeeded hook markers into recall_usage; return how many were counted.
 
     Write path only (``dream ingest``). A marker is counted exactly once, once
-    per selected document ID, and deleted only after its counts and its ledger
+    per delivered document ID, and deleted only after its counts and its ledger
     row are committed. Fresh, running, failed, malformed, foreign, symlinked or
     otherwise unexpected entries are skipped and left in place. A missing or
     locked directory counts nothing.
