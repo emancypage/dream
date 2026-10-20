@@ -103,7 +103,7 @@ keeps its own: `claude mcp get dream`) and the consolidation mode.
 | `recall.embedder.model` | `"bge-m3"` | Model name sent to the server; part of the vector fingerprint. A placeholder until the private eval picks a model. |
 | `recall.embedder.dimension` | `1024` | Vector length, 1 to 4096; every response must match it. Part of the fingerprint. |
 | `recall.embedder.timeout_seconds` | `1.5` | Wall-clock bound on one query embedding, at most 3 s (hooks time out after 5 s). |
-| `recall.embedder.dense_candidates` | `200` | Length of the dense list fused with the lexical lists. |
+| `recall.embedder.dense_candidates` | `200` | Length of the dense list fused with the lexical lists (1 to 2,000). |
 | `recall.embedder.api_key_env` | unset | Name of an environment variable holding a bearer token; the value is never stored or logged. |
 | `consolidate.mode` | `"full"` | `"full"` sends the whole store nightly, byte-identical to earlier releases. `"subset"` sends `MEMORY.md` plus related topic files and leaves the staleness audit to the weekly `dream audit`. `dream consolidate --mode` overrides it for one run. |
 | `consolidate.subset_files` | `15` | Topic files sent in subset mode, besides `MEMORY.md` and files whose name a finding mentions. |

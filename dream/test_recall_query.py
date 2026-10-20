@@ -254,14 +254,14 @@ def test_usage_only_reorders_within_exact_ties(tmp_path):
 # ------------------------------------------------------------ golden outputs and latency
 #
 # fixtures/recall/lexical-golden.json was captured from rank_lexical and
-# run_context at a63783f (bdb047d after the history rewrite), before the
+# run_context at bdb047d, before the
 # lexical path was bounded: every query of
 # the public fixture and of a 300-document synthetic store (both below
 # RECENT_POOL_SIZE, where the bound changes nothing), and the prompt-path
 # queries of the 10,000-document store, whose candidate pool the bound leaves
 # as it was. Session starts on the large store match paths over a bounded
 # pool by design (test_session_start_pool_is_bounded_on_a_large_store); their
-# bounded output was captured at 06b1cbe (d33394b) in lexical-golden-bounded.json. The
+# bounded output was captured at d33394b in lexical-golden-bounded.json. The
 # four prompt-excluded embedder records were updated when session exclusions
 # moved before the dense-candidate limit: the excluded documents no longer take
 # dense slots, so one more eligible candidate enters. Set
