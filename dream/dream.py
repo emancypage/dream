@@ -1052,6 +1052,30 @@ def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, ro
         write_conn.close()
 
 
+def _embed_after_curation(args: argparse.Namespace) -> None:
+    """The nightly embed step after curation, the last stage that changes recall documents.
+
+    Distillation and accepted suggestions synchronize the recall index without
+    embedding, and synchronization drops the vectors of changed documents, so
+    this embeds what changed since ingest. Nothing is opened when the embedder
+    is off; any failure prints one line and leaves curation's result alone.
+    """
+    if getattr(args, "dry_run", False) or not Path(args.db).exists():
+        return
+    try:
+        embedder, problem = configured_embedder(args.config)
+        if embedder is None and problem is None:
+            return
+        conn = open_db(args.db)
+    except Exception as e:
+        print(f"recall embed skipped: {type(e).__name__}: {e}", file=sys.stderr)
+        return
+    try:
+        _embed_recall_documents(conn, args.config)
+    finally:
+        conn.close()
+
+
 def cmd_suggestions(args: argparse.Namespace) -> int:
     memory_root = Path(args.memory)
     sug_dir = memory_root / ".suggestions"
@@ -1069,7 +1093,9 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
                 conn.close()
             print(f"curation error: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
-        return _cmd_curate_configured(args, conn, memory_root, rows)
+        result = _cmd_curate_configured(args, conn, memory_root, rows)
+        _embed_after_curation(args)
+        return result
 
     conn = open_db_readonly(args.db) if args.suggestions_cmd == "list" else open_db(args.db)
     rows = _pending_suggestions(conn)

@@ -16,6 +16,7 @@ import json
 import math
 import operator
 import sys
+import time
 from pathlib import Path
 
 from recall_scrub import scrub_text
@@ -135,10 +136,21 @@ def stored_vector(conn, document_id: str, content_sha256: str, fingerprint: str,
 
 
 _ELIGIBILITY_CHUNK = 200
+# Rows scanned between two deadline checks (about 8 ms of dot products at 1,024-d).
+_DEADLINE_STRIDE = 256
+
+
+class DenseScanTimeout(RuntimeError):
+    """The dense scan passed its deadline; the caller drops the whole dense list, never part of it."""
+
+
+def _check_deadline(deadline) -> None:
+    if deadline is not None and time.monotonic() > deadline:
+        raise DenseScanTimeout("dense candidate scan passed its deadline")
 
 
 def dense_candidates(conn, query_vector, fingerprint: str, allowed_kinds, limit: int = 200, *,
-                     exclude_ids=(), eligible=None) -> list[tuple[str, float]]:
+                     exclude_ids=(), eligible=None, deadline: float | None = None) -> list[tuple[str, float]]:
     """Scan current-revision vectors of one fingerprint; return positive ``(document_id, cosine)`` descending.
 
     Only rows whose ``(document_id, content_sha256)`` matches a current
@@ -149,6 +161,9 @@ def dense_candidates(conn, query_vector, fingerprint: str, allowed_kinds, limit:
     ``exclude_ids`` during the scan, and ``eligible`` (a function from a list
     of IDs to the eligible subset, for checks that need the document) over
     the score-ordered list in chunks until ``limit`` eligible IDs are found.
+    ``deadline`` (a ``time.monotonic()`` value; read-only paths pass one)
+    raises ``DenseScanTimeout`` once passed, so a large store cannot stretch
+    a hook; the scan returns all of its result or nothing.
     """
     kinds = tuple(dict.fromkeys(allowed_kinds))
     if limit <= 0 or not kinds or not has_vector_blob(conn):
@@ -162,9 +177,12 @@ def dense_candidates(conn, query_vector, fingerprint: str, allowed_kinds, limit:
         "WHERE e.adapter_fingerprint = ? AND d.source_kind IN (" + ",".join("?" for _ in kinds) + ")",
         (fingerprint, *kinds),
     ).fetchall()
+    _check_deadline(deadline)
     mul = operator.mul
     scored: list[tuple[str, float]] = []
-    for document_id, blob, row_dimension, raw in rows:
+    for position, (document_id, blob, row_dimension, raw) in enumerate(rows):
+        if deadline is not None and position % _DEADLINE_STRIDE == 0:
+            _check_deadline(deadline)
         if document_id in excluded:
             continue
         if blob is not None:
@@ -181,6 +199,7 @@ def dense_candidates(conn, query_vector, fingerprint: str, allowed_kinds, limit:
         if math.isfinite(cosine) and cosine > 0:
             scored.append((document_id, cosine))
     scored.sort(key=lambda item: (-item[1], item[0]))
+    _check_deadline(deadline)
     if eligible is None:
         return scored[:limit]
     kept: list[tuple[str, float]] = []
@@ -189,6 +208,7 @@ def dense_candidates(conn, query_vector, fingerprint: str, allowed_kinds, limit:
     for start in range(0, len(scored), _ELIGIBILITY_CHUNK):
         part = scored[start:start + _ELIGIBILITY_CHUNK]
         allowed = eligible([document_id for document_id, _cosine in part])
+        _check_deadline(deadline)
         kept.extend(item for item in part if item[0] in allowed)
         if len(kept) >= limit:
             break

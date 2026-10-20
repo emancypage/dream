@@ -14,7 +14,7 @@ from pathlib import Path
 
 from recall_events import POLICY_VERSION
 from recall_adapters import AdapterError, EmbedderUnavailable, adapter_fingerprint, apply_optional_adapters, build_embedder, embed_query, embedder_fallback_reason
-from recall_embeddings import dense_candidates, embedding_text, has_vectors
+from recall_embeddings import DenseScanTimeout, dense_candidates, embedding_text, has_vectors
 from recall_render import _render_blocks
 from recall_query import _load_documents, rank_lexical
 from recall_scrub import scrub_text
@@ -61,6 +61,9 @@ def _calibration_is_current(row, fingerprint: str) -> bool:
 
 
 EMBEDDER_MODE = "lexical_plus_embedder"
+# Wall-clock budget of the dense scan on hook and agent paths, after the query
+# embed (at most 3 s): together they stay inside the 5 s hook timeout.
+DENSE_SCAN_DEADLINE_SECONDS = 1.0
 PREFLIGHT_PROBE = "dream preflight probe"
 
 
@@ -134,8 +137,12 @@ def _dense_list(conn, query: RecallQuery, settings, embedder, calibrations, *, r
             return None, None, "embedder-no-vectors"
         # Scrubbed like the stored documents: not even a loopback server sees a credential.
         query_vector = embed_query(embedder, embedding_text(query.query_text))
+        # Hook and agent paths bound the scan; evaluation and calibration measure it whole.
+        deadline = time.monotonic() + DENSE_SCAN_DEADLINE_SECONDS if require_calibration else None
         dense = dense_candidates(conn, query_vector, fingerprint, scan_kinds, limit=settings.embedder.dense_candidates,
-                                 exclude_ids=query.excluded_source_ids, eligible=eligible)
+                                 exclude_ids=query.excluded_source_ids, eligible=eligible, deadline=deadline)
+    except DenseScanTimeout:
+        return None, None, "dense-scan-timeout"
     except Exception as exc:
         return None, None, embedder_fallback_reason(exc)
     if not dense:

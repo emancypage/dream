@@ -1216,3 +1216,62 @@ def test_aborted_calls_leave_no_workers_behind(drip_server):
     while time.monotonic() < deadline and any(thread.name == "dream-embedder" for thread in threading.enumerate()):
         time.sleep(0.02)
     assert not [thread for thread in threading.enumerate() if thread.name == "dream-embedder"]
+
+
+# --- the nightly embed step after curation ------------------------------------------
+
+
+def test_nightly_curation_runs_after_distill_so_its_embed_step_covers_both():
+    service = (Path(__file__).parent / "systemd" / "dream.service").read_text(encoding="utf-8")
+    commands = [line.split(" -- ", 1)[1] for line in service.splitlines() if line.startswith("ExecStart=")]
+    order = [next(index for index, command in enumerate(commands) if needle in command)
+             for needle in ("dream ingest", "dream distill", "dream consolidate", "dream suggestions curate-configured")]
+    assert order == sorted(order)
+
+
+def _distilled_store(tmp_path):
+    """A store whose documents were synchronized (as distill does) but never embedded."""
+    from dream import open_db
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    for name, text in _ENGLISH.items():
+        (memory / name).write_text(text, encoding="utf-8")
+    conn = open_db(tmp_path / "dream.db")
+    synchronize_recall_documents(conn, memory, include_raw_transcripts=False, constitution_path=None)
+    conn.close()
+    return memory
+
+
+def _curate(tmp_path, config, monkeypatch, capsys):
+    from dream import cmd_suggestions
+    monkeypatch.setenv("DREAM_MEMORY_ROOT", str(tmp_path / "memory"))
+    rc = cmd_suggestions(SimpleNamespace(suggestions_cmd="curate-configured", memory=str(tmp_path / "memory"),
+                                         db=tmp_path / "dream.db", config=config, dry_run=False))
+    return rc, capsys.readouterr()
+
+
+def test_nightly_curation_embeds_what_distill_and_curation_changed(tmp_path, embedding_server, monkeypatch, capsys):
+    _distilled_store(tmp_path)
+    rc, captured = _curate(tmp_path, _cli_config(tmp_path, embedding_server.url), monkeypatch, capsys)
+    assert rc == 0
+    assert len(embedding_server.posted_inputs()) == 3
+    from dream import open_db
+    conn = open_db(tmp_path / "dream.db")
+    assert conn.execute("SELECT COUNT(*) FROM recall_embeddings WHERE vector_blob IS NOT NULL").fetchone()[0] == 3
+    conn.close()
+    assert "Recall embeddings: stored 3 vectors." in captured.out
+
+
+def test_nightly_curation_embed_step_fails_open_with_one_line(tmp_path, monkeypatch, capsys):
+    _distilled_store(tmp_path)
+    rc, captured = _curate(tmp_path, _cli_config(tmp_path, refused_url()), monkeypatch, capsys)
+    assert rc == 0
+    lines = [line for line in captured.err.splitlines() if line]
+    assert len(lines) == 1 and lines[0].startswith("recall embed skipped:")
+
+
+def test_nightly_curation_with_the_embedder_off_contacts_nothing(tmp_path, embedding_server, monkeypatch, capsys):
+    from config import load_config
+    _distilled_store(tmp_path)
+    rc, captured = _curate(tmp_path, load_config(tmp_path / "missing.toml"), monkeypatch, capsys)
+    assert rc == 0 and embedding_server.requests == [] and "recall embed" not in captured.err

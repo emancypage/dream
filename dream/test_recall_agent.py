@@ -758,3 +758,42 @@ def test_rank_lexical_kinds_filter_the_full_text_and_recent_pools(agent_env):
     start = RecallQuery("/nowhere", None, "session-start:startup", "/nowhere", (), 6000, frozenset(), False)
     assert {candidate.document.source_kind for candidate in rank_lexical(conn, start, kinds=("approved_memory",))} <= {"approved_memory"}
     conn.close()
+
+
+def test_a_slow_dense_scan_on_the_agent_path_falls_back_to_lexical(monkeypatch):
+    import itertools
+    import recall_embeddings
+    from recall_context import DENSE_SCAN_DEADLINE_SECONDS, run_context
+    from recall_types import RecallQuery
+    conn, settings = _dense_store([
+        ("approved", "approved_memory", "Database operational policy", [0.8, 0.6]),
+        ("other", "approved_memory", "Backup schedule notes", [0.6, 0.8]),
+    ])
+    query = RecallQuery("zasady bazy danych", "s1", "prompt", None, (), 4000, frozenset(), False)
+    assert run_context(conn, query, settings, embedder=_AxisEmbedder(), constitution_path=None).mode == "lexical_plus_embedder"
+    lexical = run_context(conn, query, replace_embedder(settings, enabled=False), constitution_path=None)
+    # Every clock reading is a second later than the last: the scan always outlives its deadline.
+    ticks = itertools.count(start=1000.0, step=DENSE_SCAN_DEADLINE_SECONDS + 0.5)
+    monkeypatch.setattr(recall_embeddings.time, "monotonic", lambda: next(ticks))
+    result = run_context(conn, query, settings, embedder=_AxisEmbedder(), constitution_path=None)
+    assert result.diagnostics.fallback_reason == "dense-scan-timeout"
+    assert result.mode == "lexical" and result.selected == lexical.selected == ()
+    assert result.rendered_context == lexical.rendered_context
+
+
+def test_evaluation_never_bounds_the_dense_scan(monkeypatch):
+    import itertools
+    import recall_embeddings
+    from recall_context import retrieve
+    from recall_types import RecallQuery
+    conn, settings = _dense_store([("approved", "approved_memory", "Database operational policy", [0.8, 0.6])])
+    ticks = itertools.count(start=1000.0, step=60.0)
+    monkeypatch.setattr(recall_embeddings.time, "monotonic", lambda: next(ticks))
+    query = RecallQuery("zasady bazy danych", None, "prompt", None, (), 4000, frozenset(), False)
+    outcome = retrieve(conn, query, settings, {}, embedder=_AxisEmbedder(), require_calibration=False)
+    assert outcome.fallback_reason is None and outcome.mode == "lexical_plus_embedder"
+
+
+def replace_embedder(settings, **changes):
+    from dataclasses import replace
+    return replace(settings, embedder=replace(settings.embedder, **changes))

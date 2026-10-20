@@ -329,3 +329,17 @@ def test_dense_eligibility_is_checked_in_bounded_chunks(tmp_path):
     sizes.clear()
     found = dense_candidates(conn, [1.0, 0.0, 0.0], FINGERPRINT, KINDS, limit=1000, eligible=eligible)
     assert len(found) == 150 and max(sizes) <= recall_embeddings._ELIGIBILITY_CHUNK and len(sizes) == 3
+
+
+def test_a_passed_deadline_drops_the_whole_dense_scan(tmp_path):
+    import time as clock
+    from recall_embeddings import DenseScanTimeout
+    conn = _db(tmp_path)
+    for doc_id in ("a", "b"):
+        _doc(conn, doc_id)
+        store_vector(conn, doc_id, f"sha-{doc_id}", FINGERPRINT, [1.0, 0.0, 0.0])
+    conn.commit()
+    with pytest.raises(DenseScanTimeout):
+        dense_candidates(conn, [1.0, 0.0, 0.0], FINGERPRINT, KINDS, deadline=clock.monotonic() - 1.0)
+    assert len(dense_candidates(conn, [1.0, 0.0, 0.0], FINGERPRINT, KINDS, deadline=clock.monotonic() + 60.0)) == 2
+    assert len(dense_candidates(conn, [1.0, 0.0, 0.0], FINGERPRINT, KINDS)) == 2
