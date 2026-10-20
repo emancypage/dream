@@ -10,6 +10,7 @@ Subcommands:
   audit         Weekly staleness audit over the whole store (remove/patch only)
   search        FTS5 search over all ingested transcripts
   recall        Read-only approved-memory query for agents (prints the recall block)
+  mcp           Read-only recall tools over MCP stdio (serve), and client install/uninstall
   review        Walk pending suggestions, accept/reject interactively
   status        Show DB stats
 
@@ -1628,6 +1629,45 @@ def cmd_context(args: argparse.Namespace) -> int:
         return _context_failure(args, exc, explain=explain)
 
 
+def cmd_mcp(args: argparse.Namespace) -> int:
+    """``mcp serve`` speaks JSON-RPC on stdio; ``mcp install|uninstall`` edit one client's config.
+
+    ``serve`` keeps stdout for protocol messages only and stays up when the
+    configuration fails to load: every tool call then reports the error.
+    """
+    if args.mcp_cmd == "serve":
+        from mcp_server import serve
+        try:
+            return serve(sys.stdin, sys.stdout, args.config, db_path=args.db,
+                         config_error=getattr(args, "config_error", None))
+        except KeyboardInterrupt:
+            return 130
+    import mcp_install
+    if args.client == "claude" and args.path:
+        print("dream mcp: --path applies to codex and opencode only; Claude Code manages its own file",
+              file=sys.stderr)
+        return 2
+    path = Path(args.path).expanduser() if args.path else None
+    action = mcp_install.install if args.mcp_cmd == "install" else mcp_install.uninstall
+    try:
+        report = action(args.client, path)
+    except mcp_install.McpInstallError as exc:
+        print(f"dream mcp: {exc}", file=sys.stderr)
+        return 1
+    where = f" in {report.path}" if report.path else ""
+    if args.mcp_cmd == "install":
+        print(f"Installed the Dream MCP server for {args.client}{where}." if report.changed
+              else f"The Dream MCP server is already installed for {args.client}{where}.")
+    else:
+        print(f"Removed the Dream MCP server for {args.client}{where}." if report.changed
+              else f"Nothing to remove for {args.client}{where}: {report.detail}.")
+    if report.backup_path:
+        print(f"Backup of the previous file: {report.backup_path}")
+    if args.mcp_cmd == "install":
+        print(mcp_install.NEXT_STEPS[args.client])
+    return 0
+
+
 def _positive_int(value: str) -> int:
     try:
         number = int(value)
@@ -1801,6 +1841,16 @@ def main(argv: list[str] | None = None) -> int:
         hp.add_argument("--path", default=os.environ.get("DREAM_CODEX_HOOKS_PATH", str(Path.home() / ".codex" / "hooks.json")))
         hp.set_defaults(func=cmd_hooks)
 
+    pmcp = sub.add_parser("mcp", help="Read-only recall tools for agents over MCP stdio, and client installers")
+    msub = pmcp.add_subparsers(dest="mcp_cmd", required=True)
+    mserve = msub.add_parser("serve", help="Serve recall_search, recall_get and memory_index as JSON-RPC on stdio")
+    mserve.set_defaults(func=cmd_mcp)
+    for mcp_cmd, verb in (("install", "Add"), ("uninstall", "Remove")):
+        mp = msub.add_parser(mcp_cmd, help=f"{verb} the dream MCP server entry in one client's configuration")
+        mp.add_argument("--client", required=True, choices=("codex", "opencode", "claude"))
+        mp.add_argument("--path", help="Client config file for codex or opencode (default: the client's global config)")
+        mp.set_defaults(func=cmd_mcp)
+
     from character.cli import register as register_character
     register_character(sub)
 
@@ -1814,7 +1864,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.cmd == "recall":
             return _recall_unavailable(f"configuration error: {type(exc).__name__}")
-        raise
+        if args.cmd != "mcp":
+            raise
+        # mcp serve keeps speaking JSON-RPC and reports the error per tool call; install needs no config.
+        args.config, args.config_error = None, type(exc).__name__
+        args.db = Path(args.db).expanduser() if args.db else None
+        return args.func(args)
     args.db = Path(args.db).expanduser() if args.db else args.config.db_path
     if hasattr(args, "memory"):
         args.memory = str(Path(args.memory).expanduser()) if args.memory else str(args.config.memory_root)

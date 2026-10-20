@@ -15,7 +15,8 @@ from recall_events import POLICY_VERSION
 from recall_adapters import AdapterError, EmbedderUnavailable, adapter_fingerprint, apply_optional_adapters, build_embedder, embed_query, embedder_fallback_reason
 from recall_embeddings import dense_candidates, embedding_text, has_vectors
 from recall_render import _render_blocks
-from recall_query import rank_lexical
+from recall_query import _load_documents, rank_lexical
+from recall_scrub import scrub_text
 from recall_select import calibration_for, embedder_calibration_version, select_recall_candidates
 from recall_types import RecallCandidate, RecallDiagnostics, RecallQuery, RecallResult
 from recall_usage import usage_map
@@ -161,6 +162,17 @@ def retrieve(conn, query: RecallQuery, settings, calibrations, *, embedder=None,
     return Retrieval(tuple(candidates), selected, mode, fallback or adapter_fallback, version)
 
 
+def document_allowed(document, *, policy, memory_root, constitution_path) -> bool:
+    """Whether retention policy and the constitution guard let recall serve ``document``."""
+    from character.safety import is_constitution_source
+    return not (
+        is_constitution_source(document.source_path, memory_root=memory_root, constitution_path=constitution_path)
+        or policy.excludes(source_path=document.source_path, project_slug=document.project_slug, text=document.text)
+        or (document.source_kind == "approved_memory" and memory_root is not None
+            and policy.excludes_memory_path(memory_root, document.source_path))
+    )
+
+
 def run_context(conn, query: RecallQuery, settings, explain: bool = False, *, embedder=None, reranker=None, allow_cache_writes: bool = False, memory_root=None, constitution_path,
                 kinds: frozenset[str] | None = None, limit: int | None = None) -> RecallResult:
     """Retrieve, select and render one recall run.
@@ -180,19 +192,12 @@ def _run_context(conn, query: RecallQuery, settings, explain: bool = False, *, e
     """``run_context`` plus the selected candidates whose block was rendered."""
     started = time.perf_counter()
     policy = load_retention_policy(memory_root)
-    from character.safety import is_constitution_source
 
     def keep(candidate) -> bool:
         if kinds is not None and candidate.document.source_kind not in kinds:
             return False
-        return not (
-            is_constitution_source(candidate.document.source_path, memory_root=memory_root, constitution_path=constitution_path)
-            or
-            policy.excludes(source_path=candidate.document.source_path,
-                            project_slug=candidate.document.project_slug, text=candidate.document.text)
-            or (candidate.document.source_kind == "approved_memory" and memory_root is not None
-                and policy.excludes_memory_path(memory_root, candidate.document.source_path))
-        )
+        return document_allowed(candidate.document, policy=policy, memory_root=memory_root,
+                                constitution_path=constitution_path)
 
     outcome = retrieve(
         conn, query, settings, _load_calibrations(conn), embedder=embedder, reranker=reranker,
@@ -284,6 +289,61 @@ def recall_for_agent(conn, settings, *, query_text, cwd, memory_root, constituti
                                  memory_root=memory_root, constitution_path=constitution_path,
                                  kinds=allowed, limit=limit)
     return replace(result, selected=shown, diagnostics=replace(result.diagnostics, selected_count=len(shown)))
+
+
+def _agent_store_ready(conn, settings) -> None:
+    if not settings.enabled:
+        raise RecallUnavailable("recall disabled")
+    missing = missing_recall_tables(conn)
+    if missing:
+        raise RecallUnavailable("recall tables missing: " + ", ".join(missing))
+
+
+def _as_candidate(document) -> RecallCandidate:
+    return RecallCandidate(document, scrub_text(document.text, Path.home()), {}, 0.0, 0)
+
+
+def document_for_agent(conn, settings, document_id: str, *, memory_root, constitution_path) -> RecallCandidate:
+    """One current recall document by ID, under the checks every agent query applies.
+
+    Retention policy and the constitution guard filter it exactly as in
+    ``run_context``, and a ``raw_transcript`` needs
+    ``recall.allow_raw_transcript_prompt``. The candidate's excerpt is
+    scrubbed; callers still render it through ``render_context``. An unknown
+    or excluded ID raises LookupError with the same message, so the error
+    never confirms that an excluded document exists. A disabled or unmigrated
+    store raises RecallUnavailable.
+    """
+    _agent_store_ready(conn, settings)
+    documents = _load_documents(conn, [document_id])
+    policy = load_retention_policy(memory_root)
+    if (not documents or documents[0].source_kind not in RECALL_KINDS
+            or (documents[0].source_kind == "raw_transcript" and not settings.allow_raw_transcript_prompt)
+            or not document_allowed(documents[0], policy=policy, memory_root=memory_root,
+                                    constitution_path=constitution_path)):
+        raise LookupError("document not found or not available for recall")
+    return _as_candidate(documents[0])
+
+
+MEMORY_INDEX_PATH = "MEMORY.md"
+
+
+def memory_index_for_agent(conn, settings, *, memory_root, constitution_path) -> tuple[RecallCandidate | None, int]:
+    """The indexed ``MEMORY.md`` document and the number of other approved memory documents.
+
+    Reads the database only, never the memory root's files: the index is the
+    synchronized recall document, and the count covers indexed
+    ``approved_memory`` documents that recall may serve, not files on disk.
+    The candidate is None when the store holds no servable index document.
+    """
+    _agent_store_ready(conn, settings)
+    ids = [row[0] for row in conn.execute("SELECT id FROM recall_documents WHERE source_kind = 'approved_memory'")]
+    policy = load_retention_policy(memory_root)
+    servable = [document for document in _load_documents(conn, ids)
+                if document_allowed(document, policy=policy, memory_root=memory_root, constitution_path=constitution_path)]
+    index = next((document for document in servable if document.source_path == MEMORY_INDEX_PATH), None)
+    others = sum(1 for document in servable if document.source_path != MEMORY_INDEX_PATH)
+    return (_as_candidate(index) if index is not None else None), others
 
 
 def agent_results(result: RecallResult) -> list[dict]:

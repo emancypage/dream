@@ -91,7 +91,7 @@ Legacy compatibility variables remain accepted: `DREAM_BACKEND`, `CLAUDE_DREAM_D
 - **Model calls send content.** The `distill` and `consolidate` stages send selected session content to the model provider configured for that stage — by default the Codex CLI against your ChatGPT subscription. Distillation sends the filtered transcript of a session; consolidation sends the distilled notes plus the current memory store. The review stage uses its configured provider and sends pending suggestions plus bounded target context.
 - **Everything else stays local.** The SQLite database (`~/.claude/dream.db` by default), suggestion previews (`.suggestions/`), and the memory store remain on your machine.
 - **Check your configuration first.** Before the first run, review the `[[sources]]` roots and the `[stages.*]`/`[providers.*]` entries in `~/.config/dream/config.toml` so you know which transcripts are read and where their content is sent.
-- **Local and external effects.** `estimate`, `search`, `status`, `preflight`, `context`, and `suggestions list` only read the persistent local data. Automatic recall opens SQLite through an immutable read-only connection; its small deduplication markers live under `/tmp`. `ingest` reads transcripts and updates the local SQLite index without calling a model. `distill`, `consolidate`, and configured curation make model calls and write local results. Suggestion review commands update local review state; `accept`, `merge`, and configured apply operations can also update memory files, with backups before live-memory writes.
+- **Local and external effects.** `estimate`, `search`, `status`, `preflight`, `context`, `recall`, `mcp serve`, and `suggestions list` only read the persistent local data. Automatic recall, `dream recall` and the MCP server open SQLite through an immutable read-only connection; the hooks' small deduplication markers live under `/tmp`, and `dream recall` and the MCP server leave none. `mcp install` and `mcp uninstall` edit one client's configuration file, with a backup. `ingest` reads transcripts and updates the local SQLite index without calling a model. `distill`, `consolidate`, and configured curation make model calls and write local results. Suggestion review commands update local review state; `accept`, `merge`, and configured apply operations can also update memory files, with backups before live-memory writes.
 - **Cost / subscription usage.** Each model call can incur cost or consume part of your subscription limit. `dream estimate -v` shows how many sessions a distillation run would cover before you run it.
 - **Consent.** Do not run `dream` on confidential transcripts unless you have consciously agreed to send their selected content to the configured provider.
 
@@ -168,6 +168,10 @@ dream context session-start < hook-payload.json
 dream context prompt < hook-payload.json
 dream hooks install
 dream hooks uninstall
+dream recall "postgres migration rollback"
+dream recall "release checklist" --project api --kinds approved_memory --limit 3 --json
+dream mcp install --client codex
+dream mcp uninstall --client codex
 dream recall-eval --fixtures dream/fixtures/recall/public.json
 ```
 
@@ -290,6 +294,66 @@ For autonomous user-requested review, use `curate-configured` and report each mo
 
 The legacy `dream review` interactive diff remains available.
 
+## Mid-session recall for agents
+
+Hooks inject memory at session start and on the first prompt. During a
+session an agent can ask for more in two read-only ways; both use the same
+retrieval as the prompt hook (the `agent-query` event, with its calibrated
+threshold) and render every result through the same untrusted-reference
+marker, provenance line and secret scrubber.
+
+`dream recall "<3-8 content words>"` prints the rendered recall block, or
+nothing when no memory passes the threshold. `--project SLUG` prefers one
+project without excluding the others, `--kinds` filters source kinds
+(default `approved_memory,distilled_summary`; `raw_transcript` must be named
+and needs `recall.allow_raw_transcript_prompt = true`), `--limit` is clamped to 1-10
+(default 5) and `--json` adds ids, kinds, trust, project, scores, mode and the
+calibration version. A missing or busy database, an unmigrated schema or
+disabled recall print one `dream recall: unavailable (...)` line to stderr and
+exit 0.
+
+`dream mcp serve` exposes the same data as Model Context Protocol tools over
+stdio (JSON-RPC 2.0, one message per line; protocol versions 2025-06-18,
+2025-03-26 and 2024-11-05; only the `tools` capability):
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `recall_search` | `query`, optional `project`, `kinds` (same default as `dream recall`), `limit` (clamped to 1-10) | The rendered recall block, as `dream recall` prints it, plus structured `results` rows of `{id, kind, trust, project, score}` |
+| `recall_get` | `id` from a `[source: <id>; ...]` line | That one document, if retention policy, the constitution guard and the raw-transcript opt-in allow it, rendered with excerpts up to `recall.prompt_budget_codepoints` |
+| `memory_index` | none | The indexed `MEMORY.md`, rendered within `recall.session_start_budget_codepoints`, and the number of other approved memory documents |
+
+The server is meant to run inside a sandboxed agent, so it is read-only. Each
+tool call opens the database with an immutable read-only connection and closes
+it before replying, so a long session still sees the nightly updates. A
+successful call writes nothing: no database rows, hook markers, embedding
+cache or files under the home directory. Memory text comes only from the
+database (`memory_index` serves the synchronized copy of `MEMORY.md`); the one
+file read under the memory root is `.dream-retention.json`, so exclusions apply
+even to documents synchronized before the policy changed. A failed call may append one bounded diagnostic to `recall.diagnostic_path`,
+and a failed append is ignored. Tool failures (database missing or busy,
+schema not migrated, unknown or excluded id) come back as results with
+`isError: true`; malformed JSON and lines over 1 MiB get `-32700`, batches
+(JSON arrays) and invalid requests `-32600`, unknown methods `-32601`, unknown
+tools or invalid arguments `-32602`. stdout carries only protocol messages.
+
+The server is not installed by default. `dream mcp install --client codex`
+adds a marker-delimited `[mcp_servers.dream]` block at the end of
+`$CODEX_HOME/config.toml` (default `~/.codex/config.toml`); `--client opencode`
+adds `mcp.dream` (`{"type": "local", "command": ["dream", "mcp", "serve"],
+"enabled": true}`) to `$OPENCODE_CONFIG` or the global
+`~/.config/opencode/opencode.json` (`opencode.jsonc` when only that exists;
+it must be plain JSON); `--client claude` runs
+`claude mcp add --scope user dream -- dream mcp serve`, or prints that command
+when `claude` is not on `PATH`. `--path` points codex or opencode at another
+file. Install refuses malformed files and foreign `dream` entries, re-parses
+the result before an atomic replace, keeps unrelated entries, writes a
+timestamped `.bak-` copy of the previous file, and writes nothing when the
+entry is already current. Claude Code keeps its own file, so Dream makes no
+backup there. `dream mcp uninstall --client ...` removes only the Dream entry
+and is the rollback. Neither command starts the server: restart the client
+and check its MCP list (`/mcp` in Codex and Claude Code, `opencode mcp list`).
+The clients run `dream mcp serve` by name, so `dream` must be on their `PATH`.
+
 ## Data and compatibility
 
 Existing paths remain the defaults during migration:
@@ -373,6 +437,7 @@ Paths are relative to `dream/`.
 | `prompts/` | provider-neutral prompts |
 | `recall_documents.py`, `recall_query.py` | canonical synchronization and lexical retrieval |
 | `recall_context.py`, `recall_hooks.py` | fail-open context execution and Codex hook management |
+| `mcp_server.py`, `mcp_install.py` | read-only MCP stdio server and client configuration installers |
 | `recall_eval.py`, `recall_adapters.py` | fixture evaluation, calibration, and optional adapter contracts |
 | `metrics.py`, `stage_runner.py` | run-state persistence and Prometheus exporter |
 | `monitoring_prometheus.py`, `monitoring_dashboard.py` | idempotent Prometheus and Grafana patchers |

@@ -129,3 +129,16 @@ def test_text_without_forged_lines_renders_byte_identically():
                  "​[x]\n [y]", ""):
         assert neutralize_forged_headers(text) == text
         assert render_context([_candidate(text)], 4000, "memory").endswith(text)
+
+
+def test_excerpt_cap_defaults_to_one_thousand_code_points():
+    long_text = "A useful memory sentence. " * 200
+    default = render_context([_candidate(long_text)], 6000, "useful memory")
+    assert default == render_context([_candidate(long_text)], 6000, "useful memory", excerpt_codepoints=1000)
+    header, excerpt = default.split("\n", 2)[:2], default.split("\n", 2)[2]
+    assert header[0].startswith("[Dream recall") and len(excerpt) <= 1000
+    wider = render_context([_candidate(long_text)], 6000, "useful memory", excerpt_codepoints=4000)
+    assert 1000 < len(wider.split("\n", 2)[2]) <= 4000
+    assert len(wider) <= 6000
+    capped = render_context([_candidate(long_text)], 1500, "useful memory", excerpt_codepoints=4000)
+    assert len(capped) <= 1500

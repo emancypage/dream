@@ -87,15 +87,19 @@ def make_excerpt(text: str, normalized_query: str, max_codepoints: int) -> str:
     return " ".join(selected)
 
 
-def render_context(candidates, budget_codepoints: int, query_text: str) -> str:
-    return _render_blocks(candidates, budget_codepoints, query_text)[0]
+def render_context(candidates, budget_codepoints: int, query_text: str, *, excerpt_codepoints: int = 1000) -> str:
+    return _render_blocks(candidates, budget_codepoints, query_text, excerpt_codepoints=excerpt_codepoints)[0]
 
 
-def _render_blocks(candidates, budget_codepoints: int, query_text: str) -> tuple[str, list]:
+def _render_blocks(candidates, budget_codepoints: int, query_text: str, *,
+                   excerpt_codepoints: int = 1000) -> tuple[str, list]:
     """Render greedily in rank order: ``(text, kept)``, where ``kept`` lists the rendered candidates.
 
     A block that does not fit is skipped and a later, smaller one may still
     fit, so ``kept`` is not always a prefix of ``candidates``.
+    ``excerpt_codepoints`` caps each excerpt; the default 1,000 is what hooks
+    and ``dream recall`` use. The MCP tools ``recall_get`` and ``memory_index``
+    raise it to show one whole document.
     """
     if budget_codepoints <= 0:
         return "", []
@@ -119,7 +123,7 @@ def _render_blocks(candidates, budget_codepoints: int, query_text: str) -> tuple
         # Each escape adds one code point. The total budget check runs after
         # escaping, so an over-budget block is dropped, never truncated.
         source_text = neutralize_forged_headers(candidate.scrubbed_excerpt or doc.text)
-        excerpt = neutralize_forged_headers(make_excerpt(source_text, query_text, min(1000, remaining)))
+        excerpt = neutralize_forged_headers(make_excerpt(source_text, query_text, min(excerpt_codepoints, remaining)))
         block = header + excerpt
         if not excerpt or used + (2 if blocks else 0) + len(block) > budget_codepoints:
             continue
