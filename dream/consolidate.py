@@ -731,7 +731,9 @@ def run_audit(
     """Weekly staleness audit over every topic file, in chunks; emits only remove and patch.
 
     MEMORY.md is shown with every chunk as context and is never a target. No
-    distillation is consumed. Suggestions from all chunks are persisted together,
+    distillation is consumed. Each provider call gets its own consolidation run
+    (`audit-<id>-chunk<N>`, with that call's provider and reported model) and its
+    suggestions link to it. All runs are persisted together in one transaction,
     so a provider failure in any chunk persists nothing.
     """
     cfg = config or load_config()
@@ -747,8 +749,8 @@ def run_audit(
     usage = memory_annotations(conn, [entry.path.name for entry in topics])
     usage_since = observation_window(conn)
     template = AUDIT_PROMPT_PATH.read_text(encoding="utf-8")
-    suggestions: list[Suggestion] = []
-    provider = used_model = None
+    audit_run = f"audit-{uuid.uuid4().hex}"
+    runs: list[tuple[str, str, str | None, list[Suggestion]]] = []
     for number, chunk in enumerate(chunks, 1):
         prompt = (
             template
@@ -766,16 +768,17 @@ def run_audit(
         )
         prompt += policy.context()
         res = generate("audit", prompt, CONSOLIDATE_PATCH_SCHEMA, model=model, config=cfg)
-        provider, used_model = res.provider, res.model
         # audit_chunks never cuts a file, so the chunk's files are exactly what the
         # model read in full; anything else is not a valid target for this call.
-        suggestions += _patch_mode_suggestions(
+        found = _patch_mode_suggestions(
             res.output, memory_root, allowed=("remove", "patch"), shown={entry.path.name for entry in chunk},
             files=files, policy=policy, projects={}, subset=False,
         )
-    suggestions = _drop_fresh_removals(suggestions, memory_root)
-    _persist(conn, memory_root, suggestions, batch=[], provider=provider, model=used_model)
-    return suggestions
+        runs.append((f"{audit_run}-chunk{number}", res.provider, res.model, found))
+    runs = [(run_id, provider, used_model, _drop_fresh_removals(found, memory_root))
+            for run_id, provider, used_model, found in runs]
+    _persist_runs(conn, memory_root, runs, batch=[])
+    return [s for _run_id, _provider, _model, found in runs for s in found]
 
 
 def _patch_preview(memory_root: Path, s: Suggestion) -> str:
@@ -885,6 +888,24 @@ def _persist(
     provider: str,
     model: str | None,
 ) -> None:
+    _persist_runs(conn, memory_root, [(uuid.uuid4().hex, provider, model, suggestions)], batch=batch)
+
+
+def _persist_runs(
+    conn: sqlite3.Connection,
+    memory_root: Path,
+    runs: list[tuple[str, str, str | None, list[Suggestion]]],
+    *,
+    batch: list[tuple[str, str, dict, str]],
+) -> None:
+    """Persist provider runs and their suggestions in one transaction.
+
+    `runs` holds one (run_id, provider, model, suggestions) entry per provider
+    call, so each suggestion keeps the identity of the call that produced it.
+    Previews are numbered across all runs. The batch's distillations are
+    consumed by the first run. Any failure rolls back every run and removes the
+    previews already written.
+    """
     sug_dir = memory_root / ".suggestions"
     sug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -892,59 +913,67 @@ def _persist(
     existing = list(sug_dir.glob(f"{today}-*.md"))
     start_n = len(existing) + 1
 
-    run_id = uuid.uuid4().hex
     written: list[Path] = []
     try:
         with conn:
-            conn.execute(
-                "INSERT INTO consolidation_runs(run_id, provider, model) VALUES (?, ?, ?)",
-                (run_id, provider, model),
-            )
             n = start_n
-            for s in suggestions:
-                slug = re.sub(r"[^a-z0-9-]+", "-", s.target_path.lower().replace(".md", "")).strip("-")[:50] or "suggestion"
-                header = (
-                    f"<!-- dream suggestion\n"
-                    f"kind: {s.kind}\n"
-                    f"target_path: {s.target_path}\n"
-                    f"rationale: {s.rationale}\n"
-                    f"source_sessions: {', '.join(s.source_sessions)}\n"
-                    f"base_sha256: {s.base_sha256 or ''}\n"
-                    f"-->\n\n"
-                )
-                preview = _patch_preview(memory_root, s) if s.kind == "patch" else (s.body or "(remove)")
-                # Exclusive create: a preview left by an earlier or concurrent run is never
-                # overwritten and two rows never share a preview file.
-                while True:
-                    fname = f"{today}-{n:03d}-{s.kind}-{slug}.md"
-                    fpath = sug_dir / fname
-                    try:
-                        handle = open(fpath, "x", encoding="utf-8")
-                    except FileExistsError:
-                        n += 1
-                        continue
-                    written.append(fpath)
-                    with handle:
-                        handle.write(header + preview)
-                    break
-                n += 1
-                conn.execute(
-                    "INSERT INTO suggestions(kind, target_path, body, rationale, source_sessions, "
-                    "sug_file, base_sha256, target_existed, consolidation_run_id, find_text) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        s.kind, s.target_path, s.body, s.rationale,
-                        ",".join(s.source_sessions), fname, s.base_sha256,
-                        int(s.target_existed), run_id, s.find if s.kind == "patch" else None,
-                    ),
-                )
+            for run_id, provider, model, suggestions in runs:
+                n = _persist_run(conn, memory_root, sug_dir, today, n, written,
+                                 run_id, provider, model, suggestions)
             for sid, _ts, _notes, dkey in batch:
                 conn.execute(
                     "INSERT INTO consolidated_distillations(distillation_key, session_id, run_id) "
                     "VALUES (?, ?, ?)",
-                    (dkey, sid, run_id),
+                    (dkey, sid, runs[0][0]),
                 )
     except Exception:
         for path in written:
             path.unlink(missing_ok=True)
         raise
+
+
+def _persist_run(conn, memory_root: Path, sug_dir: Path, today: str, n: int, written: list[Path],
+                 run_id: str, provider: str, model: str | None, suggestions: list[Suggestion]) -> int:
+    """Insert one run row and its suggestions and previews; return the next preview number."""
+    conn.execute(
+        "INSERT INTO consolidation_runs(run_id, provider, model) VALUES (?, ?, ?)",
+        (run_id, provider, model),
+    )
+    for s in suggestions:
+        slug = re.sub(r"[^a-z0-9-]+", "-", s.target_path.lower().replace(".md", "")).strip("-")[:50] or "suggestion"
+        header = (
+            f"<!-- dream suggestion\n"
+            f"kind: {s.kind}\n"
+            f"target_path: {s.target_path}\n"
+            f"rationale: {s.rationale}\n"
+            f"source_sessions: {', '.join(s.source_sessions)}\n"
+            f"base_sha256: {s.base_sha256 or ''}\n"
+            f"-->\n\n"
+        )
+        preview = _patch_preview(memory_root, s) if s.kind == "patch" else (s.body or "(remove)")
+        # Exclusive create: a preview left by an earlier or concurrent run is never
+        # overwritten and two rows never share a preview file.
+        while True:
+            fname = f"{today}-{n:03d}-{s.kind}-{slug}.md"
+            fpath = sug_dir / fname
+            try:
+                handle = open(fpath, "x", encoding="utf-8")
+            except FileExistsError:
+                n += 1
+                continue
+            written.append(fpath)
+            with handle:
+                handle.write(header + preview)
+            break
+        n += 1
+        conn.execute(
+            "INSERT INTO suggestions(kind, target_path, body, rationale, source_sessions, "
+            "sug_file, base_sha256, target_existed, consolidation_run_id, find_text) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                s.kind, s.target_path, s.body, s.rationale,
+                ",".join(s.source_sessions), fname, s.base_sha256,
+                int(s.target_existed), run_id, s.find if s.kind == "patch" else None,
+            ),
+        )
+    return n

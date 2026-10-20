@@ -226,6 +226,56 @@ def test_audit_prompts_show_every_chunk_file_whole_even_when_oversized(tmp_path,
     assert not any("truncated" in call["prompt"] for call in calls)
 
 
+def _two_chunk_audit(tmp_path, monkeypatch, outputs):
+    root = tmp_path / "memory"
+    root.mkdir()
+    (root / "MEMORY.md").write_text("- [A](a.md)\n- [B](b.md)\n", encoding="utf-8")
+    (root / "a.md").write_text("first old fact " * 10, encoding="utf-8")
+    (root / "b.md").write_text("second old fact " * 10, encoding="utf-8")
+    monkeypatch.setattr(C, "MAX_CURRENT_MEMORY_CHARS", 800)
+    models = []
+
+    def fake(stage, prompt, schema, **kwargs):
+        models.append(f"model-{'ab'[len(models)]}")
+        return SimpleNamespace(provider="fake", model=models[-1], output=outputs[len(models) - 1])
+
+    monkeypatch.setattr(C, "generate", fake)
+    conn = _db()
+    suggestions = C.run_audit(conn, root, config=_config(tmp_path, root))
+    return conn, models, suggestions
+
+
+def test_audit_records_one_run_per_provider_call_and_links_each_suggestion_to_it(tmp_path, monkeypatch):
+    conn, models, suggestions = _two_chunk_audit(tmp_path, monkeypatch, [
+        {"suggestions": [_suggestion("patch", "a.md", "new fact", "update one fact", find="first old fact first")]},
+        {"suggestions": [_suggestion("patch", "b.md", "new fact", "update one fact", find="second old fact second")]},
+    ])
+    assert models == ["model-a", "model-b"]
+    assert [s.target_path for s in suggestions] == ["a.md", "b.md"]
+    rows = conn.execute(
+        "SELECT s.target_path, r.provider, r.model, r.run_id FROM suggestions s "
+        "JOIN consolidation_runs r ON s.consolidation_run_id = r.run_id ORDER BY s.id").fetchall()
+    assert [row[:3] for row in rows] == [("a.md", "fake", "model-a"), ("b.md", "fake", "model-b")]
+    runs = [row[0] for row in conn.execute("SELECT run_id FROM consolidation_runs ORDER BY run_id")]
+    assert len(runs) == 2
+    prefix = runs[0].rsplit("-chunk", 1)[0]
+    assert prefix.startswith("audit-")
+    assert runs == [f"{prefix}-chunk1", f"{prefix}-chunk2"]
+    assert [row[3] for row in rows] == runs
+
+
+def test_audit_records_a_run_for_a_chunk_that_proposes_nothing(tmp_path, monkeypatch):
+    conn, _, suggestions = _two_chunk_audit(tmp_path, monkeypatch, [
+        {"suggestions": []},
+        {"suggestions": [_suggestion("patch", "b.md", "new fact", "update one fact", find="second old fact second")]},
+    ])
+    assert [s.target_path for s in suggestions] == ["b.md"]
+    assert conn.execute("SELECT model FROM consolidation_runs ORDER BY run_id").fetchall() == [("model-a",), ("model-b",)]
+    assert conn.execute(
+        "SELECT r.model FROM suggestions s JOIN consolidation_runs r ON s.consolidation_run_id = r.run_id"
+    ).fetchall() == [("model-b",)]
+
+
 def test_audit_removals_keep_the_21_day_grace(tmp_path, monkeypatch):
     root = _store(tmp_path, count=2)
     _age(root / "project_topic_00.md", C.REMOVE_GRACE_DAYS + 5)
