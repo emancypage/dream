@@ -1115,3 +1115,27 @@ def test_a_closed_stdout_ends_the_process_with_exit_zero_and_no_noise(home, tmp_
         process.stderr.close()
     assert returncode == 0
     assert b"Exception ignored" not in stderr and b"Traceback" not in stderr
+
+
+def test_recall_search_kinds_filter_applies_before_the_dense_limit(home, tmp_path, embedding_server):
+    from dream import open_db
+    from recall_embeddings import store_vector
+    from test_recall_embedder_http import fake_vector
+    _memory, db = _store(home, {"api.md": "The API project stores its data in PostgreSQL."},
+                         rows=[{"doc_id": f"summary-{index:03d}", "text": f"Summary number {index}"} for index in range(200)])
+    conn = open_db(db)
+    query_vector = fake_vector("jaka baza danych")
+    for doc_id, digest, kind in conn.execute("SELECT id, content_sha256, source_kind FROM recall_documents").fetchall():
+        # Every summary points exactly along the query; the approved memory only mostly.
+        vector = query_vector if kind == "distilled_summary" else [value + (0.6 if index == 3 else 0.0) for index, value in enumerate(query_vector)]
+        store_vector(conn, doc_id, digest, FINGERPRINT, vector)
+    conn.commit()
+    calibrate_embedder_mode(conn)
+    conn.close()
+    config = _cli_config(tmp_path, embedding_server.url)
+    approved = _tool(config, db, "recall_search", {"query": "jaka baza danych", "kinds": ["approved_memory"]})["structuredContent"]
+    assert approved["mode"] == "lexical_plus_embedder" and approved["fallback_reason"] is None
+    assert [row["kind"] for row in approved["results"]] == ["approved_memory"]
+    assert "PostgreSQL" in approved["context"]
+    every = _tool(config, db, "recall_search", {"query": "jaka baza danych"})["structuredContent"]
+    assert {row["kind"] for row in every["results"]} == {"distilled_summary"}

@@ -606,3 +606,120 @@ def test_recall_unavailable_is_raised_for_library_callers(agent_env):
             recall_for_agent(conn, settings, query_text="postgres", cwd=None, memory_root=agent_env, constitution_path=None)
     finally:
         conn.close()
+
+
+# --- requested kinds and exclusions compete for the dense limit, not after it -------
+
+
+class _AxisEmbedder:
+    """Every query points along the first axis; stored vectors decide each document's cosine."""
+
+    fingerprint = "fake:2"
+    remote_data_egress = False
+
+    def embed(self, texts):
+        return [[1.0, 0.0] for _ in texts]
+
+
+def _dense_store(rows, *, dense_candidates=200):
+    """An ephemeral store: ``rows`` are (id, kind, text, vector); the embedder mode is calibrated for fake:2."""
+    from dataclasses import replace
+    from dream import _open_ephemeral_eval_db
+    from recall_embeddings import store_vector
+    from recall_eval import _default_settings, _ensure_documents
+    from recall_select import embedder_calibration_version
+    conn = _open_ephemeral_eval_db()
+    _ensure_documents(conn, [{"id": doc_id, "source_kind": kind,
+                              "trust_level": "user_approved" if kind == "approved_memory" else "model_distilled",
+                              "source_path": f"{doc_id}.md", "source_updated_at": "2026-01-01T00:00:00Z",
+                              "source_version": "v1", "text": text} for doc_id, kind, text, _vector in rows])
+    digests = dict(conn.execute("SELECT id, content_sha256 FROM recall_documents").fetchall())
+    for doc_id, _kind, _text, vector in rows:
+        store_vector(conn, doc_id, digests[doc_id], "fake:2", vector)
+    version = embedder_calibration_version("fixture", "lexical_plus_embedder", "fake:2")
+    conn.execute("INSERT INTO recall_calibrations(mode, calibration_version, threshold, fixture_sha256, created_at) "
+                 "VALUES ('lexical_plus_embedder', ?, 0.0, 'fixture', '2026-01-01')", (version,))
+    conn.commit()
+    settings = _default_settings()
+    settings = replace(settings, embedder=replace(settings.embedder, enabled=True, dense_candidates=dense_candidates))
+    return conn, settings
+
+
+def _agent_ids(conn, settings, *, kinds=None, memory_root=None, query="zasady bazy danych"):
+    from recall_context import recall_for_agent
+    result = recall_for_agent(conn, settings, query_text=query, cwd=None, memory_root=memory_root,
+                              constitution_path=None, kinds=kinds, limit=10, embedder=_AxisEmbedder())
+    return [candidate.document.id for candidate in result.selected], result
+
+
+def test_an_excluded_kind_cannot_take_the_only_dense_slot():
+    conn, settings = _dense_store([
+        ("approved", "approved_memory", "Database operational policy", [0.8, 0.6]),
+        ("summary", "distilled_summary", "Unrelated example", [1.0, 0.0]),
+    ], dense_candidates=1)
+    ids, result = _agent_ids(conn, settings, kinds=["approved_memory"])
+    assert ids == ["approved"]
+    assert result.mode == "lexical_plus_embedder" and result.diagnostics.fallback_reason is None
+    assert _agent_ids(conn, settings)[0] == ["summary"]
+
+
+def test_two_hundred_disallowed_documents_cannot_crowd_out_one_allowed_document():
+    rows = [(f"summary-{index:03d}", "distilled_summary", f"Summary number {index}", [1.0, 0.001 * index]) for index in range(200)]
+    rows.append(("approved", "approved_memory", "Database operational policy", [0.8, 0.6]))
+    conn, settings = _dense_store(rows)
+    assert settings.embedder.dense_candidates == 200
+    ids, result = _agent_ids(conn, settings, kinds=["approved_memory"])
+    assert ids == ["approved"] and result.mode == "lexical_plus_embedder"
+    assert "approved" not in _agent_ids(conn, settings)[0]
+
+
+def test_raw_transcripts_never_take_a_dense_slot_without_the_opt_in():
+    conn, settings = _dense_store([
+        ("approved", "approved_memory", "Database operational policy", [0.8, 0.6]),
+        ("raw", "raw_transcript", "USER: raw session", [1.0, 0.0]),
+    ], dense_candidates=1)
+    assert _agent_ids(conn, settings)[0] == ["approved"]
+
+
+def test_session_exclusions_apply_before_the_dense_limit():
+    from recall_context import run_context
+    from recall_types import RecallQuery
+    conn, settings = _dense_store([
+        ("first", "approved_memory", "Database operational policy", [1.0, 0.0]),
+        ("second", "approved_memory", "Backup schedule notes", [0.8, 0.6]),
+    ], dense_candidates=1)
+    query = RecallQuery("zasady bazy danych", "s1", "prompt", None, (), 4000, frozenset({"first"}), False)
+    result = run_context(conn, query, settings, embedder=_AxisEmbedder(), constitution_path=None)
+    assert [candidate.document.id for candidate in result.selected] == ["second"]
+    assert result.mode == "lexical_plus_embedder"
+
+
+def test_retention_exclusions_apply_before_the_dense_limit(tmp_path):
+    from retention_policy import POLICY_FILE
+    memory = tmp_path / "memory-root"
+    memory.mkdir()
+    conn, settings = _dense_store([
+        ("secret", "distilled_summary", "CLIENT-CONFIDENTIAL database notes", [1.0, 0.0]),
+        ("allowed", "distilled_summary", "Backup schedule notes", [0.8, 0.6]),
+    ], dense_candidates=1)
+    # The policy changed after indexing: the excluded summary is still in the store.
+    (memory / POLICY_FILE).write_text(json.dumps({"text_markers": ["CLIENT-CONFIDENTIAL"]}), encoding="utf-8")
+    ids, result = _agent_ids(conn, settings, memory_root=memory)
+    assert ids == ["allowed"] and result.mode == "lexical_plus_embedder"
+
+
+def test_requested_kinds_without_vectors_make_no_embedder_call():
+    from recall_context import recall_for_agent
+
+    class Counting(_AxisEmbedder):
+        calls = 0
+
+        def embed(self, texts):
+            Counting.calls += 1
+            return super().embed(texts)
+
+    conn, settings = _dense_store([("summary", "distilled_summary", "Unrelated example", [1.0, 0.0])])
+    result = recall_for_agent(conn, settings, query_text="zasady bazy danych", cwd=None, memory_root=None,
+                              constitution_path=None, kinds=["approved_memory"], limit=10, embedder=Counting())
+    assert result.selected == () and result.diagnostics.fallback_reason == "embedder-no-vectors"
+    assert Counting.calls == 0

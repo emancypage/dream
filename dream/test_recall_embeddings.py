@@ -288,3 +288,22 @@ def test_sync_removes_vectors_of_deleted_and_changed_documents(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM recall_embeddings").fetchone()[0] == 0
     report = embed_recall_documents(conn, RecordingEmbedder(), include_raw_transcripts=False)
     assert report.embedded == 1
+
+
+def test_dense_scan_drops_excluded_and_ineligible_documents_before_the_limit(tmp_path):
+    conn = _db(tmp_path)
+    for doc_id in ("a", "b", "c", "d"):
+        _doc(conn, doc_id)
+    for doc_id, vector in (("a", [1.0, 0.0, 0.0]), ("b", [0.9, 0.1, 0.0]), ("c", [0.8, 0.2, 0.0]), ("d", [0.7, 0.3, 0.0])):
+        store_vector(conn, doc_id, f"sha-{doc_id}", FINGERPRINT, vector)
+    conn.commit()
+    assert [doc_id for doc_id, _ in dense_candidates(conn, [1.0, 0.0, 0.0], FINGERPRINT, KINDS, limit=1, exclude_ids={"a"})] == ["b"]
+    asked = []
+
+    def eligible(ids):
+        asked.append(list(ids))
+        return {doc_id for doc_id in ids if doc_id not in {"a", "b"}}
+
+    found = dense_candidates(conn, [1.0, 0.0, 0.0], FINGERPRINT, KINDS, limit=2, eligible=eligible)
+    assert [doc_id for doc_id, _ in found] == ["c", "d"]
+    assert asked and asked[0][:2] == ["a", "b"]

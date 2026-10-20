@@ -84,8 +84,15 @@ def with_adapters(settings, *, embedder: bool | None = None, reranker: bool | No
     return settings
 
 
-def _dense_list(conn, query: RecallQuery, settings, embedder, calibrations, *, require_calibration: bool):
+def _dense_list(conn, query: RecallQuery, settings, embedder, calibrations, *, require_calibration: bool,
+                kinds=None, document_filter=None):
     """Return ``(dense, query_vector, fallback_reason)`` for an enabled embedder.
+
+    Only documents the run can serve compete for the ``dense_candidates``
+    limit: ``kinds`` (a hard source-kind filter), the raw-transcript rule and
+    the session exclusions are applied inside the scan, and
+    ``document_filter`` (retention policy, constitution guard) over-fetches
+    in score order, loading only the documents it checks.
 
     The query text is embedded at most once, and only after every local
     check passed. Unless the embedder mode has a calibration row computed for
@@ -113,13 +120,22 @@ def _dense_list(conn, query: RecallQuery, settings, embedder, calibrations, *, r
             return None, None, "embedder-calibration-stale"
     if not query.query_text.strip():
         return None, None, None
-    kinds = ("approved_memory", "distilled_summary") + (("raw_transcript",) if query.allow_raw_transcript else ())
+    scan_kinds = tuple(kind for kind in ("approved_memory", "distilled_summary")
+                       + (("raw_transcript",) if query.allow_raw_transcript else ())
+                       if kinds is None or kind in kinds)
+    if not scan_kinds:
+        return None, None, None
+    eligible = None
+    if document_filter is not None:
+        def eligible(ids):
+            return {document.id for document in _load_documents(conn, list(ids)) if document_filter(document)}
     try:
-        if not has_vectors(conn, fingerprint, kinds):
+        if not has_vectors(conn, fingerprint, scan_kinds):
             return None, None, "embedder-no-vectors"
         # Scrubbed like the stored documents: not even a loopback server sees a credential.
         query_vector = embed_query(embedder, embedding_text(query.query_text))
-        dense = dense_candidates(conn, query_vector, fingerprint, kinds, limit=settings.embedder.dense_candidates)
+        dense = dense_candidates(conn, query_vector, fingerprint, scan_kinds, limit=settings.embedder.dense_candidates,
+                                 exclude_ids=query.excluded_source_ids, eligible=eligible)
     except Exception as exc:
         return None, None, embedder_fallback_reason(exc)
     if not dense:
@@ -128,20 +144,24 @@ def _dense_list(conn, query: RecallQuery, settings, embedder, calibrations, *, r
 
 
 def retrieve(conn, query: RecallQuery, settings, calibrations, *, embedder=None, reranker=None,
-             allow_cache_writes: bool = False, keep=None, require_calibration: bool = True) -> Retrieval:
+             allow_cache_writes: bool = False, keep=None, require_calibration: bool = True,
+             kinds=None, document_filter=None) -> Retrieval:
     """Rank, fuse the optional dense list, rescore and select with the active mode's calibration.
 
     ``keep`` filters ranked candidates (retention policy, constitution) before
-    adapters and selection. The recall hooks and the evaluator share this
-    pipeline, so a fixture measures exactly what a session receives. Only the
-    evaluator and calibration, which compute the embedder mode's threshold,
-    pass ``require_calibration=False``.
+    adapters and selection. ``kinds`` and ``document_filter`` apply the same
+    eligibility to the dense scan before its limit, so excluded documents
+    never take an eligible one's place. The recall hooks and the evaluator
+    share this pipeline, so a fixture measures exactly what a session
+    receives. Only the evaluator and calibration, which compute the embedder
+    mode's threshold, pass ``require_calibration=False``.
     """
     dense = query_vector = fallback = None
     adapter_settings = settings
     if settings.embedder.enabled:
         dense, query_vector, fallback = _dense_list(conn, query, settings, embedder, calibrations,
-                                                    require_calibration=require_calibration)
+                                                    require_calibration=require_calibration,
+                                                    kinds=kinds, document_filter=document_filter)
         if query_vector is None:
             # Nothing dense contributes: no second embedder call, lexical scores stay.
             adapter_settings = with_adapters(settings, embedder=False)
@@ -241,15 +261,18 @@ def _run_context(conn, query: RecallQuery, settings, explain: bool = False, *, e
     policy = load_retention_policy(memory_root)
     is_constitution = constitution_guard(memory_root, constitution_path)
 
-    def keep(candidate) -> bool:
-        if kinds is not None and candidate.document.source_kind not in kinds:
+    def servable(document) -> bool:
+        if kinds is not None and document.source_kind not in kinds:
             return False
-        return document_allowed(candidate.document, policy=policy, memory_root=memory_root,
+        return document_allowed(document, policy=policy, memory_root=memory_root,
                                 constitution_path=constitution_path, is_constitution=is_constitution)
+
+    def keep(candidate) -> bool:
+        return servable(candidate.document)
 
     outcome = retrieve(
         conn, query, settings, _load_calibrations(conn), embedder=embedder, reranker=reranker,
-        allow_cache_writes=allow_cache_writes, keep=keep,
+        allow_cache_writes=allow_cache_writes, keep=keep, kinds=kinds, document_filter=servable,
     )
     selected = outcome.selected if limit is None else outcome.selected[:limit]
     rendered, kept = _render_blocks(selected, query.requested_codepoint_budget, query.query_text)

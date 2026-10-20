@@ -134,16 +134,26 @@ def stored_vector(conn, document_id: str, content_sha256: str, fingerprint: str,
     return _json_vector(row[0]) if row else None
 
 
-def dense_candidates(conn, query_vector, fingerprint: str, allowed_kinds, limit: int = 200) -> list[tuple[str, float]]:
+_ELIGIBILITY_CHUNK = 200
+
+
+def dense_candidates(conn, query_vector, fingerprint: str, allowed_kinds, limit: int = 200, *,
+                     exclude_ids=(), eligible=None) -> list[tuple[str, float]]:
     """Scan current-revision vectors of one fingerprint; return positive ``(document_id, cosine)`` descending.
 
     Only rows whose ``(document_id, content_sha256)`` matches a current
     recall document of an allowed kind are read, so orphaned or stale vectors
-    and vectors of another model or dimension are never compared.
+    and vectors of another model or dimension are never compared. Everything
+    a caller excludes is dropped before ``limit``, so it can never take an
+    eligible document's place: ``allowed_kinds`` in the query,
+    ``exclude_ids`` during the scan, and ``eligible`` (a function from a list
+    of IDs to the eligible subset, for checks that need the document) over
+    the score-ordered list in chunks until ``limit`` eligible IDs are found.
     """
     kinds = tuple(dict.fromkeys(allowed_kinds))
     if limit <= 0 or not kinds or not has_vector_blob(conn):
         return []
+    excluded = frozenset(exclude_ids)
     query = normalize_vector(query_vector)
     dimension = len(query)
     rows = conn.execute(
@@ -155,6 +165,8 @@ def dense_candidates(conn, query_vector, fingerprint: str, allowed_kinds, limit:
     mul = operator.mul
     scored: list[tuple[str, float]] = []
     for document_id, blob, row_dimension, raw in rows:
+        if document_id in excluded:
+            continue
         if blob is not None:
             if row_dimension != dimension or len(blob) != 4 * dimension:
                 continue
@@ -169,4 +181,14 @@ def dense_candidates(conn, query_vector, fingerprint: str, allowed_kinds, limit:
         if math.isfinite(cosine) and cosine > 0:
             scored.append((document_id, cosine))
     scored.sort(key=lambda item: (-item[1], item[0]))
-    return scored[:limit]
+    if eligible is None:
+        return scored[:limit]
+    kept: list[tuple[str, float]] = []
+    chunk = max(limit, _ELIGIBILITY_CHUNK)
+    for start in range(0, len(scored), chunk):
+        part = scored[start:start + chunk]
+        allowed = eligible([document_id for document_id, _cosine in part])
+        kept.extend(item for item in part if item[0] in allowed)
+        if len(kept) >= limit:
+            break
+    return kept[:limit]

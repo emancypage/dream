@@ -260,7 +260,10 @@ def test_usage_only_reorders_within_exact_ties(tmp_path):
 # queries of the 10,000-document store, whose candidate pool the bound leaves
 # as it was. Session starts on the large store match paths over a bounded
 # pool by design (test_session_start_pool_is_bounded_on_a_large_store); their
-# bounded output was captured at 06b1cbe in lexical-golden-bounded.json. Set
+# bounded output was captured at 06b1cbe in lexical-golden-bounded.json. The
+# four prompt-excluded embedder records were updated when session exclusions
+# moved before the dense-candidate limit: the excluded documents no longer take
+# dense slots, so one more eligible candidate enters. Set
 # DREAM_UPDATE_GOLDEN=1 only for an intentional, reviewed ranking change.
 
 GOLDEN = Path(__file__).parent / "fixtures" / "recall" / "lexical-golden.json"
