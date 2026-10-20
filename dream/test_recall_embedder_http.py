@@ -11,6 +11,7 @@ import json
 import re
 import socket
 import sqlite3
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -109,7 +110,9 @@ class _QuietServer(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         # Clients that time out or abort on purpose reset the connection; a
         # traceback printed here would land in a later test's captured stderr.
-        pass
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
 
 
 class FakeEmbeddingServer:
