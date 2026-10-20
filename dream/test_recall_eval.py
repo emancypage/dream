@@ -104,7 +104,8 @@ _REPORT_FIELDS = {
     "empty_result_correctness", "duplicate_count", "codepoints", "p50_latency_ms", "p95_latency_ms",
     "calibration_version", "query_count",
 }
-_SLICE_FIELDS = {"recall_at_1", "recall_at_5", "mrr", "forbidden_count", "p95_latency_ms", "query_count", "fallback_count"}
+_SLICE_FIELDS = {"recall_at_1", "recall_at_5", "mrr", "forbidden_count", "p95_latency_ms", "query_count", "fallback_count",
+                 "retrieval_recall_at_1", "retrieval_recall_at_5", "retrieval_mrr", "retrieval_forbidden_count"}
 
 
 def test_report_breaks_down_by_language_and_mode(tmp_path):
@@ -451,7 +452,7 @@ def test_cached_calibration_sweep_is_as_good_as_the_naive_one(tmp_path):
             rows = recall_eval._run_queries(data, conn, settings, {mode: {"threshold": threshold}}, embedder=embedder)
             cuts = []
             for item, row in zip(data["queries"], rows):
-                ids = row["selected_ids"]
+                ids = row["delivered_ids"]
                 relevant = row["relevant"]
                 cuts.append((bool(relevant), recall_eval._Cut(
                     min(row["ranks"]) if row["ranks"] else None,
@@ -481,3 +482,94 @@ def test_apply_refuses_a_zero_threshold_for_the_embedder_mode(tmp_path, monkeypa
         calibrate_fixture_file(fixture, _open_ephemeral_eval_db(), "lexical_plus_embedder", embedder=TopicEmbedder(), require_usable=True)
     # Lexical keeps today's behaviour: a 0.0 threshold is accepted.
     assert calibrate_fixture_file(fixture, _open_ephemeral_eval_db(), "lexical", require_usable=True).threshold == 0.0
+
+
+# --- gate metrics score the context an agent actually receives ------------------
+
+
+def _budget_fixture(tmp_path):
+    """Five long, equally ranked matches; the relevant one is fifth and the first four fill 4,000 code points."""
+    documents = [{"id": str(index), "source_kind": "approved_memory", "trust_level": "user_approved", "project_slug": None,
+                  "source_path": f"{index}.md", "source_updated_at": "2026-01-01T00:00:00Z", "source_version": "v1",
+                  "text": f"alpha record {index} " + "details " * 200} for index in range(5)]
+    queries = [
+        {"id": "relevant-fifth", "event": "prompt", "query": "alpha", "language": "en", "relevant": ["4"]},
+        {"id": "forbidden-fifth", "event": "prompt", "query": "alpha", "language": "en", "relevant": ["0"], "forbidden": ["4"]},
+    ]
+    fixture = tmp_path / "budget.json"
+    fixture.write_text(json.dumps({"documents": documents, "queries": queries}), encoding="utf-8")
+    return fixture, {"documents": documents, "queries": queries}
+
+
+def test_gate_metrics_count_only_documents_inside_the_rendered_budget(tmp_path):
+    from dream import _open_ephemeral_eval_db
+    from recall_context import recall_for_agent
+    from recall_eval import _ensure_documents, _run_queries
+    fixture, data = _budget_fixture(tmp_path)
+    conn = _open_ephemeral_eval_db()
+    _ensure_documents(conn, data["documents"])
+    first, second = _run_queries(data, conn, _settings(), {})
+    assert first["selected_ids"] == ["0", "1", "2", "3", "4"]
+    assert first["delivered_ids"] == ["0", "1", "2", "3"]
+    assert first["ranks"] == [] and first["retrieval_ranks"] == [5]
+    assert second["forbidden"] == 0 and second["retrieval_forbidden"] == 1
+    # The evaluator delivers exactly what the agent query renders.
+    agent = recall_for_agent(conn, _settings(), query_text="alpha", cwd=None, memory_root=None, constitution_path=None, limit=10)
+    assert [candidate.document.id for candidate in agent.selected] == first["delivered_ids"]
+    assert first["codepoints"] == len(agent.rendered_context) == 4000
+
+    report = evaluate_fixture_file(fixture, _open_ephemeral_eval_db(), _settings())
+    lexical = report.breakdown_dict()["lexical"]["all"]
+    assert (report.recall_at_5, report.mrr, report.forbidden_count) == (0.5, 0.5, 0)
+    assert (lexical["recall_at_5"], lexical["retrieval_recall_at_5"]) == (0.5, 1.0)
+    assert (lexical["forbidden_count"], lexical["retrieval_forbidden_count"]) == (0, 1)
+    assert report.retrieval == {"recall_at_1": 0.5, "recall_at_3": 0.5, "recall_at_5": 1.0, "mrr": pytest.approx(0.6),
+                                "forbidden_count": 1}
+    assert set(report.to_dict()) == _REPORT_FIELDS
+
+
+def test_recall_eval_cli_keeps_its_default_shape_and_adds_retrieval_numbers_with_by_language(tmp_path, capsys):
+    import argparse
+    from config import load_config
+    from dream import cmd_recall_eval
+    fixture, _data = _budget_fixture(tmp_path)
+    config = load_config(tmp_path / "missing.toml")
+    assert cmd_recall_eval(argparse.Namespace(fixtures=fixture, db=tmp_path / "dream.db", config=config)) == 0
+    plain = json.loads(capsys.readouterr().out)
+    assert set(plain) == _REPORT_FIELDS and plain["recall_at_5"] == 0.5
+    assert cmd_recall_eval(argparse.Namespace(fixtures=fixture, db=tmp_path / "dream.db", config=config, by_language=True)) == 0
+    detailed = json.loads(capsys.readouterr().out)
+    assert detailed["retrieval"]["recall_at_5"] == 1.0
+    assert detailed["breakdown"]["lexical"]["en"]["retrieval_recall_at_5"] == 1.0
+
+
+def _stub_candidate(doc_id, score, *, long):
+    from recall_types import RecallCandidate, RecallDocument
+    text = f"note {doc_id} " + ("filler words here " * 80 if long else "short")
+    document = RecallDocument(doc_id, f"sha-{doc_id}", "approved_memory", "user_approved", None, f"{doc_id}.md",
+                              "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "v1", text)
+    return RecallCandidate(document, text, {"fts": 1}, score, 1)
+
+
+def test_calibration_scores_delivered_context_and_that_changes_the_threshold():
+    from types import SimpleNamespace
+    from recall_eval import _query, _query_cuts, _sweep
+    settings = _settings()
+    # Q1: four long irrelevant documents outscore the relevant one, which is selected fifth but never rendered.
+    q1 = {"query": "alpha", "relevant": ["r1"]}
+    q1_outcome = SimpleNamespace(mode="lexical", candidates=tuple(
+        [_stub_candidate(f"a{index}", 0.5, long=True) for index in range(4)] + [_stub_candidate("r1", 0.3, long=False)]))
+    # Q2: the relevant document leads; a short irrelevant one follows at a lower score.
+    q2 = {"query": "beta", "relevant": ["r2"]}
+    q2_outcome = SimpleNamespace(mode="lexical", candidates=(_stub_candidate("r2", 0.6, long=False), _stub_candidate("n2", 0.35, long=False)))
+    per_query = []
+    for item, outcome in ((q1, q1_outcome), (q2, q2_outcome)):
+        cuts, rows = _query_cuts(item, _query(item, settings), outcome, settings, "lexical")
+        per_query.append((True, cuts, rows))
+    # Q1's relevant document is never delivered, at any threshold.
+    assert all(row.best_rank is None for row in per_query[0][2])
+    key, threshold = _sweep(per_query, embedder_mode=False)
+    # Scored on selection, 0.3 would win (Q1 at rank 5 adds MRR 0.2). Delivered, Q1 never counts, so the
+    # threshold that drops Q2's irrelevant document wins: the middle of (0.35, 0.5].
+    assert threshold == pytest.approx(0.425)
+    assert key[:3] == (0.5, 0.5, 0.5)

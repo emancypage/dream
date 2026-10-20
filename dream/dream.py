@@ -1409,6 +1409,8 @@ def cmd_recall_eval(args: argparse.Namespace) -> int:
     result = report.to_dict()
     if getattr(args, "by_language", False):
         result["breakdown"] = report.breakdown_dict()
+        # The headline metrics score the delivered context; these score selection before rendering.
+        result["retrieval"] = report.retrieval
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
 

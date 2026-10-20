@@ -15,7 +15,7 @@ from recall_adapters import adapter_fingerprint
 from recall_context import EMBEDDER_MODE, retrieve, with_adapters
 from recall_documents import embed_recall_documents
 from recall_query import rank_lexical
-from recall_render import render_context
+from recall_render import _render_blocks
 from recall_select import embedder_calibration_version, select_recall_candidates
 from recall_types import CalibrationRecord, RecallQuery, RecallSettings
 
@@ -27,7 +27,13 @@ ALL_LANGUAGES = "all"
 
 @dataclass(frozen=True)
 class SliceMetrics:
-    """Headline retrieval metrics for one (mode, language) slice of a fixture."""
+    """Headline metrics for one (mode, language) slice of a fixture.
+
+    Recall, MRR and the forbidden count describe the delivered context: the
+    candidates whose block fits the rendered budget, which is what an agent
+    receives and what the release gate reads. The ``retrieval_*`` fields
+    score the selection before rendering, for diagnosis only.
+    """
 
     recall_at_1: float
     recall_at_5: float
@@ -36,6 +42,10 @@ class SliceMetrics:
     p95_latency_ms: float
     query_count: int
     fallback_count: int
+    retrieval_recall_at_1: float = 0.0
+    retrieval_recall_at_5: float = 0.0
+    retrieval_mrr: float = 0.0
+    retrieval_forbidden_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -56,6 +66,10 @@ class EvaluationReport:
     # {mode: {language: SliceMetrics}}; kept out of to_dict() so the default
     # report stays byte-for-byte what it was before the breakdown existed.
     breakdown: dict = field(default_factory=dict, compare=False)
+    # The top-level metrics above score the delivered context; these score the
+    # selection before rendering (recall_at_1/3/5, mrr, forbidden_count), for
+    # diagnosis. Also kept out of to_dict().
+    retrieval: dict = field(default_factory=dict, compare=False)
 
     @property
     def metrics(self) -> dict:
@@ -64,6 +78,7 @@ class EvaluationReport:
     def to_dict(self) -> dict:
         data = asdict(self)
         data.pop("breakdown")
+        data.pop("retrieval")
         return data
 
     def breakdown_dict(self) -> dict:
@@ -130,7 +145,10 @@ def _run_queries(data: dict, conn, settings: RecallSettings, calibration: dict, 
     """Run every fixture query once and keep per-query evidence for aggregation.
 
     Queries go through the same ``retrieve`` pipeline as the recall hooks,
-    read-only: the dense list, the rescore and the per-mode threshold.
+    read-only: the dense list, the rescore and the per-mode threshold, and
+    then the same one-pass ``_render_blocks``. ``ranks`` and ``forbidden``
+    count the delivered candidates, whose block fits the budget; the
+    ``retrieval_*`` evidence counts the selection before rendering.
     """
     outcomes: list[dict] = []
     for item in data["queries"]:
@@ -143,40 +161,53 @@ def _run_queries(data: dict, conn, settings: RecallSettings, calibration: dict, 
                            require_calibration=False)
         fallback = outcome.fallback_reason
         selected = outcome.selected
-        rendered = render_context(selected, query.requested_codepoint_budget, query.query_text)
+        rendered, delivered = _render_blocks(selected, query.requested_codepoint_budget, query.query_text)
         latency = (time.perf_counter() - started) * 1000
         selected_ids = [candidate.document.id for candidate in selected]
+        delivered_ids = [candidate.document.id for candidate in delivered]
         relevant = _relevant(item)
+        forbidden = set(item.get("forbidden", ()))
         outcomes.append({
             "language": language,
             "latency": latency,
             "selected_ids": selected_ids,
+            "delivered_ids": delivered_ids,
             "relevant": relevant,
-            "ranks": [index + 1 for index, doc_id in enumerate(selected_ids) if doc_id in relevant],
-            "forbidden": len(set(item.get("forbidden", ())).intersection(selected_ids)),
-            "duplicates": len(selected_ids) - len({candidate.document.content_sha256 for candidate in selected}),
+            "ranks": _ranks(delivered_ids, relevant),
+            "forbidden": len(forbidden.intersection(delivered_ids)),
+            "retrieval_ranks": _ranks(selected_ids, relevant),
+            "retrieval_forbidden": len(forbidden.intersection(selected_ids)),
+            "duplicates": len(delivered_ids) - len({candidate.document.content_sha256 for candidate in delivered}),
             "codepoints": len(rendered),
             "fallback": fallback is not None,
         })
     return outcomes
 
 
-def _ranked_metrics(outcomes: list[dict]) -> tuple[float, float, float, float]:
+def _ranks(ids: list[str], relevant: set) -> list[int]:
+    return [index + 1 for index, doc_id in enumerate(ids) if doc_id in relevant]
+
+
+def _ranked_metrics(outcomes: list[dict], ranks: str = "ranks") -> tuple[float, float, float, float]:
+    """Recall@1/@3/@5 and MRR over queries with relevant documents, from the ``ranks`` field named."""
     rows = [outcome for outcome in outcomes if outcome["relevant"]]
     def at(k: int) -> float:
-        return sum(1 for row in rows if any(rank <= k for rank in row["ranks"])) / len(rows) if rows else 0.0
-    mrr = sum(1 / min(row["ranks"]) for row in rows if row["ranks"]) / len(rows) if rows else 0.0
+        return sum(1 for row in rows if any(rank <= k for rank in row[ranks])) / len(rows) if rows else 0.0
+    mrr = sum(1 / min(row[ranks]) for row in rows if row[ranks]) / len(rows) if rows else 0.0
     return at(1), at(3), at(5), mrr
 
 
 def _slice(outcomes: list[dict]) -> SliceMetrics:
     recall_at_1, _recall_at_3, recall_at_5, mrr = _ranked_metrics(outcomes)
+    retrieval_at_1, _retrieval_at_3, retrieval_at_5, retrieval_mrr = _ranked_metrics(outcomes, "retrieval_ranks")
     return SliceMetrics(
         recall_at_1, recall_at_5, mrr,
         sum(outcome["forbidden"] for outcome in outcomes),
         _p95([outcome["latency"] for outcome in outcomes]),
         len(outcomes),
         sum(1 for outcome in outcomes if outcome["fallback"]),
+        retrieval_at_1, retrieval_at_5, retrieval_mrr,
+        sum(outcome["retrieval_forbidden"] for outcome in outcomes),
     )
 
 
@@ -229,9 +260,10 @@ def _evaluate(data: dict, conn, settings: RecallSettings, threshold: float | Non
     all_forbidden = sum(outcome["forbidden"] for outcome in lexical)
     duplicate_count = sum(outcome["duplicates"] for outcome in lexical)
     total_codepoints = sum(outcome["codepoints"] for outcome in lexical)
-    empty_correct = [1.0 if not outcome["selected_ids"] else 0.0 for outcome in lexical if not outcome["relevant"]]
+    empty_correct = [1.0 if not outcome["delivered_ids"] else 0.0 for outcome in lexical if not outcome["relevant"]]
     query_count = len(data["queries"])
     recall_at_1, recall_at_3, recall_at_5, mrr = _ranked_metrics(lexical)
+    retrieval_at_1, retrieval_at_3, retrieval_at_5, retrieval_mrr = _ranked_metrics(lexical, "retrieval_ranks")
     injected = [row for row in data["queries"] if row.get("injected")]
     injected_hits = sum(1 for row in injected if set(row.get("injected", ())).intersection({candidate.document.id for candidate in rank_lexical(conn, _query(row, settings))}))
     injected_precision = injected_hits / len(injected) if injected else 1.0
@@ -243,6 +275,8 @@ def _evaluate(data: dict, conn, settings: RecallSettings, threshold: float | Non
         _p95(latencies),
         None, query_count,
         {name: _breakdown(values) for name, values in outcomes.items()},
+        {"recall_at_1": retrieval_at_1, "recall_at_3": retrieval_at_3, "recall_at_5": retrieval_at_5,
+         "mrr": retrieval_mrr, "forbidden_count": sum(outcome["retrieval_forbidden"] for outcome in lexical)},
     )
 
 
@@ -275,20 +309,27 @@ class _Cut:
 
 
 def _query_cuts(item: dict, query: RecallQuery, outcome, settings: RecallSettings, mode: str) -> tuple[list[float], list[_Cut]]:
-    """Selection evidence of one retrieved query for each distinct score cut.
+    """Delivered-context evidence of one retrieved query for each distinct score cut.
 
     A threshold ``t`` keeps the candidates scoring at least ``t``, so the
     query has one selection per distinct candidate score plus "nothing
-    passes". Only selection reruns here; ranking ran once.
+    passes". Ranking ran once; selection and the one-pass ``_render_blocks``
+    rerun per cut, and only the candidates whose block fits the budget count.
+    Identical selections are rendered once.
     """
     cuts = sorted({candidate.score for candidate in outcome.candidates})
     relevant = _relevant(item)
     forbidden = set(item.get("forbidden", ()))
+    rendered: dict[tuple[str, ...], list[str]] = {}
     rows: list[_Cut] = []
     for value in [*cuts, float("inf")]:
         selected = select_recall_candidates(outcome.candidates, query, settings, {mode: {"threshold": value}}, mode=outcome.mode)
-        ids = [candidate.document.id for candidate in selected]
-        ranks = [index + 1 for index, doc_id in enumerate(ids) if doc_id in relevant]
+        selection = tuple(candidate.document.id for candidate in selected)
+        if selection not in rendered:
+            _text, delivered = _render_blocks(selected, query.requested_codepoint_budget, query.query_text)
+            rendered[selection] = [candidate.document.id for candidate in delivered]
+        ids = rendered[selection]
+        ranks = _ranks(ids, relevant)
         rows.append(_Cut(min(ranks) if ranks else None,
                          len(relevant.intersection(ids)) / len(ids) if ids else 0.0,
                          len(forbidden.intersection(ids))))
@@ -298,11 +339,12 @@ def _query_cuts(item: dict, query: RecallQuery, outcome, settings: RecallSetting
 def calibration_key(rows: list[tuple[bool, _Cut]], threshold: float) -> tuple[float, float, float, float]:
     """Order thresholds: MRR, then Recall@3, then precision, then the lower threshold.
 
-    ``rows`` holds ``(has_relevant, cut)`` per query. Precision is the mean
-    share of relevant documents among the selected ones (0 when nothing is
-    selected) over queries with relevant documents; without it every tie went
-    to the lowest threshold, which selects everything. Any forbidden result
-    disqualifies the threshold.
+    ``rows`` holds ``(has_relevant, cut)`` per query, scored on the delivered
+    context. Precision is the mean share of relevant documents among the
+    delivered ones (0 when nothing is delivered) over queries with relevant
+    documents; without it every tie went to the lowest threshold, which
+    selects everything. Any delivered forbidden result disqualifies the
+    threshold.
     """
     answerable = [cut for has_relevant, cut in rows if has_relevant]
     if any(cut.forbidden for _has_relevant, cut in rows):
@@ -313,6 +355,30 @@ def calibration_key(rows: list[tuple[bool, _Cut]], threshold: float) -> tuple[fl
     recall_at_3 = sum(1 for cut in answerable if cut.best_rank and cut.best_rank <= 3) / len(answerable)
     precision = sum(cut.precision for cut in answerable) / len(answerable)
     return mrr, recall_at_3, precision, -threshold
+
+
+def _sweep(per_query, *, embedder_mode: bool) -> tuple[tuple[float, float, float, float], float] | None:
+    """The best ``(key, threshold)`` over every swept threshold; None without one.
+
+    ``per_query`` holds ``(has_relevant, cuts, cut_rows)`` from ``_query_cuts``.
+    The lexical sweep also tries 0.0, as it always has; the embedder mode
+    sweeps only observed fused scores.
+    """
+    scores: set[float] = set() if embedder_mode else {0.0}
+    for _has_relevant, cuts, _rows in per_query:
+        scores.update(cuts)
+    best: tuple[tuple[float, float, float, float], float] | None = None
+    swept = sorted(scores)
+    for index, threshold in enumerate(swept):
+        rows = [(has_relevant, cut_rows[bisect.bisect_left(cuts, threshold)]) for has_relevant, cuts, cut_rows in per_query]
+        key = calibration_key(rows, threshold)
+        if best is None or key > best[0]:
+            # Every value in (previous swept score, threshold] selects the same
+            # fixture results; report the middle of that interval, so a score
+            # that moves slightly on the live index does not fall off the edge.
+            lower = swept[index - 1] if index else 0.0
+            best = (key, (lower + threshold) / 2 if threshold > 0 else threshold)
+    return best
 
 
 def calibrate_fixture_file(path, conn, mode: str, *, embedder=None, require_usable: bool = False) -> CalibrationRecord:
@@ -344,9 +410,8 @@ def calibrate_fixture_file(path, conn, mode: str, *, embedder=None, require_usab
     else:
         embedder = None
         run_settings = _lexical_settings(settings)
-    # Rank every query once; each threshold then only looks up its selection.
+    # Rank every query once; each threshold then only looks up its delivered context.
     per_query = []
-    scores: set[float] = set() if embedder_mode else {0.0}
     for item in data["queries"]:
         query = _query(item, settings)
         outcome = retrieve(conn, query, run_settings, {}, embedder=embedder, require_calibration=False)
@@ -354,18 +419,7 @@ def calibrate_fixture_file(path, conn, mode: str, *, embedder=None, require_usab
             raise ValueError(f"embedder mode fell back during calibration: {outcome.fallback_reason}")
         cuts, rows = _query_cuts(item, query, outcome, run_settings, mode)
         per_query.append((bool(_relevant(item)), cuts, rows))
-        scores.update(cuts)
-    best: tuple[tuple[float, float, float, float], float] | None = None
-    swept = sorted(scores)
-    for index, threshold in enumerate(swept):
-        rows = [(has_relevant, cut_rows[bisect.bisect_left(cuts, threshold)]) for has_relevant, cuts, cut_rows in per_query]
-        key = calibration_key(rows, threshold)
-        if best is None or key > best[0]:
-            # Every value in (previous swept score, threshold] selects the same
-            # fixture results; report the middle of that interval, so a score
-            # that moves slightly on the live index does not fall off the edge.
-            lower = swept[index - 1] if index else 0.0
-            best = (key, (lower + threshold) / 2 if threshold > 0 else threshold)
+    best = _sweep(per_query, embedder_mode=embedder_mode)
     if require_usable:
         if best is None or best[0][0] < 0:
             raise ValueError("refusing --apply: every threshold returns a forbidden result")
