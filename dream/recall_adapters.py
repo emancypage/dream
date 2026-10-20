@@ -364,6 +364,10 @@ def embedder_fallback_reason(exc: Exception) -> str:
     return "embedder-unavailable" if isinstance(exc, EmbedderUnavailable) else f"embedder-error:{type(exc).__name__}"
 
 
+# The trust order rank_lexical ties on; the usage tie-break below follows it.
+_TRUST_ORDER = {"user_approved": 0, "model_distilled": 1, "untrusted_transcript": 2}
+
+
 def apply_optional_adapters(conn, query: RecallQuery, candidates: list[RecallCandidate], settings, *, embedder=None, reranker=None, allow_cache_writes: bool = False, query_vector=None, usage=None) -> tuple[list[RecallCandidate], str, str | None]:
     """Enhance lexical candidates, preserving them unchanged on any adapter error.
 
@@ -373,11 +377,15 @@ def apply_optional_adapters(conn, query: RecallQuery, candidates: list[RecallCan
     a candidate without a stored vector keeps its score, and the mode stays
     ``lexical`` unless at least one candidate was rescored. ``usage`` (passed
     only with ``recall.usage_tie_break``) breaks exact score ties after a
-    rescore, as in ``rank_lexical``; without it the order is unchanged.
+    rescore as in ``rank_lexical``: after trust, before the ID. Without it the
+    order is exactly score, then ID.
     """
 
     def rescored_order(candidate):
-        return (-candidate.score, -(usage or {}).get(candidate.document.id, (0,))[0], candidate.document.id)
+        if usage is None:
+            return (-candidate.score, candidate.document.id)
+        return (-candidate.score, _TRUST_ORDER.get(candidate.document.trust_level, 99),
+                -usage.get(candidate.document.id, (0,))[0], candidate.document.id)
 
     current = list(candidates)
     mode = "lexical"

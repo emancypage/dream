@@ -781,3 +781,25 @@ def test_retrieve_keeps_the_usage_tie_break_through_the_embedder_rescore(tmp_pat
     assert [c.document.id for c in outcome.candidates] == expected
     usage = {"y": (9, "2026-10-01T00:00:00Z")} if tie_break else None
     assert seen["rank"] == seen["adapters"] == usage
+
+
+@pytest.mark.parametrize("adapters", [{"embed": True}, {"rerank": True}])
+def test_rescored_ties_rank_trust_before_usage(tmp_path, adapters):
+    from dataclasses import replace
+
+    from recall_adapters import apply_optional_adapters
+
+    conn = _db(tmp_path)
+    query = RecallQuery("postgres", "s", "prompt", None, (), 4000, frozenset(), False)
+    x, y = _tied_candidates()
+    distilled = replace(x, document=replace(x.document, source_kind="distilled_summary", trust_level="model_distilled"))
+    candidates = [distilled, y]
+    kwargs = {"embedder": _FlatEmbedder(), "reranker": _FlatReranker(), "allow_cache_writes": True}
+    settings = _adapter_settings(**adapters)
+    on, mode, _fallback = apply_optional_adapters(conn, query, candidates, settings,
+                                                  usage={"x": (500, "2026-10-01T00:00:00Z")}, **kwargs)
+    assert mode != "lexical" and on[0].score == on[1].score
+    # The frequently used model_distilled x loses the tie to the user_approved y.
+    assert [(c.document.id, c.document.trust_level) for c in on] == [("y", "user_approved"), ("x", "model_distilled")]
+    off, _mode, _fallback = apply_optional_adapters(conn, query, candidates, settings, **kwargs)
+    assert [c.document.id for c in off] == ["x", "y"]  # switch off: score, then ID, exactly as before
