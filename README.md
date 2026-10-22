@@ -23,10 +23,10 @@ cd dream
 ./install.sh
 ```
 
-The installer creates two symlinks into your **current checkout directory** and, on first install, copies the default configuration:
+The installer creates symlinks into your **current checkout directory** and, on first install, copies the default configuration:
 
 - `dream/dream.py` → `~/.local/bin/dream`
-- `skill/` → `~/.codex/skills/dream`
+- `skill/` → `~/.codex/skills/dream` and `~/.claude/skills/dream`
 - `dream/default-config.toml` is copied to `~/.config/dream/config.toml`, only when no configuration file exists yet.
 
 Because the links point at the checkout, update in place:

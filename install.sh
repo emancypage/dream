@@ -3,11 +3,12 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-mkdir -p "$HOME/.local/bin" "$HOME/.codex/skills" "$HOME/.config/dream" "$HOME/.config/systemd/user"
+mkdir -p "$HOME/.local/bin" "$HOME/.codex/skills" "$HOME/.claude/skills" "$HOME/.config/dream" "$HOME/.config/systemd/user"
 ln -sfn "$REPO_DIR/dream/dream.py" "$HOME/.local/bin/dream"
 ln -sfn "$REPO_DIR/dream/metrics.py" "$HOME/.local/bin/dream-metrics"
 ln -sfn "$REPO_DIR/dream/stage_runner.py" "$HOME/.local/bin/dream-stage"
 ln -sfn "$REPO_DIR/skill" "$HOME/.codex/skills/dream"
+ln -sfn "$REPO_DIR/skill" "$HOME/.claude/skills/dream"
 install -m 0644 "$REPO_DIR/dream/systemd/dream.service" "$HOME/.config/systemd/user/dream.service"
 install -m 0644 "$REPO_DIR/dream/systemd/dream.timer" "$HOME/.config/systemd/user/dream.timer"
 install -m 0644 "$REPO_DIR/dream/systemd/dream-audit.service" "$HOME/.config/systemd/user/dream-audit.service"
@@ -21,7 +22,7 @@ fi
 echo "dream CLI -> $HOME/.local/bin/dream"
 echo "dream metrics -> $HOME/.local/bin/dream-metrics"
 echo "dream stage runner -> $HOME/.local/bin/dream-stage"
-echo "dream skill -> $HOME/.codex/skills/dream"
+echo "dream skill -> $HOME/.codex/skills/dream, $HOME/.claude/skills/dream"
 echo "dream config -> $HOME/.config/dream/config.toml"
 echo "systemd units -> $HOME/.config/systemd/user/ (run systemctl --user daemon-reload separately)"
 
