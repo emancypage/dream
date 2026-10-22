@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS distilled (
 CREATE TABLE IF NOT EXISTS suggestions (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
-    kind          TEXT NOT NULL,             -- 'new' | 'update' | 'remove' | 'index'
+    kind          TEXT NOT NULL,             -- 'new' | 'update' | 'remove' | 'index' | 'patch'
     target_path   TEXT NOT NULL,             -- relative under ~/.claude/memory or project memory
     body          TEXT NOT NULL,             -- proposed file content (full, not diff — diff computed at review time)
     rationale     TEXT,                       -- why this change
@@ -96,7 +96,8 @@ CREATE TABLE IF NOT EXISTS suggestions (
     sug_file      TEXT,                       -- filename of the preview .md under .suggestions/; review deletes it on resolve
     base_sha256   TEXT,
     target_existed INTEGER,
-    consolidation_run_id TEXT
+    consolidation_run_id TEXT,
+    find_text     TEXT                        -- 'patch' only: the exact span that body replaces
 );
 
 CREATE INDEX IF NOT EXISTS idx_suggestions_status ON suggestions(status);
@@ -155,7 +156,8 @@ CREATE TABLE IF NOT EXISTS recall_documents (
     source_updated_at TEXT NOT NULL,     -- UTC source timestamp
     indexed_at        TEXT NOT NULL,     -- UTC index timestamp
     source_version    TEXT NOT NULL,     -- ingest / distillation / file-revision identifier
-    text              TEXT NOT NULL      -- canonical searchable content (pre-render redaction)
+    text              TEXT NOT NULL,     -- canonical searchable content (pre-render redaction)
+    path_text         TEXT               -- recall_query.document_path_text(); NULL: computed when read
 );
 
 CREATE TABLE IF NOT EXISTS recall_events (
@@ -179,6 +181,9 @@ CREATE TABLE IF NOT EXISTS recall_calibrations (
     created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- dream.py _migrate() adds vector_blob BLOB (L2-normalized little-endian
+-- float32) and dimension INTEGER. Blob writers store '[]' in vector_json;
+-- readers use vector_json only when vector_blob is NULL.
 CREATE TABLE IF NOT EXISTS recall_embeddings (
     document_id         TEXT NOT NULL,
     content_sha256      TEXT NOT NULL,
@@ -224,6 +229,29 @@ CREATE TRIGGER IF NOT EXISTS recall_documents_ad AFTER DELETE ON recall_document
             old.source_kind, old.trust_level, old.project_slug, old.source_path,
             old.source_updated_at, old.indexed_at, old.source_version);
 END;
+
+-- How often automatic recall delivered each document, harvested by `dream ingest`
+-- from the hook lifecycle markers (hooks are read-only and never write here).
+-- Keyed by the stable recall document ID, so usage survives edits to a file.
+-- Evidence only: it breaks exact ranking ties (recall.usage_tie_break), annotates
+-- the subset and audit prompts and feeds `dream status --usage`; it never deletes.
+-- meta.recall_usage_since holds the start of the observation window.
+CREATE TABLE IF NOT EXISTS recall_usage (
+    document_id       TEXT PRIMARY KEY,
+    first_selected_at TEXT NOT NULL,     -- UTC, YYYY-MM-DDTHH:MM:SSZ
+    last_selected_at  TEXT NOT NULL,     -- UTC, YYYY-MM-DDTHH:MM:SSZ
+    select_count      INTEGER NOT NULL CHECK (select_count > 0)
+);
+
+-- Ledger of hook markers already counted into recall_usage, written in the same
+-- transaction as the counts. A marker found here is deleted, never recounted.
+-- Keyed by marker file name and finish time; rows older than 30 days are pruned.
+CREATE TABLE IF NOT EXISTS recall_usage_markers (
+    name        TEXT NOT NULL,           -- marker file name in the hook state directory
+    finished_at TEXT NOT NULL,           -- the marker's finished_at, YYYY-MM-DDTHH:MM:SSZ
+    counted_at  TEXT NOT NULL,           -- when the harvest counted it, same format
+    PRIMARY KEY (name, finished_at)
+);
 
 CREATE TABLE IF NOT EXISTS character_constitutions (
  id TEXT PRIMARY KEY,

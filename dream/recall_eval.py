@@ -2,18 +2,50 @@
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import statistics
 import time
 import datetime as dt
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from recall_adapters import adapter_fingerprint
+from recall_context import EMBEDDER_MODE, retrieve, with_adapters
+from recall_documents import embed_recall_documents
 from recall_query import rank_lexical
-from recall_render import render_context
-from recall_select import select_recall_candidates
+from recall_render import _render_blocks
+from recall_select import embedder_calibration_version, select_recall_candidates
 from recall_types import CalibrationRecord, RecallQuery, RecallSettings
+
+# Every fixture under the repository's fixtures directory is public by definition.
+FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures"
+UNTAGGED_LANGUAGE = "untagged"
+ALL_LANGUAGES = "all"
+
+
+@dataclass(frozen=True)
+class SliceMetrics:
+    """Headline metrics for one (mode, language) slice of a fixture.
+
+    Recall, MRR and the forbidden count describe the delivered context: the
+    candidates whose block fits the rendered budget, which is what an agent
+    receives and what the release gate reads. The ``retrieval_*`` fields
+    score the selection before rendering, for diagnosis only.
+    """
+
+    recall_at_1: float
+    recall_at_5: float
+    mrr: float
+    forbidden_count: int
+    p95_latency_ms: float
+    query_count: int
+    fallback_count: int
+    retrieval_recall_at_1: float = 0.0
+    retrieval_recall_at_5: float = 0.0
+    retrieval_mrr: float = 0.0
+    retrieval_forbidden_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -31,13 +63,29 @@ class EvaluationReport:
     p95_latency_ms: float
     calibration_version: str | None
     query_count: int
+    # {mode: {language: SliceMetrics}}; kept out of to_dict() so the default
+    # report stays byte-for-byte what it was before the breakdown existed.
+    breakdown: dict = field(default_factory=dict, compare=False)
+    # The top-level metrics above score the delivered context; these score the
+    # selection before rendering (recall_at_1/3/5, mrr, forbidden_count), for
+    # diagnosis. Also kept out of to_dict().
+    retrieval: dict = field(default_factory=dict, compare=False)
 
     @property
     def metrics(self) -> dict:
-        return asdict(self)
+        return self.to_dict()
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        data.pop("breakdown")
+        data.pop("retrieval")
+        return data
+
+    def breakdown_dict(self) -> dict:
+        return {
+            mode: {language: asdict(values) for language, values in sorted(languages.items())}
+            for mode, languages in self.breakdown.items()
+        }
 
 
 def _canonical(data: dict) -> bytes:
@@ -84,77 +132,339 @@ def _query(item: dict, settings: RecallSettings) -> RecallQuery:
     )
 
 
-def _evaluate(data: dict, conn, settings: RecallSettings, threshold: float | None = None) -> EvaluationReport:
-    _ensure_documents(conn, data["documents"])
-    rows: list[dict] = []
-    latencies: list[float] = []
-    all_forbidden = 0
-    duplicate_count = 0
-    total_codepoints = 0
-    empty_correct: list[float] = []
-    mode = "lexical"
-    calibration = {mode: {"threshold": threshold}} if threshold is not None else {}
+def _relevant(item: dict) -> set:
+    # Public fixtures say "relevant"; generated private fixtures say "expected_ids".
+    return set(item["relevant"] if "relevant" in item else item.get("expected_ids", ()))
+
+
+def _p95(latencies: list[float]) -> float:
+    return sorted(latencies)[max(0, int(len(latencies) * 0.95) - 1)] if latencies else 0.0
+
+
+def _run_queries(data: dict, conn, settings: RecallSettings, calibration: dict, embedder=None) -> list[dict]:
+    """Run every fixture query once and keep per-query evidence for aggregation.
+
+    Queries go through the same ``retrieve`` pipeline as the recall hooks,
+    read-only: the dense list, the rescore and the per-mode threshold, and
+    then the same one-pass ``_render_blocks``. ``ranks`` and ``forbidden``
+    count the delivered candidates, whose block fits the budget; the
+    ``retrieval_*`` evidence counts the selection before rendering.
+    """
+    outcomes: list[dict] = []
     for item in data["queries"]:
+        language = str(item.get("language") or UNTAGGED_LANGUAGE)
+        if language == ALL_LANGUAGES:
+            raise ValueError(f"fixture query language {ALL_LANGUAGES!r} is reserved for the aggregate slice")
         query = _query(item, settings)
         started = time.perf_counter()
-        candidates = rank_lexical(conn, query)
-        selected = select_recall_candidates(candidates, query, settings, calibration)
-        rendered = render_context(selected, query.requested_codepoint_budget, query.query_text)
-        latencies.append((time.perf_counter() - started) * 1000)
+        outcome = retrieve(conn, query, settings, calibration, embedder=embedder, allow_cache_writes=False,
+                           require_calibration=False)
+        fallback = outcome.fallback_reason
+        selected = outcome.selected
+        rendered, delivered = _render_blocks(selected, query.requested_codepoint_budget, query.query_text)
+        latency = (time.perf_counter() - started) * 1000
         selected_ids = [candidate.document.id for candidate in selected]
-        relevant = set(item.get("relevant", ()))
+        delivered_ids = [candidate.document.id for candidate in delivered]
+        relevant = _relevant(item)
         forbidden = set(item.get("forbidden", ()))
-        all_forbidden += len(forbidden.intersection(selected_ids))
-        duplicate_count += len(selected_ids) - len({candidate.document.content_sha256 for candidate in selected})
-        total_codepoints += len(rendered)
-        if relevant:
-            ranks = [index + 1 for index, doc_id in enumerate(selected_ids) if doc_id in relevant]
-            rows.append({"ranks": ranks, "relevant": relevant})
-        else:
-            empty_correct.append(1.0 if not selected_ids else 0.0)
-    query_count = len(data["queries"])
+        outcomes.append({
+            "language": language,
+            "latency": latency,
+            "selected_ids": selected_ids,
+            "delivered_ids": delivered_ids,
+            "relevant": relevant,
+            "ranks": _ranks(delivered_ids, relevant),
+            "forbidden": len(forbidden.intersection(delivered_ids)),
+            "retrieval_ranks": _ranks(selected_ids, relevant),
+            "retrieval_forbidden": len(forbidden.intersection(selected_ids)),
+            "duplicates": len(delivered_ids) - len({candidate.document.content_sha256 for candidate in delivered}),
+            "codepoints": len(rendered),
+            "fallback": fallback is not None,
+        })
+    return outcomes
+
+
+def _ranks(ids: list[str], relevant: set) -> list[int]:
+    return [index + 1 for index, doc_id in enumerate(ids) if doc_id in relevant]
+
+
+def _ranked_metrics(outcomes: list[dict], ranks: str = "ranks") -> tuple[float, float, float, float]:
+    """Recall@1/@3/@5 and MRR over queries with relevant documents, from the ``ranks`` field named."""
+    rows = [outcome for outcome in outcomes if outcome["relevant"]]
     def at(k: int) -> float:
-        return sum(1 for row in rows if any(rank <= k for rank in row["ranks"])) / len(rows) if rows else 0.0
-    mrr = sum(1 / min(row["ranks"]) for row in rows if row["ranks"]) / len(rows) if rows else 0.0
+        return sum(1 for row in rows if any(rank <= k for rank in row[ranks])) / len(rows) if rows else 0.0
+    mrr = sum(1 / min(row[ranks]) for row in rows if row[ranks]) / len(rows) if rows else 0.0
+    return at(1), at(3), at(5), mrr
+
+
+def _slice(outcomes: list[dict]) -> SliceMetrics:
+    recall_at_1, _recall_at_3, recall_at_5, mrr = _ranked_metrics(outcomes)
+    retrieval_at_1, _retrieval_at_3, retrieval_at_5, retrieval_mrr = _ranked_metrics(outcomes, "retrieval_ranks")
+    return SliceMetrics(
+        recall_at_1, recall_at_5, mrr,
+        sum(outcome["forbidden"] for outcome in outcomes),
+        _p95([outcome["latency"] for outcome in outcomes]),
+        len(outcomes),
+        sum(1 for outcome in outcomes if outcome["fallback"]),
+        retrieval_at_1, retrieval_at_5, retrieval_mrr,
+        sum(outcome["retrieval_forbidden"] for outcome in outcomes),
+    )
+
+
+def _breakdown(outcomes: list[dict]) -> dict[str, SliceMetrics]:
+    languages = sorted({outcome["language"] for outcome in outcomes})
+    result = {ALL_LANGUAGES: _slice(outcomes)}
+    for language in languages:
+        result[language] = _slice([outcome for outcome in outcomes if outcome["language"] == language])
+    return result
+
+
+def _lexical_settings(settings: RecallSettings) -> RecallSettings:
+    # The lexical baseline never consults an adapter, whatever the configuration says.
+    return with_adapters(settings, embedder=False, reranker=False)
+
+
+def _embedder_settings(settings: RecallSettings) -> RecallSettings:
+    # Measure the embedder alone: force it on and keep the reranker out of the mode.
+    return with_adapters(settings, embedder=True, reranker=False)
+
+
+def _embed_fixture_documents(conn, embedder, settings: RecallSettings):
+    """Embed fixture documents into the throwaway eval database.
+
+    Read-only recall never embeds documents, so without this step the
+    embedder mode would silently equal lexical. A failure is not fatal: the
+    queries then report it as a fallback.
+    """
+    try:
+        return embed_recall_documents(conn, embedder, include_raw_transcripts=settings.allow_raw_transcript_prompt)
+    except Exception:
+        return None
+
+
+def _evaluate(data: dict, conn, settings: RecallSettings, threshold: float | None = None, *, embedder=None,
+              primary_mode: str = "lexical") -> EvaluationReport:
+    """Run every mode; ``threshold`` applies to ``primary_mode``, which the top-level fields describe."""
+    _ensure_documents(conn, data["documents"])
+    mode = "lexical"
+
+    def calibration(name: str) -> dict:
+        return {name: {"threshold": threshold}} if threshold is not None and name == primary_mode else {}
+
+    outcomes = {mode: _run_queries(data, conn, _lexical_settings(settings), calibration(mode))}
+    if embedder is not None:
+        _embed_fixture_documents(conn, embedder, settings)
+        outcomes[EMBEDDER_MODE] = _run_queries(data, conn, _embedder_settings(settings), calibration(EMBEDDER_MODE), embedder=embedder)
+    lexical = outcomes[primary_mode]
+    latencies = [outcome["latency"] for outcome in lexical]
+    all_forbidden = sum(outcome["forbidden"] for outcome in lexical)
+    duplicate_count = sum(outcome["duplicates"] for outcome in lexical)
+    total_codepoints = sum(outcome["codepoints"] for outcome in lexical)
+    empty_correct = [1.0 if not outcome["delivered_ids"] else 0.0 for outcome in lexical if not outcome["relevant"]]
+    query_count = len(data["queries"])
+    recall_at_1, recall_at_3, recall_at_5, mrr = _ranked_metrics(lexical)
+    retrieval_at_1, retrieval_at_3, retrieval_at_5, retrieval_mrr = _ranked_metrics(lexical, "retrieval_ranks")
     injected = [row for row in data["queries"] if row.get("injected")]
     injected_hits = sum(1 for row in injected if set(row.get("injected", ())).intersection({candidate.document.id for candidate in rank_lexical(conn, _query(row, settings))}))
     injected_precision = injected_hits / len(injected) if injected else 1.0
     return EvaluationReport(
-        at(1), at(3), at(5), mrr, injected_precision, all_forbidden,
+        recall_at_1, recall_at_3, recall_at_5, mrr, injected_precision, all_forbidden,
         statistics.mean(empty_correct) if empty_correct else 1.0,
         duplicate_count, total_codepoints,
         statistics.median(latencies) if latencies else 0.0,
-        sorted(latencies)[max(0, int(len(latencies) * 0.95) - 1)] if latencies else 0.0,
+        _p95(latencies),
         None, query_count,
+        {name: _breakdown(values) for name, values in outcomes.items()},
+        {"recall_at_1": retrieval_at_1, "recall_at_3": retrieval_at_3, "recall_at_5": retrieval_at_5,
+         "mrr": retrieval_mrr, "forbidden_count": sum(outcome["retrieval_forbidden"] for outcome in lexical)},
     )
 
 
-def evaluate_fixture_file(path, conn, settings=None) -> EvaluationReport:
-    """Evaluate a fixture against the supplied database."""
-    return _evaluate(_fixture(Path(path)), conn, settings or _default_settings())
+def evaluate_fixture_file(path, conn, settings=None, *, embedder=None) -> EvaluationReport:
+    """Evaluate a fixture against the supplied database.
+
+    The report always carries a per-mode, per-language breakdown: ``lexical``,
+    plus ``lexical_plus_embedder`` when an embedder is supplied.
+    """
+    return _evaluate(_fixture(Path(path)), conn, settings or _default_settings(), embedder=embedder)
 
 
 def _score(record: EvaluationReport) -> tuple[float, float]:
     return record.mrr, record.recall_at_3
 
 
-def calibrate_fixture_file(path, conn, mode: str) -> CalibrationRecord:
-    """Choose the best observed score threshold from a held-out fixture."""
-    fixture_path = Path(path)
-    if fixture_path.name.lower() == "public.json" or "public" in {part.lower() for part in fixture_path.parts}:
-        raise ValueError("public evaluation fixtures cannot be used for calibration")
-    data = _fixture(fixture_path)
-    settings = _default_settings()
-    _ensure_documents(conn, data["documents"])
-    scores = {0.0}
-    for item in data["queries"]:
-        scores.update(candidate.score for candidate in rank_lexical(conn, _query(item, settings)))
-    best: tuple[tuple[float, float, float], float, EvaluationReport] | None = None
-    for threshold in sorted(scores):
-        report = _evaluate(data, conn, settings, threshold)
-        key = (report.mrr if report.forbidden_count == 0 else -1.0, report.recall_at_3 if report.forbidden_count == 0 else -1.0, -threshold)
+def _is_public_fixture(path: Path) -> bool:
+    if path.name.lower() == "public.json" or "public" in {part.lower() for part in path.parts}:
+        return True
+    return path.expanduser().resolve().is_relative_to(FIXTURES_ROOT)
+
+
+@dataclass(frozen=True)
+class _Cut:
+    """One query's evidence for every threshold in ``(previous score, score]``."""
+
+    best_rank: int | None
+    precision: float
+    forbidden: int
+
+
+def _cut_row(ids: list[str], relevant: set, forbidden: set) -> _Cut:
+    ranks = _ranks(ids, relevant)
+    return _Cut(min(ranks) if ranks else None,
+                len(relevant.intersection(ids)) / len(ids) if ids else 0.0,
+                len(forbidden.intersection(ids)))
+
+
+def _query_cuts(item: dict, query: RecallQuery, outcome, settings: RecallSettings, mode: str) -> tuple[list[float], list[_Cut]]:
+    """Delivered-context evidence of one retrieved query for each distinct score cut.
+
+    A threshold ``t`` keeps the candidates scoring at least ``t``, so the
+    query has one selection per distinct candidate score plus "nothing
+    passes", and only the candidates whose block fits the budget count.
+    When the threshold applies and the candidates are in descending score
+    order (every fused or rescored ranking), the candidates passing ``t``
+    are a prefix, and selection and the one-pass ``_render_blocks`` are both
+    greedy in rank order: selecting and rendering once without a threshold,
+    then keeping the delivered candidates scoring at least ``t``, is exact.
+    Any other ranking (the lexical prompt path sorts FTS rank first) reruns
+    selection per cut in ``_query_cuts_per_cut``.
+    """
+    candidates = outcome.candidates
+    threshold_applies = outcome.mode == mode and not query.hook_event.startswith("session-start")
+    if not threshold_applies or any(left.score < right.score for left, right in zip(candidates, candidates[1:])):
+        return _query_cuts_per_cut(item, query, outcome, settings, mode)
+    cuts = sorted({candidate.score for candidate in candidates})
+    relevant = _relevant(item)
+    forbidden = set(item.get("forbidden", ()))
+    selected = select_recall_candidates(candidates, query, settings, {}, mode=outcome.mode, threshold=None)
+    _text, delivered = _render_blocks(selected, query.requested_codepoint_budget, query.query_text)
+    return cuts, [_cut_row([candidate.document.id for candidate in delivered if candidate.score >= value], relevant, forbidden)
+                  for value in [*cuts, float("inf")]]
+
+
+def _query_cuts_per_cut(item: dict, query: RecallQuery, outcome, settings: RecallSettings, mode: str) -> tuple[list[float], list[_Cut]]:
+    """``_query_cuts`` for any ranking: selection reruns per cut.
+
+    Identical selections render once, and every render of this query shares
+    one excerpt cache, so each document's excerpt is built once per cap.
+    """
+    cuts = sorted({candidate.score for candidate in outcome.candidates})
+    relevant = _relevant(item)
+    forbidden = set(item.get("forbidden", ()))
+    rendered: dict[tuple[str, ...], list[str]] = {}
+    excerpts: dict = {}
+    rows: list[_Cut] = []
+    for value in [*cuts, float("inf")]:
+        selected = select_recall_candidates(outcome.candidates, query, settings, {mode: {"threshold": value}}, mode=outcome.mode)
+        selection = tuple(candidate.document.id for candidate in selected)
+        if selection not in rendered:
+            _text, delivered = _render_blocks(selected, query.requested_codepoint_budget, query.query_text,
+                                              excerpt_cache=excerpts)
+            rendered[selection] = [candidate.document.id for candidate in delivered]
+        rows.append(_cut_row(rendered[selection], relevant, forbidden))
+    return cuts, rows
+
+
+def calibration_key(rows: list[tuple[bool, _Cut]], threshold: float) -> tuple[float, float, float, float]:
+    """Order thresholds: MRR, then Recall@3, then precision, then the lower threshold.
+
+    ``rows`` holds ``(has_relevant, cut)`` per query, scored on the delivered
+    context. Precision is the mean share of relevant documents among the
+    delivered ones (0 when nothing is delivered) over queries with relevant
+    documents; without it every tie went to the lowest threshold, which
+    selects everything. Any delivered forbidden result disqualifies the
+    threshold.
+    """
+    answerable = [cut for has_relevant, cut in rows if has_relevant]
+    if any(cut.forbidden for _has_relevant, cut in rows):
+        return -1.0, -1.0, -1.0, -threshold
+    if not answerable:
+        return 0.0, 0.0, 0.0, -threshold
+    mrr = sum(1 / cut.best_rank for cut in answerable if cut.best_rank) / len(answerable)
+    recall_at_3 = sum(1 for cut in answerable if cut.best_rank and cut.best_rank <= 3) / len(answerable)
+    precision = sum(cut.precision for cut in answerable) / len(answerable)
+    return mrr, recall_at_3, precision, -threshold
+
+
+def _sweep(per_query, *, embedder_mode: bool) -> tuple[tuple[float, float, float, float], float] | None:
+    """The best ``(key, threshold)`` over every swept threshold; None without one.
+
+    ``per_query`` holds ``(has_relevant, cuts, cut_rows)`` from ``_query_cuts``.
+    The lexical sweep also tries 0.0, as it always has; the embedder mode
+    sweeps only observed fused scores.
+    """
+    scores: set[float] = set() if embedder_mode else {0.0}
+    for _has_relevant, cuts, _rows in per_query:
+        scores.update(cuts)
+    best: tuple[tuple[float, float, float, float], float] | None = None
+    swept = sorted(scores)
+    for index, threshold in enumerate(swept):
+        rows = [(has_relevant, cut_rows[bisect.bisect_left(cuts, threshold)]) for has_relevant, cuts, cut_rows in per_query]
+        key = calibration_key(rows, threshold)
         if best is None or key > best[0]:
-            best = (key, threshold, report)
+            # Every value in (previous swept score, threshold] selects the same
+            # fixture results; report the middle of that interval, so a score
+            # that moves slightly on the live index does not fall off the edge.
+            lower = swept[index - 1] if index else 0.0
+            best = (key, (lower + threshold) / 2 if threshold > 0 else threshold)
+    return best
+
+
+def calibrate_fixture_file(path, conn, mode: str, *, embedder=None, require_usable: bool = False,
+                           settings: RecallSettings | None = None) -> CalibrationRecord:
+    """Choose the best observed score threshold from a held-out fixture.
+
+    ``settings`` are the configured recall settings (``recall-calibrate``
+    passes them), so thresholds are tuned on the budgets and dense limit
+    agents receive; the adapters are still forced per mode. Without them the
+    packaged defaults apply.
+
+    ``lexical_plus_embedder`` evaluates in that mode, sweeping the fused and
+    rescored scores, and needs the configured embedder; its version also
+    covers the embedder fingerprint, because a threshold belongs to a model.
+    ``require_usable`` (``recall-calibrate --apply``) refuses a degenerate
+    result: no query with relevant documents, forbidden results at every
+    threshold, or no relevant document retrieved at any threshold.
+    """
+    fixture_path = Path(path)
+    if _is_public_fixture(fixture_path):
+        raise ValueError("public evaluation fixtures cannot be used for calibration")
+    if mode == EMBEDDER_MODE and embedder is None:
+        raise ValueError(f"calibrating {EMBEDDER_MODE} needs the configured embedder")
+    data = _fixture(fixture_path)
+    if require_usable and not any(_relevant(item) for item in data["queries"]):
+        raise ValueError("refusing --apply: the fixture has no query with relevant documents")
+    settings = settings or _default_settings()
+    _ensure_documents(conn, data["documents"])
+    embedder_mode = mode == EMBEDDER_MODE
+    if embedder_mode:
+        report = _embed_fixture_documents(conn, embedder, settings)
+        if report is None or report.error:
+            raise ValueError(f"could not embed the fixture documents: {report.error if report else 'embedder failed'}")
+        run_settings = _embedder_settings(settings)
+    else:
+        embedder = None
+        run_settings = _lexical_settings(settings)
+    # Rank every query once; each threshold then only looks up its delivered context.
+    per_query = []
+    for item in data["queries"]:
+        query = _query(item, settings)
+        outcome = retrieve(conn, query, run_settings, {}, embedder=embedder, require_calibration=False)
+        if embedder_mode and outcome.fallback_reason:
+            raise ValueError(f"embedder mode fell back during calibration: {outcome.fallback_reason}")
+        cuts, rows = _query_cuts(item, query, outcome, run_settings, mode)
+        per_query.append((bool(_relevant(item)), cuts, rows))
+    best = _sweep(per_query, embedder_mode=embedder_mode)
+    if require_usable:
+        if best is None or best[0][0] < 0:
+            raise ValueError("refusing --apply: every threshold returns a forbidden result")
+        if best[0][0] <= 0:
+            raise ValueError("refusing --apply: no relevant document was retrieved at any threshold")
+        if embedder_mode and best[1] <= 0.0:
+            raise ValueError(f"refusing --apply: a {EMBEDDER_MODE} threshold of 0 would select every dense candidate")
     canonical_hash = hashlib.sha256(_canonical(data)).hexdigest()
-    version = hashlib.sha256(f"{canonical_hash}:{mode}:calibration-v1".encode("utf-8")).hexdigest()
+    if embedder is not None:
+        version = embedder_calibration_version(canonical_hash, mode, adapter_fingerprint(embedder))
+    else:
+        version = hashlib.sha256(f"{canonical_hash}:{mode}:calibration-v1".encode("utf-8")).hexdigest()
     return CalibrationRecord(mode, version, best[1] if best else 0.0, canonical_hash, dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"))

@@ -68,6 +68,54 @@ def test_codex_adapter_import_does_not_import_claude_adapter():
     subprocess.run([sys.executable, "-c", code], check=True, env=os.environ.copy())
 
 
+def test_openai_compatible_adapter_import_does_not_import_cli_adapters():
+    code = (
+        "import sys; "
+        f"sys.path.insert(0, {str(ROOT)!r}); "
+        "from providers.registry import create_provider; "
+        "create_provider('openai-compatible', {'type': 'openai-compatible', 'base_url': 'http://127.0.0.1:8080'}); "
+        "assert 'codex_cli' not in sys.modules; "
+        "assert 'claude_cli' not in sys.modules"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True, env=os.environ.copy())
+
+
+def test_unsupported_provider_type_is_rejected(tmp_path):
+    from model_types import ProviderError
+    from providers.registry import create_provider
+
+    with pytest.raises(ProviderError, match="unsupported provider type"):
+        create_provider("http-json")
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[providers.local]\ntype = 'http-json'\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="unsupported type"):
+        load_config(config_path)
+
+
+def test_default_profile_defines_no_openai_compatible_provider():
+    config = load_config(Path("/nonexistent/dream-config.toml"))
+    assert {name: provider["type"] for name, provider in config.data["providers"].items()} == {
+        "codex": "codex-cli",
+        "claude": "claude-cli",
+    }
+
+
+def test_default_config_example_openai_compatible_provider_is_valid(tmp_path):
+    lines = (ROOT / "default-config.toml").read_text(encoding="utf-8").splitlines()
+    start = lines.index("# [providers.local-qwen]")
+    example = []
+    for line in lines[start:]:
+        if not line.startswith("# "):
+            break
+        example.append(line[2:])
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("\n".join(example) + "\n", encoding="utf-8")
+    provider = load_config(config_path).provider("local-qwen")
+    assert provider["type"] == "openai-compatible"
+    assert provider["remote_data_egress"] is False
+    assert provider["timeout_seconds"] == 600
+
+
 def test_default_profile_enables_opencode_sqlite_and_keeps_claude_disabled():
     config = load_config(Path("/nonexistent/dream-config.toml"))
     sources = {source["name"]: source for source in config.sources}

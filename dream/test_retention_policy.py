@@ -266,3 +266,83 @@ def test_cleanup_preserves_changes_made_after_snapshot(setup, monkeypatch, resou
     else:
         assert conn.execute("SELECT notes_json,summary FROM distilled").fetchone() == (fresh_notes, "new ordinary fact")
         assert result["deferred_sessions"] == ["private-session"]
+
+
+def _stage_patch(conn, root, target, find, body, rationale, run_id):
+    """Stage a patch exactly as consolidation does: the row, its find_text and its diff preview."""
+    import hashlib
+    sug_dir = root / ".suggestions"
+    sug_dir.mkdir(exist_ok=True)
+    suggestion = consolidate.Suggestion(
+        "patch", target, body, rationale, ["ordinary-session"],
+        base_sha256=hashlib.sha256((root / target).read_bytes()).hexdigest(), target_existed=True, find=find)
+    with conn:
+        consolidate._persist_run(conn, root, sug_dir, "2026-10-20", 1, [], run_id, "codex", None, [suggestion])
+    return conn.execute("SELECT id, sug_file FROM suggestions ORDER BY id DESC LIMIT 1").fetchone()
+
+
+_CONTRACT_FACT = "The retired-marker vendor contract ends in May.\n"
+
+
+def _status(conn, sug_id):
+    return conn.execute("SELECT status FROM suggestions WHERE id=?", (sug_id,)).fetchone()[0]
+
+
+def test_cleanup_rejects_a_pending_patch_whose_span_holds_an_excluded_fact(setup):
+    conn, root, cfg = setup
+    (root / "mixed.md").write_text("Ordinary intro.\n" + _CONTRACT_FACT + "Ordinary outro.\n", encoding="utf-8")
+    sug_id, sug_file = _stage_patch(conn, root, "mixed.md", _CONTRACT_FACT, "", "delete the obsolete date", "run-span")
+    # The user already removed the fact by hand: only find_text and the preview still hold it.
+    (root / "mixed.md").write_text("Ordinary intro.\nOrdinary outro.\n", encoding="utf-8")
+    assert apply_retention(conn, root, config=cfg)["pending_suggestions"] == 1
+    result = apply_retention(conn, root, config=cfg, apply=True)
+    assert _status(conn, sug_id) == "rejected"
+    assert not (root / ".suggestions" / sug_file).exists()
+    backup = json.loads((Path(result["backup"]) / "affected-records.json").read_text(encoding="utf-8"))
+    assert [row[0] for row in backup["pending_suggestions"]] == [sug_id]
+    assert _CONTRACT_FACT in backup["pending_suggestions"][0]
+
+
+def test_cleanup_rejects_a_pending_patch_whose_preview_context_holds_an_excluded_fact(setup):
+    conn, root, cfg = setup
+    (root / "mixed.md").write_text("Ordinary intro.\n" + _CONTRACT_FACT + "Editor: vim.\n", encoding="utf-8")
+    sug_id, sug_file = _stage_patch(conn, root, "mixed.md", "Editor: vim.", "Editor: helix.", "the editor changed",
+                                    "run-context")
+    clean_id, clean_file = _stage_patch(conn, root, "ordinary.md", "useful", "handy", "a better word", "run-clean")
+    # The unified diff's context lines copied the fact; the patch fields themselves are clean.
+    assert "vendor contract ends in May" in (root / ".suggestions" / sug_file).read_text(encoding="utf-8")
+    apply_retention(conn, root, config=cfg, apply=True)
+    assert _status(conn, sug_id) == "rejected"
+    assert not (root / ".suggestions" / sug_file).exists()
+    assert _status(conn, clean_id) == "pending"
+    assert (root / ".suggestions" / clean_file).exists()
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_curation_never_sends_an_excluded_pending_patch_to_the_review_provider(setup, monkeypatch, capsys, dry_run):
+    import argparse
+    conn, root, cfg = setup
+    (root / "mixed.md").write_text("Ordinary intro.\n" + _CONTRACT_FACT + "Ordinary outro.\n", encoding="utf-8")
+    sug_id, _sug_file = _stage_patch(conn, root, "mixed.md", _CONTRACT_FACT, "", "delete the obsolete date", "run-span")
+    clean_id, _clean_file = _stage_patch(conn, root, "ordinary.md", "useful", "handy", "a better word", "run-clean")
+    (root / "mixed.md").write_text("Ordinary intro.\nOrdinary outro.\n", encoding="utf-8")
+    prompts = []
+
+    def fake_review(_stage, prompt, _schema, **_kwargs):
+        prompts.append(prompt)
+        return SimpleNamespace(output={"decisions": [
+            {"suggestion_id": clean_id, "decision": "defer", "reason": "later", "body": ""}]},
+            provider="codex", model="gpt-5.6-luna")
+
+    monkeypatch.setattr(dream, "generate", fake_review, raising=False)
+    review = load_config(root.parent / "absent.toml", {
+        "storage": {"memory_root": str(root), "db_path": str(root.parent / "dream.db")},
+        "character": {"state_root": str(root.parent / "state")}, "review": {"mode": "auto-apply"}})
+    rc = dream.cmd_suggestions(argparse.Namespace(db=root.parent / "dream.db", memory=str(root),
+                                                  suggestions_cmd="curate-configured", config=review, dry_run=dry_run))
+    assert rc == 0
+    [prompt] = prompts
+    assert "vendor contract ends in May" not in prompt
+    assert f'"id": {clean_id}' in prompt and f'"id": {sug_id}' not in prompt
+    assert f"skipped #{sug_id}: excluded by local memory retention policy" in capsys.readouterr().out
+    assert _status(conn, sug_id) == "pending"

@@ -8,7 +8,20 @@ from pathlib import Path
 import uuid
 
 from recall_documents import synchronize_recall_documents
-from retention_policy import empty_notes, excludes_source_sessions, filter_notes, load_retention_policy
+from retention_policy import empty_notes, excludes_suggestion, filter_notes, load_retention_policy
+
+
+def _patch_preview_text(root: Path, sug_file: str | None) -> str:
+    """A pending patch's preview: its unified diff's context lines can copy text outside the span."""
+    if not sug_file:
+        return ""
+    preview = root / ".suggestions" / sug_file
+    if not preview.resolve().is_relative_to(root / ".suggestions"):
+        return ""
+    try:
+        return preview.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
 
 
 def apply_retention(conn, memory_root: Path, *, config, apply=False) -> dict:
@@ -42,11 +55,15 @@ def apply_retention(conn, memory_root: Path, *, config, apply=False) -> dict:
         if filtered != notes or filtered_summary != summary:
             changed.append((sid, notes_json, summary, json.dumps(filtered, ensure_ascii=False), filtered_summary))
 
+    # A database not yet migrated (preview runs read-only) has no patch spans.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(suggestions)")}
+    find_text = "find_text" if "find_text" in columns else "NULL"
     pending = [row for row in conn.execute(
-        "SELECT id, target_path, body, rationale, sug_file, source_sessions FROM suggestions WHERE status='pending'"
-    ) if (policy.excludes(source_path=row[1], text=(row[2] or "") + "\n" + (row[3] or ""))
-          or policy.excludes_memory_path(root, row[1])
-          or excludes_source_sessions(conn, policy, row[5]))]
+        f"SELECT id, target_path, body, rationale, sug_file, source_sessions, {find_text}, kind "
+        "FROM suggestions WHERE status='pending'"
+    ).fetchall() if excludes_suggestion(
+        conn, policy, root, target_path=row[1], source_sessions=row[5],
+        texts=(row[2], row[3], row[6], _patch_preview_text(root, row[4]) if row[7] == "patch" else None))]
     result = {"memory_files": [str(p.relative_to(root)) for p in files],
               "distilled_records": len(changed), "pending_suggestions": len(pending), "applied": apply, "character": preview(character_snapshot)}
     if not apply:

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
+import re
 import tomllib
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +18,7 @@ from recall_types import AdapterSettings, RecallSettings
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "dream" / "config.toml"
 
-_TOP_KEYS = {"storage", "stages", "providers", "sources", "review", "recall", "character"}
+_TOP_KEYS = {"storage", "stages", "providers", "sources", "review", "recall", "character", "consolidate"}
 _STORAGE_KEYS = {"db_path", "memory_root"}
 _STAGE_KEYS = {"provider", "model", "reasoning_effort", "timeout_seconds"}
 _PROVIDER_KEYS = {"type", "auth", "executable", "extra_args"}
@@ -34,8 +37,9 @@ _RECALL_KEYS = {
     "calibration_path",
     "embedder",
     "reranker",
+    "usage_tie_break",
 }
-_RECALL_BOOL_KEYS = {"enabled", "install_hooks", "allow_raw_transcript_prompt", "first_prompt_only"}
+_RECALL_BOOL_KEYS = {"enabled", "install_hooks", "allow_raw_transcript_prompt", "first_prompt_only", "usage_tie_break"}
 _RECALL_BUDGET_KEYS = {
     "session_start_budget_codepoints",
     "prompt_budget_codepoints",
@@ -44,6 +48,14 @@ _RECALL_BUDGET_KEYS = {
 }
 _RECALL_PATH_KEYS = {"diagnostic_path", "calibration_path"}
 _ADAPTER_KEYS = {"enabled", "type", "remote_data_egress"}
+# The embedder alone gains connection keys; the reranker keeps the three above.
+_EMBEDDER_KEYS = _ADAPTER_KEYS | {"base_url", "model", "dimension", "timeout_seconds", "dense_candidates", "api_key_env"}
+_EMBEDDER_TYPES = ("none", "openai-compatible")
+_EMBEDDER_MAX_TIMEOUT_SECONDS = 3.0
+# The dense list joins RRF fusion and the top-100 rescore; far more than a
+# prompt can show, and small enough for every SQLite IN list built from it.
+_EMBEDDER_MAX_DENSE_CANDIDATES = 2000
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _RECALL_DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "install_hooks": False,
@@ -55,12 +67,28 @@ _RECALL_DEFAULTS: dict[str, Any] = {
     "prompt_additional_context_limit": 1200,
     "diagnostic_path": "~/.cache/dream/recall-diagnostics.jsonl",
     "calibration_path": "~/.config/dream/recall-calibration.json",
+    "usage_tie_break": False,
 }
 _DEFAULT_ADAPTER = AdapterSettings(enabled=False, type="none", remote_data_egress=False)
+_CONSOLIDATE_KEYS = {"mode", "subset_files"}
+_CONSOLIDATE_MODES = {"full", "subset"}
 
 
 class ConfigError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class ConsolidateSettings:
+    """How the nightly consolidation reads the memory store.
+
+    ``full`` sends the whole store (today's behaviour, and the rollback);
+    ``subset`` sends MEMORY.md plus at most ``subset_files`` related topic files
+    and leaves the staleness audit to the weekly ``dream audit``.
+    """
+
+    mode: str = "full"
+    subset_files: int = 15
 
 
 @dataclass(frozen=True)
@@ -105,6 +133,15 @@ class DreamConfig:
             reranker=self._adapter_settings("reranker", recall),
         )
 
+    def consolidate_settings(self) -> ConsolidateSettings:
+        raw = self.data.get("consolidate")
+        raw = raw if isinstance(raw, dict) else {}
+        defaults = ConsolidateSettings()
+        return ConsolidateSettings(
+            mode=raw.get("mode", defaults.mode),
+            subset_files=raw.get("subset_files", defaults.subset_files),
+        )
+
     @staticmethod
     def _adapter_settings(name: str, recall: dict[str, Any]) -> AdapterSettings:
         raw = recall.get(name)
@@ -115,10 +152,21 @@ class DreamConfig:
         if problems:
             # An invalid optional adapter falls back to its safe disabled default.
             return _DEFAULT_ADAPTER
-        return AdapterSettings(
+        settings = AdapterSettings(
             enabled=raw.get("enabled", False),
             type=raw.get("type", "none"),
             remote_data_egress=raw.get("remote_data_egress", False),
+        )
+        if name != "embedder":
+            return settings
+        return AdapterSettings(
+            settings.enabled, settings.type, settings.remote_data_egress,
+            base_url=raw.get("base_url", _DEFAULT_ADAPTER.base_url),
+            model=raw.get("model", _DEFAULT_ADAPTER.model),
+            dimension=raw.get("dimension", _DEFAULT_ADAPTER.dimension),
+            timeout_seconds=float(raw.get("timeout_seconds", _DEFAULT_ADAPTER.timeout_seconds)),
+            dense_candidates=raw.get("dense_candidates", _DEFAULT_ADAPTER.dense_candidates),
+            api_key_env=raw.get("api_key_env", _DEFAULT_ADAPTER.api_key_env),
         )
 
 
@@ -143,6 +191,85 @@ def _unknown_keys(label: str, data: dict[str, Any], allowed: set[str]) -> None:
         raise ConfigError(f"unknown {label} options: {', '.join(unknown)}")
 
 
+_OPENAI_COMPATIBLE_PROVIDER_KEYS = {"type", "base_url", "model", "api_key_env", "remote_data_egress", "timeout_seconds"}
+
+
+def is_loopback_url(url: str) -> bool:
+    """True only for 127.0.0.0/8, ::1 and the literal name localhost."""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def has_url_extras(url: str) -> bool:
+    """True when a URL carries userinfo, a query or a fragment (all can disguise the host)."""
+    from urllib.parse import urlsplit
+
+    # An empty query or fragment ("...:8080?") parses as absent but corrupts the endpoint path.
+    if "?" in url or "#" in url:
+        return True
+    try:
+        parts = urlsplit(url)
+        return bool(parts.username is not None or parts.password is not None or parts.query or parts.fragment)
+    except ValueError:
+        return True
+
+
+def is_valid_bearer_token(token: str) -> bool:
+    """True when every character is visible ASCII, so the Authorization header is well formed.
+
+    http.client rejects a header value with CR, LF or other control
+    characters with a ValueError that quotes the complete value; callers
+    check the token first and report the variable name instead.
+    """
+    return bool(token) and all("!" <= char <= "~" for char in token)
+
+
+def _validate_openai_compatible_provider(name: str, provider: dict[str, Any]) -> None:
+    """A local model server; sending prompts off this machine needs explicit consent."""
+    from urllib.parse import urlsplit
+
+    _unknown_keys(f"provider {name}", provider, _OPENAI_COMPATIBLE_PROVIDER_KEYS)
+    base_url = provider.get("base_url")
+    try:
+        parts = urlsplit(base_url) if isinstance(base_url, str) else None
+        valid_url = bool(parts and parts.scheme in {"http", "https"} and parts.hostname)
+        # .port raises ValueError for a malformed or out-of-range port.
+        valid_url = valid_url and (parts.port is None or parts.port > 0)
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        raise ConfigError(f"provider {name} requires base_url as an http(s) URL with a host")
+    if has_url_extras(base_url):
+        raise ConfigError(f"provider {name} base_url must not contain credentials, a query or a fragment")
+    for key in ("model", "api_key_env"):
+        if key in provider and (not isinstance(provider[key], str) or not provider[key].strip()):
+            raise ConfigError(f"provider {name} {key} must be a non-empty string")
+    egress = provider.get("remote_data_egress", False)
+    if not isinstance(egress, bool):
+        raise ConfigError(f"provider {name} remote_data_egress must be a boolean")
+    timeout = provider.get("timeout_seconds", 600)
+    if type(timeout) is not int or timeout <= 0:
+        raise ConfigError(f"provider {name} timeout_seconds must be a positive integer")
+    if not egress and not is_loopback_url(base_url):
+        raise ConfigError(
+            f"provider {name} base_url is not a loopback address; "
+            "set remote_data_egress = true to allow sending prompts to it"
+        )
+
+
 def _validate(data: dict[str, Any]) -> list[str]:
     """Strictly validate core configuration; record optional adapter problems.
 
@@ -158,6 +285,9 @@ def _validate(data: dict[str, Any]) -> list[str]:
         if "provider" not in stage:
             raise ConfigError(f"stage {name} requires provider")
     for name, provider in data.get("providers", {}).items():
+        if provider.get("type") == "openai-compatible":
+            _validate_openai_compatible_provider(name, provider)
+            continue
         _unknown_keys(f"provider {name}", provider, _PROVIDER_KEYS)
         if provider.get("type") not in {"codex-cli", "claude-cli"}:
             raise ConfigError(f"provider {name} has unsupported type: {provider.get('type')!r}")
@@ -174,7 +304,19 @@ def _validate(data: dict[str, Any]) -> list[str]:
             raise ConfigError(f"stage {name} references unknown provider {stage['provider']!r}")
     _validate_character(data)
     _validate_recall(data.get("recall", {}), optional_errors)
+    _validate_consolidate(data.get("consolidate", {}))
     return optional_errors
+
+
+def _validate_consolidate(raw: Any) -> None:
+    if not isinstance(raw, dict):
+        raise ConfigError("consolidate must be a table")
+    _unknown_keys("consolidate", raw, _CONSOLIDATE_KEYS)
+    if "mode" in raw and raw["mode"] not in _CONSOLIDATE_MODES:
+        raise ConfigError("consolidate.mode must be full or subset")
+    value = raw.get("subset_files")
+    if "subset_files" in raw and (type(value) is not int or value <= 0):
+        raise ConfigError("consolidate.subset_files must be a positive integer")
 
 
 def _validate_recall(recall: Any, optional_errors: list[str]) -> None:
@@ -204,7 +346,7 @@ def _validate_adapter_table(name: str, raw: Any, optional_errors: list[str]) -> 
     if not isinstance(raw, dict):
         optional_errors.append(f"recall.{name} must be a table")
         return
-    unknown = sorted(set(raw) - _ADAPTER_KEYS)
+    unknown = sorted(set(raw) - (_EMBEDDER_KEYS if name == "embedder" else _ADAPTER_KEYS))
     if unknown:
         optional_errors.append(f"unknown recall.{name} options: {', '.join(unknown)}")
     for key in ("enabled", "remote_data_egress"):
@@ -212,6 +354,47 @@ def _validate_adapter_table(name: str, raw: Any, optional_errors: list[str]) -> 
             optional_errors.append(f"recall.{name}.{key} must be a boolean")
     if "type" in raw and (not isinstance(raw["type"], str) or not raw["type"]):
         optional_errors.append(f"recall.{name}.type must be a non-empty string")
+    elif name == "embedder" and "type" in raw and raw["type"] not in _EMBEDDER_TYPES:
+        optional_errors.append(f"recall.embedder.type must be one of: {', '.join(_EMBEDDER_TYPES)}")
+    if name == "embedder":
+        _validate_embedder_connection(raw, optional_errors)
+
+
+def _valid_base_url(value: Any) -> bool:
+    if not isinstance(value, str) or "@" in value or has_url_extras(value):
+        return False
+    try:
+        parts = urlsplit(value)
+        parts.port  # raises ValueError for a malformed or out-of-range port
+    except ValueError:
+        return False
+    return parts.scheme in {"http", "https"} and bool(parts.hostname)
+
+
+def _validate_embedder_connection(raw: dict[str, Any], optional_errors: list[str]) -> None:
+    """Record problems in the embedder's connection keys; values are never echoed.
+
+    The loopback/egress rule needs the adapter and is checked when the
+    embedder is built (see recall_adapters.build_embedder).
+    """
+    def positive_int(value: Any, maximum: int | None = None) -> bool:
+        return type(value) is int and value > 0 and (maximum is None or value <= maximum)
+
+    if "base_url" in raw and not _valid_base_url(raw["base_url"]):
+        optional_errors.append("recall.embedder.base_url must be an http(s) URL with a host and no credentials, query or fragment")
+    if "model" in raw and (not isinstance(raw["model"], str) or not raw["model"].strip()):
+        optional_errors.append("recall.embedder.model must be a non-empty string")
+    if "dimension" in raw and not positive_int(raw["dimension"], 4096):
+        optional_errors.append("recall.embedder.dimension must be an integer between 1 and 4096")
+    timeout = raw.get("timeout_seconds")
+    # A query embed must leave room inside the 5 s hook timeout.
+    if "timeout_seconds" in raw and (type(timeout) not in (int, float) or not math.isfinite(timeout)
+                                     or not 0 < timeout <= _EMBEDDER_MAX_TIMEOUT_SECONDS):
+        optional_errors.append(f"recall.embedder.timeout_seconds must be a positive number of at most {_EMBEDDER_MAX_TIMEOUT_SECONDS:g} seconds")
+    if "dense_candidates" in raw and not positive_int(raw["dense_candidates"], _EMBEDDER_MAX_DENSE_CANDIDATES):
+        optional_errors.append(f"recall.embedder.dense_candidates must be an integer between 1 and {_EMBEDDER_MAX_DENSE_CANDIDATES}")
+    if "api_key_env" in raw and (not isinstance(raw["api_key_env"], str) or not _ENV_NAME.fullmatch(raw["api_key_env"])):
+        optional_errors.append("recall.embedder.api_key_env must be an environment variable name")
 
 
 def load_config(path: Path | None = None, overrides: dict[str, Any] | None = None) -> DreamConfig:

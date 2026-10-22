@@ -10,6 +10,8 @@ ln -sfn "$REPO_DIR/dream/stage_runner.py" "$HOME/.local/bin/dream-stage"
 ln -sfn "$REPO_DIR/skill" "$HOME/.codex/skills/dream"
 install -m 0644 "$REPO_DIR/dream/systemd/dream.service" "$HOME/.config/systemd/user/dream.service"
 install -m 0644 "$REPO_DIR/dream/systemd/dream.timer" "$HOME/.config/systemd/user/dream.timer"
+install -m 0644 "$REPO_DIR/dream/systemd/dream-audit.service" "$HOME/.config/systemd/user/dream-audit.service"
+install -m 0644 "$REPO_DIR/dream/systemd/dream-audit.timer" "$HOME/.config/systemd/user/dream-audit.timer"
 install -m 0644 "$REPO_DIR/dream/systemd/dream-exporter.service" "$HOME/.config/systemd/user/dream-exporter.service"
 
 if [ ! -f "$HOME/.config/dream/config.toml" ]; then

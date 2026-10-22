@@ -186,3 +186,81 @@ def test_recall_contract_types_are_fully_specified_and_immutable():
     ):
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(instance, field_name, "mutated")
+
+
+def test_embedder_connection_defaults_keep_the_embedder_off():
+    embedder = load_config(Path("/nonexistent/dream-recall-config.toml")).recall_settings().embedder
+    assert (embedder.enabled, embedder.type, embedder.remote_data_egress) == (False, "none", False)
+    assert embedder.base_url == "http://127.0.0.1:8081"
+    assert embedder.model == "bge-m3"
+    assert embedder.dimension == 1024
+    assert embedder.timeout_seconds == 1.5
+    assert embedder.dense_candidates == 200
+    assert embedder.api_key_env is None
+
+
+def test_openai_compatible_embedder_keys_are_applied(tmp_path):
+    config_path = _write(
+        tmp_path,
+        "[recall.embedder]\n"
+        "enabled = true\n"
+        'type = "openai-compatible"\n'
+        'base_url = "http://localhost:9000"\n'
+        'model = "Qwen3-Embedding-0.6B"\n'
+        "dimension = 1024\n"
+        "timeout_seconds = 2\n"
+        "dense_candidates = 50\n"
+        'api_key_env = "LOCAL_EMBED_KEY"\n',
+    )
+    config = load_config(config_path)
+    assert config.optional_config_errors == ()
+    embedder = config.recall_settings().embedder
+    assert embedder == AdapterSettings(True, "openai-compatible", False, "http://localhost:9000", "Qwen3-Embedding-0.6B", 1024, 2.0, 50, "LOCAL_EMBED_KEY")
+    assert isinstance(embedder.timeout_seconds, float)
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ('type = "mystery"', "recall.embedder.type"),
+        ('base_url = "ftp://127.0.0.1:8081"', "recall.embedder.base_url"),
+        ('base_url = "http://evil.com@127.0.0.1:8081"', "recall.embedder.base_url"),
+        ('base_url = "http://127.0.0.1:8081/#@evil.com"', "recall.embedder.base_url"),
+        ('base_url = "http://127.0.0.1:8081/?@evil.com"', "recall.embedder.base_url"),
+        ('base_url = "http://127.0.0.1:99999"', "recall.embedder.base_url"),
+        ('model = ""', "recall.embedder.model"),
+        ("dimension = 0", "recall.embedder.dimension"),
+        ("dimension = 4097", "recall.embedder.dimension"),
+        ("dimension = true", "recall.embedder.dimension"),
+        ("timeout_seconds = 0", "recall.embedder.timeout_seconds"),
+        ('timeout_seconds = "1.5"', "recall.embedder.timeout_seconds"),
+        ("timeout_seconds = nan", "recall.embedder.timeout_seconds"),
+        ("timeout_seconds = 3.5", "recall.embedder.timeout_seconds"),
+        ("dense_candidates = 0", "recall.embedder.dense_candidates"),
+        ("dense_candidates = 2001", "recall.embedder.dense_candidates"),
+        ("dense_candidates = 40000", "recall.embedder.dense_candidates"),
+        ('api_key_env = "not a name"', "recall.embedder.api_key_env"),
+    ],
+)
+def test_invalid_embedder_connection_keys_disable_the_embedder(tmp_path, line, expected):
+    type_line = "" if line.startswith("type") else 'type = "openai-compatible"\n'
+    config = load_config(_write(tmp_path, f"[recall.embedder]\nenabled = true\n{type_line}{line}\n"))
+    assert any(expected in error for error in config.optional_config_errors)
+    assert config.recall_settings().embedder == DEFAULT_ADAPTER
+
+
+def test_error_messages_never_echo_the_configured_url(tmp_path):
+    config = load_config(_write(tmp_path, '[recall.embedder]\nbase_url = "http://user:hunter2@127.0.0.1:8081"\n'))
+    assert config.optional_config_errors
+    assert all("hunter2" not in error for error in config.optional_config_errors)
+
+
+def test_reranker_does_not_accept_embedder_connection_keys(tmp_path):
+    config = load_config(_write(tmp_path, '[recall.reranker]\nbase_url = "http://127.0.0.1:8081"\n'))
+    assert any("unknown recall.reranker options: base_url" in error for error in config.optional_config_errors)
+
+
+def test_dense_candidates_accepts_its_upper_bound(tmp_path):
+    config = load_config(_write(tmp_path, '[recall.embedder]\nenabled = true\ntype = "openai-compatible"\ndense_candidates = 2000\n'))
+    assert config.optional_config_errors == ()
+    assert config.recall_settings().embedder.dense_candidates == 2000

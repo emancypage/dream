@@ -1,0 +1,117 @@
+{
+  "consumed": [
+    "key-s-1",
+    "key-s-2"
+  ],
+  "model": null,
+  "previews": {
+    "2026-10-19-001-update-reference-grafana.md": "<!-- dream suggestion\nkind: update\ntarget_path: reference_grafana.md\nrationale: alert rules were added\nsource_sessions: s-2\nbase_sha256: f6ac757818f3c2e0ab65e44d53f247ba1391f75008fe104d0ee4af15c48687e5\n-->\n\n---\nname: reference-grafana\n---\n\nDashboards and alert rules live on the build host.\n",
+    "2026-10-19-002-new-feedback-terse-responses.md": "<!-- dream suggestion\nkind: new\ntarget_path: feedback_terse_responses.md\nrationale: model missed the existing file\nsource_sessions: s-1\nbase_sha256: aee0381a7b069822bf96abb0ceebbcae3f85506476d5e0451b05db12a2ad62bd\n-->\n\nduplicate topic",
+    "2026-10-19-003-index-memory.md": "<!-- dream suggestion\nkind: index\ntarget_path: MEMORY.md\nrationale: new file\nsource_sessions: s-2\nbase_sha256: 4c1bd6170f22a1ddbf000545dc3ebd78f8158ca5d0038a9937b1d79a664af120\n-->\n\n- [Alerts](reference_alerts.md) — alert rules\n"
+  },
+  "rows": [
+    [
+      "update",
+      "reference_grafana.md",
+      "---\nname: reference-grafana\n---\n\nDashboards and alert rules live on the build host.\n",
+      "alert rules were added",
+      "s-2",
+      "2026-10-19-001-update-reference-grafana.md",
+      "f6ac757818f3c2e0ab65e44d53f247ba1391f75008fe104d0ee4af15c48687e5",
+      1,
+      "pending"
+    ],
+    [
+      "new",
+      "feedback_terse_responses.md",
+      "duplicate topic",
+      "model missed the existing file",
+      "s-1",
+      "2026-10-19-002-new-feedback-terse-responses.md",
+      "aee0381a7b069822bf96abb0ceebbcae3f85506476d5e0451b05db12a2ad62bd",
+      1,
+      "pending"
+    ],
+    [
+      "index",
+      "MEMORY.md",
+      "- [Alerts](reference_alerts.md) — alert rules\n",
+      "new file",
+      "s-2",
+      "2026-10-19-003-index-memory.md",
+      "4c1bd6170f22a1ddbf000545dc3ebd78f8158ca5d0038a9937b1d79a664af120",
+      1,
+      "pending"
+    ]
+  ],
+  "schema": {
+    "additionalProperties": false,
+    "properties": {
+      "suggestions": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "body": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "new",
+                "update",
+                "remove",
+                "index"
+              ],
+              "type": "string"
+            },
+            "rationale": {
+              "type": "string"
+            },
+            "source_sessions": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "target_path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "target_path",
+            "body",
+            "rationale",
+            "source_sessions"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "suggestions"
+    ],
+    "type": "object"
+  },
+  "stage": "consolidate",
+  "suggestions": [
+    [
+      "update",
+      "reference_grafana.md",
+      "f6ac757818f3c2e0ab65e44d53f247ba1391f75008fe104d0ee4af15c48687e5",
+      true
+    ],
+    [
+      "new",
+      "feedback_terse_responses.md",
+      "aee0381a7b069822bf96abb0ceebbcae3f85506476d5e0451b05db12a2ad62bd",
+      true
+    ],
+    [
+      "index",
+      "MEMORY.md",
+      "4c1bd6170f22a1ddbf000545dc3ebd78f8158ca5d0038a9937b1d79a664af120",
+      true
+    ]
+  ]
+}

@@ -4,6 +4,7 @@ A stage may omit `model` so the provider falls back to its own default model.
 Explicit models remain settable via TOML, stage-specific environment variables,
 and the CLI `--model` override.
 """
+import copy
 import sqlite3
 from pathlib import Path
 
@@ -12,7 +13,7 @@ import pytest
 import backend
 import codex_cli
 import claude_cli
-from config import load_config
+from config import DreamConfig, load_config
 from distill import sessions_needing_distill
 from model_types import GenerationResult
 
@@ -77,7 +78,12 @@ def _capture_generate(monkeypatch):
                 usage=None, duration_ms=1,
             )
 
-    monkeypatch.setattr(backend, "create_provider", lambda _type: FakeProvider())
+    def fake_create_provider(provider_type, settings=None):
+        captured["provider_type"] = provider_type
+        captured["settings"] = settings
+        return FakeProvider()
+
+    monkeypatch.setattr(backend, "create_provider", fake_create_provider)
     return captured
 
 
@@ -108,6 +114,51 @@ def test_generate_cli_override_wins_over_stage_model(monkeypatch, tmp_path):
     config = load_config(_config_without_model(tmp_path))
     backend.generate("distill", "prompt", {"type": "object"}, model="override", config=config)
     assert captured["request"].model == "override"
+
+
+def test_openai_compatible_stage_without_model_leaves_choice_to_provider(monkeypatch, tmp_path):
+    captured = _capture_generate(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[stages.distill]\nprovider = \"local\"\n"
+        "[providers.local]\ntype = \"openai-compatible\"\n"
+        "base_url = \"http://127.0.0.1:8080\"\nmodel = \"qwen3-32b\"\n",
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    backend.generate("distill", "prompt", {"type": "object"}, config=config)
+    # The stage model stays None; the provider falls back to its configured model.
+    assert captured["request"].model is None
+    assert captured["provider_type"] == "openai-compatible"
+    assert captured["settings"]["model"] == "qwen3-32b"
+    assert captured["settings"]["base_url"] == "http://127.0.0.1:8080"
+
+
+def test_stage_timeout_wins_and_provider_timeout_is_the_default(monkeypatch, tmp_path):
+    captured = _capture_generate(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[stages.distill]\nprovider = \"local\"\ntimeout_seconds = 120\n"
+        "[providers.local]\ntype = \"openai-compatible\"\n"
+        "base_url = \"http://127.0.0.1:8080\"\ntimeout_seconds = 900\n",
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    backend.generate("distill", "prompt", {"type": "object"}, config=config)
+    assert captured["request"].timeout_seconds == 120
+
+    backend.generate("distill", "prompt", {"type": "object"}, timeout=30, config=config)
+    assert captured["request"].timeout_seconds == 30
+
+    # Packaged stages always carry timeout_seconds; drop it to reach the provider default.
+    data = copy.deepcopy(config.data)
+    del data["stages"]["distill"]["timeout_seconds"]
+    backend.generate("distill", "prompt", {"type": "object"}, config=DreamConfig(data, None))
+    assert captured["request"].timeout_seconds == 900
+
+    del data["providers"]["local"]["timeout_seconds"]
+    backend.generate("distill", "prompt", {"type": "object"}, config=DreamConfig(data, None))
+    assert captured["request"].timeout_seconds == 600
 
 
 def test_codex_call_without_model_omits_model_flag(monkeypatch):

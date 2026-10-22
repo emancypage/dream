@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly dream memory staleness audit
+
+[Timer]
+# Midday Sunday, well clear of the nightly 04:00 run; dream-audit.service is ordered
+# after dream.service when both are caught up at boot.
+OnCalendar=Sun *-*-* 12:00:00
+Persistent=true
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target

@@ -32,7 +32,7 @@ def generate(
         raise ValueError(f"character stage {stage} requires an explicit model ID")
     provider_name = stage_cfg["provider"]
     provider_cfg = cfg.provider(provider_name)
-    provider = create_provider(provider_cfg["type"])
+    provider = create_provider(provider_cfg["type"], provider_cfg)
     options = {
         "reasoning_effort": stage_cfg.get("reasoning_effort"),
         "extra_args": provider_cfg.get("extra_args"),
@@ -43,7 +43,7 @@ def generate(
         prompt=prompt,
         schema=schema,
         model=model or stage_cfg.get("model"),
-        timeout_seconds=timeout or int(stage_cfg.get("timeout_seconds", 600)),
+        timeout_seconds=timeout or int(stage_cfg.get("timeout_seconds", provider_cfg.get("timeout_seconds", 600))),
         options={key: value for key, value in options.items() if value is not None},
     )
     return provider.generate_structured(request)

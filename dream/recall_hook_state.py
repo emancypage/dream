@@ -27,6 +27,11 @@ def _root() -> Path:
     return Path(tempfile.gettempdir()) / f"dream-recall-{os.getuid()}"
 
 
+def marker_root() -> Path:
+    """The directory hooks keep their markers in; ``dream ingest`` harvests it."""
+    return _root()
+
+
 def _bounded(value: object) -> str:
     return str(value)[:_MAX_ID_FIELD]
 
@@ -142,7 +147,14 @@ def claim_hook_event(session_id: str, event: str) -> int | None:
         return attempts
 
 
-def finish_hook_event(session_id: str, event: str, *, succeeded: bool, selected_ids: Iterable[str] = (), error_code: str | None = None, attempt_token: int | None = None) -> None:
+def finish_hook_event(session_id: str, event: str, *, succeeded: bool, selected_ids: Iterable[str] = (), error_code: str | None = None, attempt_token: int | None = None,
+                      delivered_ids: Iterable[str] | None = None) -> None:
+    """Record the outcome of a claimed event.
+
+    ``selected_ids`` is the selection (the prompt path excludes a session
+    start's selection); ``delivered_ids``, when given, is the subset whose
+    block reached the agent, which ``dream ingest`` counts as usage.
+    """
     root = _root()
     _ensure_root(root)
     path = _marker_path(str(session_id), str(event), root)
@@ -163,6 +175,9 @@ def finish_hook_event(session_id: str, event: str, *, succeeded: bool, selected_
             "selected_ids": bounded_ids,
             "error_code": _bounded(error_code) if error_code else None,
         })
+        if delivered_ids is not None:
+            payload["delivered_ids"] = (
+                [_bounded(value) for value in list(delivered_ids)[:_MAX_SELECTED_IDS]] if succeeded else [])
         _write_atomic(path, payload)
 
 

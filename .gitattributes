@@ -1,0 +1,2 @@
+# Golden prompts are byte-exact captures, trailing blank lines included.
+dream/fixtures/consolidate/*.txt -whitespace

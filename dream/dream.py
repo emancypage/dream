@@ -7,7 +7,10 @@ Subcommands:
   estimate      Show how many sessions would be distilled + subscription-limit draw
   distill       Run the configured distillation stage and store JSON notes
   consolidate   Run the configured consolidation stage and propose updates
+  audit         Weekly staleness audit over the whole store (remove/patch only)
   search        FTS5 search over all ingested transcripts
+  recall        Read-only approved-memory query for agents (prints the recall block)
+  mcp           Read-only recall tools over MCP stdio (serve), and client install/uninstall
   review        Walk pending suggestions, accept/reject interactively
   status        Show DB stats
 
@@ -37,29 +40,33 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from ingest import discover_jsonl, home_project_slug, ingest_file, ingest_configured_sources  # noqa: E402
+from ingest import discover_jsonl, harvest_recall_usage, home_project_slug, ingest_file, ingest_configured_sources  # noqa: E402
 from distill import distill_session, sessions_needing_distill  # noqa: E402
 from consolidate import consolidate as run_consolidate  # noqa: E402
+from consolidate import PatchError, patch_text, run_audit, states_deletion  # noqa: E402
 from search import search as fts_search, session_summary  # noqa: E402
 from backend import active_backend, generate, preflight  # noqa: E402
 from config import load_config  # noqa: E402
 from curate import CURATION_SCHEMA, build_curation_prompt, parse_curation_output  # noqa: E402
-from recall_documents import synchronize_recall_documents  # noqa: E402
-from recall_context import append_diagnostic, parse_hook_payload, recall_preflight, run_context, hook_success_json  # noqa: E402
+from recall_documents import embed_recall_documents, synchronize_recall_documents  # noqa: E402
+from recall_context import append_diagnostic, configured_embedder, parse_hook_payload, recall_preflight, recent_diagnostic, run_context, hook_success_json  # noqa: E402
+from recall_context import RECALL_KINDS, RecallUnavailable, agent_results, recall_for_agent, validate_agent_query, with_adapters  # noqa: E402
 from recall_hook_state import claim_hook_event, finish_hook_event, successful_session_start_ids  # noqa: E402
+from recall_render import delivered_ids  # noqa: E402
 from recall_hooks import install_hooks, uninstall_hooks  # noqa: E402
 from storage import open_db_readonly  # noqa: E402
-from retention_policy import POLICY_FILE, excludes_source_sessions, load_retention_policy  # noqa: E402
+from retention_policy import POLICY_FILE, excludes_source_sessions, excludes_suggestion, load_retention_policy  # noqa: E402
 
 
 def _sync_recall_documents(conn: sqlite3.Connection, memory_root,
-                           *, include_raw_transcripts: bool = False, constitution_path) -> None:
+                           *, include_raw_transcripts: bool = False, constitution_path) -> bool:
     """Keep the recall store current after a successful mutation.
 
     Synchronization is quiet on success and non-fatal: any error (missing
     recall objects, FTS problems, ...) is reported to stderr and swallowed so
     the caller's already-committed mutation is never undone and the command
-    keeps its documented behavior. Raw transcripts are opt-in.
+    keeps its documented behavior. Raw transcripts are opt-in. Returns
+    whether synchronization succeeded.
     """
     try:
         synchronize_recall_documents(
@@ -70,6 +77,34 @@ def _sync_recall_documents(conn: sqlite3.Connection, memory_root,
         )
     except Exception as e:
         print(f"recall sync skipped: {type(e).__name__}: {e}", file=sys.stderr)
+        return False
+    return True
+
+
+def _embed_recall_documents(conn: sqlite3.Connection, config) -> None:
+    """Nightly: embed new or changed recall documents after a successful sync.
+
+    Quiet when the embedder is off. Never fails the caller: an unusable or
+    unreachable embedder prints one diagnostic line to stderr and leaves the
+    lexical index complete.
+    """
+    try:
+        embedder, problem = configured_embedder(config)
+        if problem:
+            print(f"recall embed skipped: embedder misconfigured: {problem}", file=sys.stderr)
+            return
+        if embedder is None:
+            return
+        report = embed_recall_documents(
+            conn, embedder, include_raw_transcripts=config.recall_settings().allow_raw_transcript_prompt,
+        )
+    except Exception as e:
+        print(f"recall embed skipped: {type(e).__name__}: {e}", file=sys.stderr)
+        return
+    if report.error:
+        print(f"recall embed skipped: {report.error} ({report.embedded} of {report.candidates} documents stored)", file=sys.stderr)
+    elif report.embedded:
+        print(f"Recall embeddings: stored {report.embedded} vectors.")
 
 
 def _sub_label() -> str:
@@ -111,6 +146,11 @@ def _backup_before_schema_migration(conn: sqlite3.Connection, path: Path) -> Pat
         "source" not in _table_columns(conn, "sessions")
         or "distillation_key" not in _table_columns(conn, "distilled")
         or "base_sha256" not in _table_columns(conn, "suggestions")
+        or "find_text" not in _table_columns(conn, "suggestions")
+        or "vector_blob" not in _table_columns(conn, "recall_embeddings")
+        or not _table_columns(conn, "recall_usage")
+        or not _table_columns(conn, "recall_usage_markers")
+        or "path_text" not in _table_columns(conn, "recall_documents")
     )
     migrations = _table_columns(conn, "schema_migrations")
     version = conn.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0] if migrations else 0
@@ -153,6 +193,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "base_sha256": "TEXT",
             "target_existed": "INTEGER",
             "consolidation_run_id": "TEXT",
+            "find_text": "TEXT",
+        },
+        # Float32 recall vectors. No schema_migrations version: read-only
+        # paths detect the column with PRAGMA table_info and fail open.
+        "recall_embeddings": {
+            "vector_blob": "BLOB",
+            "dimension": "INTEGER",
+        },
+        # Pre-normalized path evidence, filled by the next sync. Read-only
+        # paths detect the column and compute a NULL value on the fly.
+        "recall_documents": {
+            "path_text": "TEXT",
         },
     }
     with conn:
@@ -310,6 +362,9 @@ def _prune_orphaned_index_lines(memory_root: Path, *, constitution_path) -> bool
 
 def cmd_ingest(args: argparse.Namespace) -> int:
     conn = open_db(args.db)
+    harvested = harvest_recall_usage(conn)
+    if harvested:
+        print(f"recall usage: counted {harvested} hook marker{'' if harvested == 1 else 's'}.")
     if args.projects:
         seen = ingested = msgs = 0
         for path in discover_jsonl(Path(args.projects)):
@@ -329,7 +384,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     for name, seen, ingested, messages in results:
         print(f"{name}: scanned {seen}, ingested {ingested}, {messages} messages stored.")
     print(f"DB: {args.db}")
-    _sync_recall_documents(conn, args.config.memory_root, constitution_path=args.config.data['character']['constitution_path'])
+    if _sync_recall_documents(conn, args.config.memory_root, constitution_path=args.config.data['character']['constitution_path']):
+        _embed_recall_documents(conn, args.config)
     failures = getattr(results, "failures", [])
     if failures:
         print(f"Ingestion completed with {len(failures)} source/session errors. Failed items remain eligible for retry.",
@@ -341,7 +397,7 @@ def cmd_estimate(args: argparse.Namespace) -> int:
     conn = open_db_readonly(args.db)
     candidates = sessions_needing_distill(
         conn, min_chars=args.min_chars, project_slug=args.project, config=args.config,
-        refresh_config=getattr(args, "refresh", False),
+        refresh_config=getattr(args, "refresh", False), model=getattr(args, "model", None),
     )
     if not candidates:
         print("Nothing to distill.")
@@ -367,7 +423,7 @@ def cmd_distill(args: argparse.Namespace) -> int:
     conn = open_db(args.db)
     candidates = sessions_needing_distill(
         conn, min_chars=args.min_chars, project_slug=args.project, config=args.config,
-        refresh_config=getattr(args, "refresh", False),
+        refresh_config=getattr(args, "refresh", False), model=getattr(args, "model", None),
     )
     if not candidates:
         print("Nothing to distill.")
@@ -417,27 +473,63 @@ def cmd_distill(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def _subset_embedder(config):
+    """The configured embedder for subset selection, or None to rank lexically.
+
+    Building it contacts nothing; an unusable configuration prints one line.
+    """
+    try:
+        embedder, problem = configured_embedder(config)
+    except Exception as e:
+        embedder, problem = None, f"{type(e).__name__}: {e}"
+    if problem:
+        print(f"subset selection: embedder misconfigured ({problem}); ranking lexically", file=sys.stderr)
+    return embedder
+
+
 def cmd_consolidate(args: argparse.Namespace) -> int:
     conn = open_db(args.db)
     memory_root = Path(args.memory)
     memory_root.mkdir(parents=True, exist_ok=True)
     print(f"Consolidating into suggestions for {memory_root}")
+    mode = getattr(args, "mode", None)
+    embedder = _subset_embedder(args.config) if (mode or args.config.consolidate_settings().mode) == "subset" else None
     suggestions = run_consolidate(
         conn, memory_root,
         since_iso=args.since,
         model=args.model,
         max_sessions=args.max_sessions,
         config=args.config,
+        mode=mode,
+        embedder=embedder,
     )
+    return _print_suggestions(memory_root, suggestions)
+
+
+def _print_suggestions(memory_root: Path, suggestions) -> int:
     if not suggestions:
         print("No suggestions produced.")
         return 0
     print(f"\nWrote {len(suggestions)} suggestions to {memory_root}/.suggestions/")
     for s in suggestions:
-        kind_color = {"new": "green", "update": "yellow", "remove": "red", "index": "blue"}.get(s.kind, "grey")
+        kind_color = {"new": "green", "update": "yellow", "remove": "red", "index": "blue",
+                      "patch": "magenta"}.get(s.kind, "grey")
         print(f"  [{_color(s.kind, kind_color):>14}] {s.target_path}  — {s.rationale[:80]}")
     print(f"\nRun `dream review` to walk through them.")
     return 0
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    """Weekly staleness audit; in full mode the nightly consolidation already audits."""
+    if args.config.consolidate_settings().mode == "full" and not getattr(args, "force", False):
+        print("consolidate.mode is full: the nightly consolidation already audits the whole store; "
+              "skipping. Pass --force to audit anyway.")
+        return 0
+    conn = open_db(args.db)
+    memory_root = Path(args.memory)
+    print(f"Auditing {memory_root} for stale memories")
+    suggestions = run_audit(conn, memory_root, model=args.model, config=args.config)
+    return _print_suggestions(memory_root, suggestions)
 
 
 def cmd_search(args: argparse.Namespace) -> int:
@@ -452,6 +544,73 @@ def cmd_search(args: argparse.Namespace) -> int:
         print(f"\n{role_c}  {ts}  {_color(h.project_slug, 'grey')}  {_color('('+h.session_id[:8]+')', 'grey')}")
         print(f"  {h.snippet}")
     print(f"\n{len(hits)} hits.")
+    return 0
+
+
+def _recall_unavailable(reason: str) -> int:
+    """One bounded stderr line, nothing on stdout, exit 0: agents carry on without recall."""
+    print(f"dream recall: unavailable ({' '.join(str(reason).split())[:200]})", file=sys.stderr)
+    return 0
+
+
+def cmd_recall(args: argparse.Namespace) -> int:
+    """Agent-side recall over approved memory, read-only and fail-open.
+
+    Without ``--kinds`` it reads approved memory and distilled summaries.
+    Usage errors (an empty query, ``raw_transcript`` without the opt-in)
+    exit 2. A missing or busy database, an unmigrated schema or disabled
+    recall print one ``unavailable`` line to stderr and exit 0. The command
+    writes nothing: no markers, cache rows, embeddings or diagnostics.
+    """
+    settings = args.config.recall_settings()
+    try:
+        query_text, kinds = validate_agent_query(args.query, args.kinds, settings)
+    except ValueError as exc:
+        print(f"dream recall: {exc}", file=sys.stderr)
+        return 2
+    conn = None
+    try:
+        if not args.db.exists():
+            return _recall_unavailable("database does not exist")
+        conn = open_db_readonly(args.db)
+        # Building the embedder contacts nothing; an unusable one means lexical recall.
+        embedder, embedder_problem = configured_embedder(args.config)
+        if embedder_problem:
+            settings = with_adapters(settings, embedder=False)
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = None
+        result = recall_for_agent(
+            conn, settings, query_text=query_text, cwd=cwd, memory_root=args.config.memory_root,
+            constitution_path=args.config.data["character"]["constitution_path"], project_slug=args.project,
+            kinds=kinds, limit=args.limit, budget_codepoints=settings.prompt_budget_codepoints, embedder=embedder,
+        )
+    except RecallUnavailable as exc:
+        return _recall_unavailable(str(exc))
+    except sqlite3.Error as exc:
+        return _recall_unavailable(f"{type(exc).__name__}: {exc}")
+    except Exception as exc:
+        # Other messages can carry absolute paths (an unreadable policy file); the type is enough.
+        return _recall_unavailable(type(exc).__name__)
+    finally:
+        if conn is not None:
+            conn.close()
+    try:
+        if args.json:
+            fallback_reason = result.diagnostics.fallback_reason or ("embedder-misconfigured" if embedder_problem else None)
+            print(json.dumps({
+                "mode": result.mode,
+                "calibration_version": result.calibration_version,
+                "fallback_reason": fallback_reason,
+                "results": agent_results(result),
+                "context": result.rendered_context,
+            }, ensure_ascii=False))
+        elif result.rendered_context:
+            print(result.rendered_context)
+    except (UnicodeError, OSError) as exc:
+        # A stdout that cannot encode the marker (latin-1 locale) or is closed: no traceback.
+        return _recall_unavailable(type(exc).__name__)
     return 0
 
 
@@ -481,6 +640,43 @@ def _file_sha256(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
 
 
+def apply_patch(target: Path, find: str, replace: str, *, expected_sha: str | None,
+                allow_empty: bool = False) -> str:
+    """Write one accepted `patch` suggestion; the only writer for patches.
+
+    Refuses (PatchError, nothing written) unless the target exists with the
+    expected SHA-256, is NFC, and contains the NFC-normalized `find` exactly
+    once. An empty replacement needs ``allow_empty`` (a stated deletion).
+    Callers run the containment, protected-file and retention checks and take
+    the backup first, exactly as for `update`. Returns the written text.
+    """
+    target = Path(target)
+    if not expected_sha:
+        raise PatchError("patch requires a base SHA precondition")
+    if not target.exists():
+        raise PatchError(f"patch target does not exist: {target.name}")
+    data = target.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected_sha:
+        raise PatchError("target changed since the suggestion was made")
+    patched = patch_text(data.decode("utf-8"), find, replace, allow_empty=allow_empty)
+    target.write_text(patched, encoding="utf-8", newline="")
+    return patched
+
+
+def _patch_fields(conn: sqlite3.Connection, sug_id) -> tuple[str | None, str]:
+    """Return (find_text, rationale) of a suggestion; (None, "") on a pre-patch schema."""
+    columns = _table_columns(conn, "suggestions")
+    if "find_text" not in columns:
+        return None, ""
+    rationale = "rationale" if "rationale" in columns else "''"
+    row = conn.execute(f"SELECT find_text, {rationale} FROM suggestions WHERE id=?", (sug_id,)).fetchone()
+    return (row[0], row[1] or "") if row else (None, "")
+
+
+def _find_text(conn: sqlite3.Connection, sug_id) -> str | None:
+    return _patch_fields(conn, sug_id)[0]
+
+
 def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
                       sug_id, kind, target_path, new_content, sug_file,
                       sync_recall: bool = True, *, constitution_path) -> bool:
@@ -496,7 +692,8 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
     resolved_target = tgt.resolve()
     contained = resolved_target.is_relative_to(resolved_root)
     from character.safety import is_memory_control_source
-    protected = kind == "remove" and resolved_target == resolved_root / "MEMORY.md"
+    # MEMORY.md is never deleted, and never patched: index lines are only appended.
+    protected = kind in ("remove", "patch") and resolved_target == resolved_root / "MEMORY.md"
     if is_memory_control_source(tgt, memory_root=memory_root, constitution_path=constitution_path):
         _reject_suggestion(conn, sug_dir, sug_id, sug_file)
         print(f"  rejected #{sug_id}: the constitution is human-controlled")
@@ -527,12 +724,31 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
     if conflict:
         print(f"  conflict #{sug_id} ({target_path}): target changed since suggestion")
         return False
+    if kind == "patch" and contained and not protected:
+        find, rationale = _patch_fields(conn, sug_id)
+        allow_empty = states_deletion(rationale)
+        try:
+            patched = patch_text(tgt.read_bytes().decode("utf-8") if tgt.exists() else "",
+                                 find or "", new_content or "", allow_empty=allow_empty)
+        except (PatchError, OSError, UnicodeDecodeError) as exc:
+            print(f"  deferred #{sug_id}: {exc}")
+            return False
+        if policy.excludes(source_path=target_path, text=patched):
+            _reject_suggestion(conn, sug_dir, sug_id, sug_file)
+            print(f"  rejected #{sug_id}: excluded by local memory retention policy")
+            return False
     if contained and not protected:
         tgt.parent.mkdir(parents=True, exist_ok=True)
         if kind == "remove" and tgt.exists():
             tgt.unlink()
         elif kind in ("new", "update", "index"):
             tgt.write_text(new_content, encoding="utf-8")
+        elif kind == "patch":
+            try:
+                apply_patch(tgt, find or "", new_content or "", expected_sha=base_sha, allow_empty=allow_empty)
+            except PatchError as exc:
+                print(f"  deferred #{sug_id}: {exc}")
+                return False
         status = "accepted"
     else:
         print(f"  refusing #{sug_id} ({target_path}): unsafe target, marking rejected")
@@ -572,7 +788,7 @@ def _safe_suggestion_target(memory_root: Path, target_path: str) -> Path | None:
     return target if target.is_relative_to(root) else None
 
 
-def _curation_target_snapshot(memory_root: Path, row: tuple) -> dict[str, Any]:
+def _curation_target_snapshot(memory_root: Path, row: tuple, find_text: str | None = None) -> dict[str, Any]:
     """Build the model-facing snapshot without reading an unsafe target path."""
     sug_id, kind, target_path, body, rationale, sources, sug_file, base_sha, existed = row
     target = _safe_suggestion_target(memory_root, target_path)
@@ -590,6 +806,7 @@ def _curation_target_snapshot(memory_root: Path, row: tuple) -> dict[str, Any]:
             "current_body": "",
             "current_sha256": None,
             "conflict": True,
+            "find_text": find_text,
         }
 
     target_existed = target.exists()
@@ -613,6 +830,7 @@ def _curation_target_snapshot(memory_root: Path, row: tuple) -> dict[str, Any]:
         "current_body": current_body,
         "current_sha256": current_sha,
         "conflict": conflict,
+        "find_text": find_text,
     }
 
 
@@ -688,7 +906,7 @@ def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions, *, const
             unsafe.append(sug_id)
             print(f"conflict #{sug_id}: unsafe target path; rejected by host safety check")
             continue
-        if kind == "remove" and target == memory_root.resolve() / "MEMORY.md":
+        if kind in ("remove", "patch") and target == memory_root.resolve() / "MEMORY.md":
             _reject_suggestion(conn, memory_root / ".suggestions", sug_id, sug_file)
             rejected.append(sug_id)
             unsafe.append(sug_id)
@@ -718,7 +936,9 @@ def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions, *, const
             print(f"conflict #{sug_id} ({target_path}): initial conflict; accept deferred")
             continue
         proposed_body = snapshot["body"] if decision.decision == "accept" else decision.body
-        new_content = _resolved_body(kind, old, proposed_body)
+        # A merge supplies a complete body, so a merged patch applies as an update.
+        apply_kind = "update" if kind == "patch" and decision.decision == "merge" else kind
+        new_content = _resolved_body(apply_kind, old, proposed_body)
         if backup is None:
             backup = _backup_memory(memory_root)
         with conn:
@@ -726,13 +946,19 @@ def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions, *, const
                 "UPDATE suggestions SET base_sha256=?, target_existed=? WHERE id=?",
                 (expected["sha256"], int(expected["existed"]), sug_id),
             )
+            if apply_kind != kind:
+                # Store the full merged body too: a pending update must never hold a patch span.
+                conn.execute(
+                    "UPDATE suggestions SET kind='update', find_text=NULL, body=? WHERE id=?",
+                    (proposed_body, sug_id),
+                )
         try:
             applied_ok = _apply_suggestion(
                 conn,
                 memory_root,
                 memory_root / ".suggestions",
                 sug_id,
-                kind,
+                apply_kind,
                 target_path,
                 new_content,
                 sug_file,
@@ -784,10 +1010,25 @@ def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, ro
         return 0
 
     try:
-        snapshots = [_curation_target_snapshot(memory_root, row) for row in rows]
+        # A rule added after a suggestion was staged: its fields never reach the
+        # provider, and `dream retention --apply` rejects it.
+        policy = load_retention_policy(memory_root)
+        snapshots = []
+        for row in rows:
+            find_text = _find_text(conn, row[0]) if row[1] == "patch" else None
+            if excludes_suggestion(conn, policy, memory_root, target_path=row[2], source_sessions=row[5],
+                                   texts=(row[3], row[4], find_text)):
+                print(f"skipped #{row[0]}: excluded by local memory retention policy; "
+                      "dream retention --apply rejects it")
+                continue
+            snapshots.append(_curation_target_snapshot(memory_root, row, find_text))
+        if not snapshots:
+            conn.close()
+            print("No pending suggestions to curate.")
+            return 0
         prompt = build_curation_prompt(snapshots, memory_root)
         result = generate("review", prompt, CURATION_SCHEMA, config=args.config)
-        decisions = parse_curation_output(result.output, {row[0] for row in rows})
+        decisions = parse_curation_output(result.output, {snapshot["id"] for snapshot in snapshots})
         missing_merge_bodies = [
             sug_id for sug_id, decision in decisions.items()
             if decision.decision == "merge" and not isinstance(decision.body, str)
@@ -823,6 +1064,35 @@ def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, ro
         write_conn.close()
 
 
+def _embed_after_curation(args: argparse.Namespace, memory_root: Path) -> None:
+    """The nightly embed step after curation, the last stage that changes recall documents.
+
+    Distillation and accepted suggestions synchronize the recall index without
+    embedding, and synchronization drops the vectors of changed documents, so
+    this embeds what changed since ingest. It synchronizes first, as ingest
+    and ``dream embed`` do, so a retention exclusion added since the last sync
+    removes its documents before any text leaves the process; a failed sync
+    embeds nothing. Nothing is opened when the embedder is off; any failure
+    prints one line and leaves curation's result alone.
+    """
+    if getattr(args, "dry_run", False) or not Path(args.db).exists():
+        return
+    try:
+        embedder, problem = configured_embedder(args.config)
+        if embedder is None and problem is None:
+            return
+        conn = open_db(args.db)
+    except Exception as e:
+        print(f"recall embed skipped: {type(e).__name__}: {e}", file=sys.stderr)
+        return
+    try:
+        if _sync_recall_documents(conn, memory_root,
+                                  constitution_path=args.config.data["character"]["constitution_path"]):
+            _embed_recall_documents(conn, args.config)
+    finally:
+        conn.close()
+
+
 def cmd_suggestions(args: argparse.Namespace) -> int:
     memory_root = Path(args.memory)
     sug_dir = memory_root / ".suggestions"
@@ -840,7 +1110,9 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
                 conn.close()
             print(f"curation error: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
-        return _cmd_curate_configured(args, conn, memory_root, rows)
+        result = _cmd_curate_configured(args, conn, memory_root, rows)
+        _embed_after_curation(args, memory_root)
+        return result
 
     conn = open_db_readonly(args.db) if args.suggestions_cmd == "list" else open_db(args.db)
     rows = _pending_suggestions(conn)
@@ -866,6 +1138,8 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
                 "current_sha256": _file_sha256(path),
                 "conflict": conflict,
             })
+            if kind == "patch":
+                items[-1]["find"] = _find_text(conn, sug_id)
         print(json.dumps({"suggestions": items}, ensure_ascii=False, indent=2))
         return 0
 
@@ -918,6 +1192,10 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
                 "UPDATE suggestions SET body=?, base_sha256=?, target_existed=? WHERE id=?",
                 (body, _file_sha256(path), int(path.exists()), sug_id),
             )
+            if kind == "patch":
+                # The merge body is the complete file, so the patch becomes an update.
+                conn.execute("UPDATE suggestions SET kind='update', find_text=NULL WHERE id=?", (sug_id,))
+        kind = "update" if kind == "patch" else kind
     new_content = _resolved_body(kind, old, body)
     backup = _backup_memory(memory_root)
     print(f"Backup: {backup}")
@@ -954,6 +1232,13 @@ def cmd_review(args: argparse.Namespace) -> int:
             tgt = memory_root / target_path
             old = tgt.read_text(encoding="utf-8") if tgt.exists() else ""
             new_content = _resolved_body(kind, old, body)
+            if kind == "patch":
+                find, patch_rationale = _patch_fields(conn, sug_id)
+                try:
+                    patch_text(old, find or "", body or "", allow_empty=states_deletion(patch_rationale))
+                except PatchError as exc:
+                    print(f"  [{kind:<6}] {target_path}  (#{sug_id}) — deferred: {exc}")
+                    continue
             noop = (kind == "index" and new_content == old)
             tag = "no-op" if noop else ("would apply" if dry else "applied")
             print(f"  [{kind:<6}] {target_path}  (#{sug_id}) — {tag}")
@@ -985,14 +1270,23 @@ def cmd_review(args: argparse.Namespace) -> int:
         print(f"sources:   {sources}")
         print(_color("-" * 78, "grey"))
 
+        shown = new_content
+        if kind == "patch":
+            find = _find_text(conn, sug_id)
+            print(f"find: {find}")
+            try:
+                shown = patch_text(old, find or "", body or "", allow_empty=states_deletion(rationale))
+            except PatchError as exc:
+                print(_color(f"(patch cannot apply as proposed: {exc}; accepting defers it)", "red"))
+                shown = None
         if kind == "remove":
             print(_color("(would delete this file)", "red"))
-        else:
-            # Diff against what we'll actually write (merged result for index), so the
-            # preview never lies about the outcome.
+        elif shown is not None:
+            # Diff against what we'll actually write (merged result for index, patched
+            # file for patch), so the preview never lies about the outcome.
             diff = difflib.unified_diff(
                 old.splitlines(keepends=True),
-                new_content.splitlines(keepends=True),
+                shown.splitlines(keepends=True),
                 fromfile=f"a/{target_path}",
                 tofile=f"b/{target_path}",
                 n=3,
@@ -1014,8 +1308,8 @@ def cmd_review(args: argparse.Namespace) -> int:
         if choice == "q":
             break
         if choice == "a":
-            _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target_path, new_content, sug_file, constitution_path=args.config.data['character']['constitution_path'])
-            print(_color("  accepted.", "green"))
+            if _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target_path, new_content, sug_file, constitution_path=args.config.data['character']['constitution_path']):
+                print(_color("  accepted.", "green"))
         elif choice == "r":
             conn.execute("UPDATE suggestions SET status='rejected', reviewed_at=CURRENT_TIMESTAMP WHERE id=?", (sug_id,))
             conn.commit()
@@ -1041,13 +1335,59 @@ def cmd_status(args: argparse.Namespace) -> int:
     accepted = scalar("SELECT COUNT(*) FROM suggestions WHERE status='accepted'")
     print(f"Suggestions pending: {pending}")
     print(f"Suggestions accepted:{accepted}")
-    last = conn.execute("SELECT MAX(created_at) FROM consolidation_runs").fetchone()
+    last = conn.execute("SELECT MAX(created_at) FROM consolidation_runs WHERE run_id NOT LIKE 'audit-%'").fetchone()
     print(f"Last consolidate:   {last[0] if last and last[0] else 'never'}")
+    audit = conn.execute("SELECT MAX(created_at) FROM consolidation_runs WHERE run_id LIKE 'audit-%'").fetchone()
+    if audit and audit[0]:
+        print(f"Last audit:         {audit[0]}")
     distill_route = args.config.stage("distill")
     consolidate_route = args.config.stage("consolidate")
     print(f"Distill route:      {distill_route['provider']} / {distill_route.get('model') or '(provider default)'}")
     print(f"Consolidate route:  {consolidate_route['provider']} / {consolidate_route.get('model') or '(provider default)'}")
+    if getattr(args, "usage", False):
+        _print_usage_report(conn, args.config.memory_root)
     return 0
+
+
+def _memory_index_lines(memory_root: Path) -> dict[str, str]:
+    try:
+        lines = (memory_root / "MEMORY.md").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return {}
+    index: dict[str, str] = {}
+    for line in lines:
+        target = _index_target(line)
+        if target and target not in index:
+            index[target] = line.strip()
+    return index
+
+
+def _print_usage_report(conn: sqlite3.Connection, memory_root: Path) -> None:
+    """Approved memory files automatic recall has not delivered lately. Read-only."""
+    import recall_usage
+
+    try:
+        report = recall_usage.usage_report(conn)
+    except sqlite3.Error as exc:
+        print(f"Recall usage:       not available ({type(exc).__name__}: recall tables unreadable)")
+        return
+    if report.state == "unavailable":
+        print("Recall usage:       not available (database not migrated yet; the next `dream ingest` adds it)")
+        return
+    if report.state == "not-observed":
+        print("Recall usage:       not observed yet (no recall hook markers harvested by `dream ingest`)")
+        return
+    days = recall_usage.UNUSED_DAYS
+    print(f"Recall usage:       observed since {report.since} (harvested from recall hook markers)")
+    print(f"  {len(report.unused)} of {report.approved_count} approved memory files not recalled in the last "
+          f"{days} days (report only; nothing is deleted)")
+    if report.window_shorter_than_days:
+        print(f"  The observation window is shorter than {days} days, so recent files may not have had a chance.")
+    index = _memory_index_lines(memory_root)
+    usage = recall_usage.usage_map(conn)
+    for entry in report.unused:
+        print(f"  {entry.source_path} ({recall_usage.annotation(usage, entry.document_id)})")
+        print(f"      {index.get(entry.source_path, '(not in MEMORY.md)')}")
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
@@ -1058,23 +1398,127 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     for name, ok, detail in recall_preflight(args.config, args.db):
         print(f"{'ok' if ok else 'FAIL'}  {name}: {detail}")
         failed = failed or not ok
+    consolidate = args.config.consolidate_settings()
+    mode = consolidate.mode if consolidate.mode == "full" else (
+        f"{consolidate.mode} ({consolidate.subset_files} topic files; the weekly dream audit covers the whole store)")
+    print(f"ok  consolidate.mode: {mode}")
     return 1 if failed else 0
+
+
+def cmd_embed(args: argparse.Namespace) -> int:
+    embedder, problem = configured_embedder(args.config)
+    if problem:
+        print(f"dream embed: embedder misconfigured: {problem}", file=sys.stderr)
+        return 2
+    if embedder is None:
+        print('dream embed: the embedder is disabled; set [recall.embedder] enabled = true and type = "openai-compatible"',
+              file=sys.stderr)
+        return 2
+    conn = open_db(args.db)
+    try:
+        # Synchronize first, so retention exclusions and edits are current
+        # before any text leaves the process.
+        if not _sync_recall_documents(conn, args.config.memory_root,
+                                      constitution_path=args.config.data["character"]["constitution_path"]):
+            return 1
+        report = embed_recall_documents(
+            conn, embedder, include_raw_transcripts=args.config.recall_settings().allow_raw_transcript_prompt,
+            refresh=args.refresh,
+        )
+    finally:
+        conn.close()
+    print(f"Embedded {report.embedded} of {report.candidates} documents under {report.fingerprint}.")
+    if report.error:
+        print(f"dream embed: stopped: {report.error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _open_ephemeral_eval_db() -> sqlite3.Connection:
+    """In-memory database for fixture runs: fixture rows never reach the live index."""
+    conn = sqlite3.connect(":memory:")
+    conn.executescript((ROOT / "schema.sql").read_text(encoding="utf-8"))
+    _migrate(conn)
+    return conn
 
 
 def cmd_recall_eval(args: argparse.Namespace) -> int:
     from recall_eval import evaluate_fixture_file
-    conn = sqlite3.connect(":memory:")
-    conn.executescript((ROOT / "schema.sql").read_text(encoding="utf-8"))
-    _migrate(conn)
-    report = evaluate_fixture_file(args.fixtures, conn, args.config.recall_settings())
+    embedder, problem = configured_embedder(args.config)
+    if problem:
+        print(f"recall-eval: embedder misconfigured, reporting lexical only: {problem}", file=sys.stderr)
+    conn = _open_ephemeral_eval_db()
+    report = evaluate_fixture_file(args.fixtures, conn, args.config.recall_settings(), embedder=embedder)
     conn.close()
-    print(json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True))
+    result = report.to_dict()
+    if getattr(args, "by_language", False):
+        result["breakdown"] = report.breakdown_dict()
+        # The headline metrics score the delivered context; these score selection before rendering.
+        result["retrieval"] = report.retrieval
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_eval_build(args: argparse.Namespace) -> int:
+    from eval_build import build_eval_fixture, collect_eval_documents, default_output_path
+    output = Path(args.output).expanduser() if args.output else default_output_path()
+    memory_root = args.config.memory_root
+    conn = None
+    try:
+        # Read-only, and tolerant of a nightly writer's active WAL.
+        conn = _open_curation_readonly(Path(args.db))
+        _corpus, candidates = collect_eval_documents(conn, memory_root, config=args.config)
+        if not candidates:
+            print("eval-build: the recall index has no approved memories or distilled summaries to ask about; "
+                  "run the nightly pipeline (dream distill) first.", file=sys.stderr)
+            return 1
+        if args.limit is None and not args.yes:
+            print(f"Would ask the configured distill provider for questions about {len(candidates)} documents "
+                  f"(one call each). Pass --limit N to cap, or --yes to proceed.")
+            return 2
+        fixture = build_eval_fixture(
+            conn, memory_root, config=args.config, questions_per_file=args.questions_per_file,
+            languages=args.languages, limit=args.limit, output=output,
+        )
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        print(f"eval-build: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        if conn is not None:
+            conn.close()
+    generator = fixture["generator"]
+    print(f"Wrote {len(fixture['queries'])} queries for {generator['sampled_documents']} documents "
+          f"({len(fixture['documents'])} in the corpus) to {output}")
+    print("This fixture holds private memory text: keep it out of the repository.")
+    if generator["failed_documents"]:
+        print(f"{generator['failed_documents']} documents failed at the provider and have no questions.", file=sys.stderr)
+        return 1
     return 0
 
 
 def cmd_recall_calibrate(args: argparse.Namespace) -> int:
-    from recall_eval import calibrate_fixture_file
-    record = calibrate_fixture_file(args.fixtures, open_db(args.db), args.mode)
+    from recall_eval import EMBEDDER_MODE, calibrate_fixture_file
+    embedder = None
+    if args.mode == EMBEDDER_MODE:
+        embedder, problem = configured_embedder(args.config)
+        if embedder is None:
+            print(f"recall-calibrate: {EMBEDDER_MODE} needs the configured embedder: {problem or 'the embedder is disabled'}",
+                  file=sys.stderr)
+            return 2
+    apply = bool(getattr(args, "apply", False))
+    # Calibrate on an in-memory copy of the fixture: a stale or now-excluded
+    # fixture row must never be re-inserted into the live recall index.
+    conn = _open_ephemeral_eval_db()
+    try:
+        record = calibrate_fixture_file(args.fixtures, conn, args.mode, embedder=embedder, require_usable=apply,
+                                        settings=args.config.recall_settings())
+    except ValueError as exc:
+        if not apply:
+            raise
+        print(f"recall-calibrate: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
     result = {
         "mode": record.mode,
         "calibration_version": record.calibration_version,
@@ -1082,6 +1526,24 @@ def cmd_recall_calibrate(args: argparse.Namespace) -> int:
         "fixture_sha256": record.fixture_sha256,
         "created_at": record.created_at,
     }
+    if apply:
+        # The only writer of recall_calibrations: one row for the requested
+        # mode, through the normal writer, after the evaluation succeeded.
+        live = open_db(args.db)
+        try:
+            with live:
+                live.execute(
+                    "INSERT INTO recall_calibrations(mode, calibration_version, threshold, fixture_sha256, created_at) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(mode) DO UPDATE SET "
+                    "calibration_version=excluded.calibration_version, threshold=excluded.threshold, "
+                    "fixture_sha256=excluded.fixture_sha256, created_at=excluded.created_at",
+                    (record.mode, record.calibration_version, record.threshold, record.fixture_sha256, record.created_at),
+                )
+        finally:
+            live.close()
+        result["applied_to"] = str(args.db)
+        print(f"recall-calibrate: wrote recall_calibrations row mode={record.mode} threshold={record.threshold} "
+              f"calibration_version={record.calibration_version} to {args.db}", file=sys.stderr)
     if args.output:
         output = Path(args.output).expanduser()
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1161,9 +1623,22 @@ def cmd_context(args: argparse.Namespace) -> int:
             if explain:
                 print(json.dumps({"candidate_count": 0, "selected_count": 0, "fallback_reason": "duplicate-or-running"}, separators=(",", ":")))
             return 0
-        result = run_context(conn, query, settings, explain=explain, allow_cache_writes=False,
+        # Building the embedder contacts nothing; an unusable one means lexical recall.
+        embedder, embedder_problem = configured_embedder(args.config)
+        if embedder_problem:
+            settings = with_adapters(settings, embedder=False)
+        result = run_context(conn, query, settings, explain=explain, embedder=embedder, allow_cache_writes=False,
                              memory_root=args.config.memory_root,
                              constitution_path=args.config.data["character"]["constitution_path"])
+        fallback_reason = result.diagnostics.fallback_reason or ("embedder-misconfigured" if embedder_problem else None)
+        if embedder_problem or str(fallback_reason).startswith(("embedder-unavailable", "embedder-error", "dense-scan-timeout")):
+            try:
+                # One line per reason every ten minutes while the embedder stays down.
+                if not recent_diagnostic(settings, fallback_reason):
+                    append_diagnostic(settings, {"event": query.hook_event, "fallback_reason": fallback_reason,
+                                                 "embedder_problem": (embedder_problem or "")[:400] or None})
+            except Exception:
+                pass
         character_text = ""
         character_diagnostic = None
         reminder_text = ""
@@ -1190,7 +1665,10 @@ def cmd_context(args: argparse.Namespace) -> int:
         )
         character_diagnostic = character_diagnostic or budget_diagnostic
         if attempt_token is not None:
-            finish_hook_event(query.session_id, query.hook_event, succeeded=True, selected_ids=[candidate.document.id for candidate in result.selected], attempt_token=attempt_token)
+            # selected_ids keeps the prompt-path exclusion as before; usage counts
+            # only the blocks that reached the agent (delivered_ids).
+            finish_hook_event(query.session_id, query.hook_event, succeeded=True, selected_ids=[candidate.document.id for candidate in result.selected], attempt_token=attempt_token,
+                              delivered_ids=delivered_ids(result.selected, combined_context))
         if explain:
             print(json.dumps({
                 "candidate_ids": [candidate.document.id for candidate in result.selected],
@@ -1199,7 +1677,7 @@ def cmd_context(args: argparse.Namespace) -> int:
                 "short_review_diagnostic": reminder_diagnostic,
                 "elapsed_ms": result.diagnostics.elapsed_ms,
                 "calibration_version": result.calibration_version,
-                "fallback_reason": result.diagnostics.fallback_reason,
+                "fallback_reason": fallback_reason,
             }, ensure_ascii=False, separators=(",", ":")))
         else:
             print(hook_success_json(event_name, combined_context))
@@ -1211,6 +1689,85 @@ def cmd_context(args: argparse.Namespace) -> int:
             except Exception:
                 pass
         return _context_failure(args, exc, explain=explain)
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    """``mcp serve`` speaks JSON-RPC on stdio; ``mcp install|uninstall`` edit one client's config.
+
+    ``serve`` keeps stdout for protocol messages only and stays up when the
+    configuration fails to load: every tool call then reports the error.
+    """
+    if args.mcp_cmd == "serve":
+        from mcp_server import serve
+        try:
+            return serve(sys.stdin, sys.stdout, args.config, db_path=args.db,
+                         config_error=getattr(args, "config_error", None))
+        except KeyboardInterrupt:
+            return 130
+    import mcp_install
+    if args.client == "claude" and args.path:
+        print("dream mcp: --path applies to codex and opencode only; Claude Code manages its own file",
+              file=sys.stderr)
+        return 2
+    path = Path(args.path).expanduser() if args.path else None
+    # Explicit --config and --db choose the profile the client's server reads too.
+    launch = mcp_install.server_launch(config_path=getattr(args, "config_option", None),
+                                       db_path=getattr(args, "db_option", None))
+    try:
+        if args.mcp_cmd == "install":
+            report = mcp_install.install(args.client, path, launch)
+        else:
+            report = mcp_install.uninstall(args.client, path)
+    except mcp_install.McpInstallError as exc:
+        print(f"dream mcp: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"dream mcp: {exc.strerror or type(exc).__name__}", file=sys.stderr)
+        return 1
+    where = f" in {report.path}" if report.path else ""
+    if args.mcp_cmd == "install":
+        if not report.changed:
+            print(f"The Dream MCP server is already installed for {args.client}{where}.")
+        elif report.detail == "updated":
+            print(f"Updated the Dream MCP server entry for {args.client}{where}.")
+        else:
+            print(f"Installed the Dream MCP server for {args.client}{where}.")
+    else:
+        print(f"Removed the Dream MCP server for {args.client}{where}." if report.changed
+              else f"Nothing to remove for {args.client}{where}: {report.detail}.")
+    for note in report.notes:
+        print(note)
+    if report.backup_path:
+        print(f"Backup of the previous file: {report.backup_path}")
+    if args.mcp_cmd == "install":
+        print(mcp_install.next_step(args.client, launch))
+    return 0
+
+
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        number = 0
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return number
+
+
+def _recall_kinds(value: str) -> tuple[str, ...]:
+    kinds = tuple(dict.fromkeys(part.strip() for part in value.split(",") if part.strip()))
+    unknown = [kind for kind in kinds if kind not in RECALL_KINDS]
+    if not kinds or unknown:
+        raise argparse.ArgumentTypeError(f"expected a comma-separated list of: {', '.join(RECALL_KINDS)}")
+    return kinds
+
+
+def _language_codes(value: str) -> tuple[str, ...]:
+    from eval_build import validate_languages
+    try:
+        return validate_languages(part for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1248,7 +1805,16 @@ def main(argv: list[str] | None = None) -> int:
     pc.add_argument("--since", help="Optional legacy timestamp lower bound")
     pc.add_argument("--max-sessions", type=int, default=200)
     pc.add_argument("--model", default=None, help="Temporary model override")
+    pc.add_argument("--mode", choices=["full", "subset"], default=None,
+                    help="Override consolidate.mode for this run")
     pc.set_defaults(func=cmd_consolidate)
+
+    pa = sub.add_parser("audit", help="Weekly staleness audit over the whole store (remove/patch suggestions)")
+    pa.add_argument("--memory")
+    pa.add_argument("--model", default=None, help="Temporary model override")
+    pa.add_argument("--force", action="store_true",
+                    help="Audit even when consolidate.mode is full (the nightly run already audits)")
+    pa.set_defaults(func=cmd_audit)
 
     ps = sub.add_parser("search", help="FTS5 search over transcripts")
     ps.add_argument("query")
@@ -1256,6 +1822,17 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("--role", choices=["user", "assistant"])
     ps.add_argument("--project")
     ps.set_defaults(func=cmd_search)
+
+    prc = sub.add_parser("recall", help="Read-only approved-memory query for agents (untrusted reference data)")
+    prc.add_argument("query", help="3-8 content words, passed as one argument")
+    prc.add_argument("--project", help="Prefer this project slug; other projects stay eligible")
+    prc.add_argument("--kinds", type=_recall_kinds,
+                     help="Comma-separated source kinds (default approved_memory,distilled_summary; "
+                          "raw_transcript must be named and needs recall.allow_raw_transcript_prompt)")
+    prc.add_argument("--limit", type=int, default=5, help="Results to return, clamped to 1-10 (default 5)")
+    prc.add_argument("--json", action="store_true",
+                     help="Print one JSON object with mode, calibration version, results and the rendered context")
+    prc.set_defaults(func=cmd_recall)
 
     pr = sub.add_parser("review", help="Walk pending suggestions interactively")
     pr.add_argument("--memory")
@@ -1287,6 +1864,8 @@ def main(argv: list[str] | None = None) -> int:
     scurate.set_defaults(func=cmd_suggestions)
 
     pst = sub.add_parser("status", help="Show DB stats")
+    pst.add_argument("--usage", action="store_true",
+                     help="List approved memory files not recalled in the last 90 days (read-only)")
     pst.set_defaults(func=cmd_status)
 
     pret = sub.add_parser("retention", help="Preview or apply local memory exclusions")
@@ -1297,6 +1876,11 @@ def main(argv: list[str] | None = None) -> int:
     ppre = sub.add_parser("preflight", help="Check configured provider executables and auth")
     ppre.set_defaults(func=cmd_preflight)
 
+    pemb = sub.add_parser("embed", help="Store recall embeddings with the configured local embedder")
+    pemb.add_argument("--refresh", action="store_true",
+                      help="Re-embed every current document, e.g. after a model change behind the same name")
+    pemb.set_defaults(func=cmd_embed)
+
     pctx = sub.add_parser("context", help="Run fail-open automatic recall context")
     csub = pctx.add_subparsers(dest="context_cmd", required=True)
     for context_cmd in ("session-start", "prompt"):
@@ -1306,11 +1890,24 @@ def main(argv: list[str] | None = None) -> int:
 
     peval = sub.add_parser("recall-eval", help="Evaluate a recall fixture")
     peval.add_argument("--fixtures", required=True)
+    peval.add_argument("--by-language", action="store_true",
+                       help="Add Recall@1/@5, MRR, forbidden results and p95 latency per mode and language")
     peval.set_defaults(func=cmd_recall_eval)
+    pbuild = sub.add_parser("eval-build", help="Build a private held-out recall fixture with the distill provider")
+    pbuild.add_argument("--limit", type=_positive_int, help="Ask about at most N documents")
+    pbuild.add_argument("--questions-per-file", type=_positive_int, default=3,
+                        help="Questions per document and language (default 3)")
+    pbuild.add_argument("--languages", type=_language_codes, default=("en", "pl"),
+                        help="Comma-separated language codes (default en,pl)")
+    pbuild.add_argument("--output", help="Fixture path (default ~/.config/dream/eval/private.json)")
+    pbuild.add_argument("--yes", "-y", action="store_true", help="Proceed without --limit")
+    pbuild.set_defaults(func=cmd_eval_build)
     pcal = sub.add_parser("recall-calibrate", help="Calibrate recall thresholds")
     pcal.add_argument("--fixtures", required=True)
     pcal.add_argument("--mode", required=True)
     pcal.add_argument("--output")
+    pcal.add_argument("--apply", action="store_true",
+                      help="Write the calibration for --mode to the live database (recall_calibrations)")
     pcal.set_defaults(func=cmd_recall_calibrate)
 
     phooks = sub.add_parser("hooks", help="Install or remove Codex recall hooks")
@@ -1320,10 +1917,22 @@ def main(argv: list[str] | None = None) -> int:
         hp.add_argument("--path", default=os.environ.get("DREAM_CODEX_HOOKS_PATH", str(Path.home() / ".codex" / "hooks.json")))
         hp.set_defaults(func=cmd_hooks)
 
+    pmcp = sub.add_parser("mcp", help="Read-only recall tools for agents over MCP stdio, and client installers")
+    msub = pmcp.add_subparsers(dest="mcp_cmd", required=True)
+    mserve = msub.add_parser("serve", help="Serve recall_search, recall_get and memory_index as JSON-RPC on stdio")
+    mserve.set_defaults(func=cmd_mcp)
+    for mcp_cmd, verb in (("install", "Add"), ("uninstall", "Remove")):
+        mp = msub.add_parser(mcp_cmd, help=f"{verb} the dream MCP server entry in one client's configuration")
+        mp.add_argument("--client", required=True, choices=("codex", "opencode", "claude"))
+        mp.add_argument("--path", help="Client config file for codex or opencode (default: the client's global config)")
+        mp.set_defaults(func=cmd_mcp)
+
     from character.cli import register as register_character
     register_character(sub)
 
     args = p.parse_args(argv)
+    # The options as given; args.config and args.db are replaced by what they resolve to.
+    args.config_option, args.db_option = args.config, args.db
     try:
         args.config = load_config(Path(args.config).expanduser() if args.config else None)
     except Exception as exc:
@@ -1331,7 +1940,14 @@ def main(argv: list[str] | None = None) -> int:
             if getattr(args, "explain", False):
                 print(json.dumps({"error": type(exc).__name__, "message": str(exc)[:400]}, separators=(",", ":")))
             return 0
-        raise
+        if args.cmd == "recall":
+            return _recall_unavailable(f"configuration error: {type(exc).__name__}")
+        if args.cmd != "mcp":
+            raise
+        # mcp serve keeps speaking JSON-RPC and reports the error per tool call; install needs no config.
+        args.config, args.config_error = None, type(exc).__name__
+        args.db = Path(args.db).expanduser() if args.db else None
+        return args.func(args)
     args.db = Path(args.db).expanduser() if args.db else args.config.db_path
     if hasattr(args, "memory"):
         args.memory = str(Path(args.memory).expanduser()) if args.memory else str(args.config.memory_root)

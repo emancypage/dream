@@ -1,0 +1,14 @@
+[Unit]
+Description=Dream weekly memory staleness audit
+After=network-online.target dream.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Audits the whole memory store in chunks and writes remove/patch suggestions for
+# review; it never writes live memory. Provider routing comes from [stages.audit]
+# in ~/.config/dream/config.toml. With consolidate.mode = "full" the nightly run
+# already audits, so this exits without a model call. It runs the CLI directly:
+# the nightly run metrics and their stage list stay unchanged.
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/dream audit

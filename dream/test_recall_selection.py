@@ -30,3 +30,20 @@ def test_selection_preserves_relevance_order_across_source_kinds_and_projects():
     ]
     selected = select_recall_candidates(values, _query(), None, {})
     assert [candidate.document.id for candidate in selected] == ["best", "second"]
+
+
+def test_selection_uses_the_threshold_of_the_active_mode():
+    values = [_candidate("a", "approved_memory", "user_approved", .6), _candidate("b", "approved_memory", "user_approved", .3)]
+    calibrations = {"lexical": {"threshold": .5}, "lexical_plus_embedder": {"threshold": .2}}
+    assert [c.document.id for c in select_recall_candidates(values, _query(), None, calibrations)] == ["a"]
+    assert [c.document.id for c in select_recall_candidates(values, _query(), None, calibrations, mode="lexical_plus_embedder")] == ["a", "b"]
+    assert [c.document.id for c in select_recall_candidates(values, _query(), None, {"lexical": {"threshold": .5}}, mode="lexical_plus_embedder")] == ["a", "b"]
+
+
+def test_calibration_lookup_reports_the_row_used():
+    from recall_select import calibration_for
+    calibrations = {"lexical": {"threshold": .5, "calibration_version": "lex-v1"}}
+    assert calibration_for(calibrations, "lexical", _query()) == (.5, "lex-v1")
+    assert calibration_for(calibrations, "lexical", _query("session-start:startup")) == (None, None)
+    assert calibration_for(calibrations, "lexical_plus_embedder", _query()) == (None, None)
+    assert calibration_for({}, "lexical", _query()) == (None, None)

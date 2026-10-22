@@ -187,5 +187,86 @@ class MetricsStateTest(unittest.TestCase):
         return root.joinpath(*parts) if parts else root / "dream-status.json"
 
 
+class RecallUsageGaugeTest(unittest.TestCase):
+    GAUGE = "dream_recall_documents_unused_90d"
+
+    def _store(self, *, since="2026-07-01T00:00:00Z", migrated=True):
+        import datetime as dt
+        import dream
+        from config import load_config
+        from recall_documents import stable_document_id, synchronize_recall_documents
+
+        root = Path(tempfile.mkdtemp(prefix="dream-metrics-usage-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        memory = root / "memory"
+        memory.mkdir()
+        for name in ("MEMORY.md", "project_used.md", "project_secret_unused.md", "project_unused.md"):
+            (memory / name).write_text(f"{name} body\n", encoding="utf-8")
+        db_path = root / "dream.db"
+        conn = dream.open_db(db_path)
+        synchronize_recall_documents(conn, memory, include_raw_transcripts=False, constitution_path=None)
+        recent = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn.execute("INSERT INTO recall_usage VALUES (?, ?, ?, 4)",
+                     (stable_document_id("approved_memory", "memory:project_used.md"), recent, recent))
+        if since:
+            conn.execute("INSERT INTO meta(key, value) VALUES ('recall_usage_since', ?)", (since,))
+        if not migrated:
+            conn.execute("DROP TABLE recall_usage")
+        conn.commit()
+        conn.close()
+        config = load_config(root / "missing.toml", overrides={
+            "storage": {"db_path": str(db_path), "memory_root": str(memory)}})
+        return root, config
+
+    def _gauge_lines(self, text):
+        return [line for line in text.splitlines() if line.startswith(self.GAUGE + " ")]
+
+    def test_gauge_counts_unrecalled_approved_memory_without_ids_or_paths(self):
+        from recall_documents import stable_document_id
+
+        root, config = self._store()
+        text = metrics.collect_metrics(root / "run.json", config=config)
+        self.assertEqual(self._gauge_lines(text), [f"{self.GAUGE} 2"])
+        self.assertIn(f"# TYPE {self.GAUGE} gauge", text)
+        for name in ("project_used.md", "project_secret_unused.md", "project_unused.md"):
+            self.assertNotIn(name, text)
+            self.assertNotIn(stable_document_id("approved_memory", f"memory:{name}"), text)
+        self.assertNotIn(str(root), text)
+
+    def test_gauge_needs_a_full_90_day_observation_window(self):
+        import datetime as dt
+
+        now = dt.datetime.now(dt.timezone.utc)
+        for days, expected in ((91, [f"{self.GAUGE} 2"]), (89, [])):
+            since = (now - dt.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            root, config = self._store(since=since)
+            text = metrics.collect_metrics(root / "run.json", config=config)
+            self.assertEqual(self._gauge_lines(text), expected, days)
+            self.assertEqual(f"# TYPE {self.GAUGE} gauge" in text, bool(expected))
+
+    def test_gauge_help_says_it_needs_a_full_window(self):
+        root, config = self._store()
+        text = metrics.collect_metrics(root / "run.json", config=config)
+        [help_line] = [line for line in text.splitlines() if line.startswith(f"# HELP {self.GAUGE} ")]
+        self.assertIn("observed for at least 90 days", help_line)
+
+    def test_gauge_is_omitted_when_usage_is_unknown(self):
+        for kwargs in ({"since": None}, {"migrated": False}):
+            root, config = self._store(**kwargs)
+            text = metrics.collect_metrics(root / "run.json", config=config)
+            self.assertEqual(self._gauge_lines(text), [], kwargs)
+            self.assertIn("dream_run_health", text)
+
+    def test_gauge_is_omitted_when_the_database_is_missing(self):
+        from config import load_config
+
+        root = Path(tempfile.mkdtemp(prefix="dream-metrics-usage-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        config = load_config(root / "missing.toml", overrides={"storage": {"db_path": str(root / "missing.db")}})
+        text = metrics.collect_metrics(root / "run.json", config=config)
+        self.assertEqual(self._gauge_lines(text), [])
+        self.assertFalse((root / "missing.db").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

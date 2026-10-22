@@ -127,3 +127,32 @@ def test_readonly_database_opener_fails_closed_while_wal_is_present(tmp_path):
             open_db_readonly(db_path)
     finally:
         writer.close()
+
+
+def test_constitution_guard_agrees_with_is_constitution_source(tmp_path, monkeypatch):
+    """The per-run guard resolves the constitution once and must catch the same paths."""
+    import os
+    from character.safety import is_constitution_source
+    from recall_context import constitution_guard
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / "memory"
+    (root / "sub").mkdir(parents=True)
+    constitution = tmp_path / "rules" / "constitution.md"
+    constitution.parent.mkdir()
+    constitution.write_text("rules", encoding="utf-8")
+    (root / "notes.md").write_text("notes", encoding="utf-8")
+    (root / "link.md").symlink_to(constitution)
+    os.link(constitution, root / "sub" / "hard.md")
+    (tmp_path / "rules" / "alias").symlink_to(constitution.parent, target_is_directory=True)
+    sources = ["notes.md", "link.md", "sub/hard.md", "missing.md", "sub/../link.md", str(constitution),
+               "~/rules/constitution.md", str(tmp_path / "rules" / "alias" / "constitution.md"), "distilled:codex:x"]
+    targets = [constitution, tmp_path / "rules" / "alias" / "constitution.md", "~/rules/constitution.md",
+               tmp_path / "absent.md", None]
+    for memory_root in (root, None):
+        for target in targets:
+            guard = constitution_guard(memory_root, target)
+            for source in sources:
+                expected = is_constitution_source(source, memory_root=memory_root, constitution_path=target)
+                assert guard(source) == expected, (memory_root, target, source)
+    assert constitution_guard(root, constitution)("link.md") and constitution_guard(root, constitution)("sub/hard.md")

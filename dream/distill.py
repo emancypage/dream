@@ -145,7 +145,7 @@ def distill_session(
         duration_ms=res.duration_ms,
     )
 
-    key_material = "\0".join([
+    key_parts = [
         session_id,
         source_revision or "",
         parser_version or "",
@@ -153,7 +153,14 @@ def distill_session(
         res.provider,
         res.model or "",
         json.dumps(cfg.stage("distill"), sort_keys=True),
-    ])
+    ]
+    snapshot = _local_route_snapshot(cfg, model) if res.provider == "openai-compatible" else None
+    if snapshot is not None:
+        # The effective request --refresh compares, so a route refreshed for
+        # another base_url (same stage settings, same served model) gets a key
+        # consolidation has not consumed. CLI routes keep their keys unchanged.
+        key_parts.append(json.dumps(snapshot, sort_keys=True))
+    key_material = "\0".join(key_parts)
     distillation_key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
     usage_json = json.dumps({
         "input_tokens": res.input_tokens,
@@ -187,7 +194,7 @@ def distill_session(
         """,
         (
             session_id, distillation_key, res.provider, res.model, source_revision,
-            parser_version, prompt_version(), json.dumps(cfg.stage("distill"), sort_keys=True),
+            parser_version, prompt_version(), _provider_options(cfg, res.provider, model),
             res.input_tokens, res.output_tokens, usage_json, res.duration_ms,
             json.dumps(notes, ensure_ascii=False), summary,
         ),
@@ -210,17 +217,98 @@ def distill_session(
     return result
 
 
+_EFFECTIVE_REQUEST_KEY = "effective_request"
+
+
+def _local_route_snapshot(cfg: DreamConfig, model: str | None = None) -> dict | None:
+    """Credential-free identity of an openai-compatible distill request; None for CLI routes."""
+    stage = cfg.stage("distill")
+    provider = cfg.provider(stage["provider"])
+    if provider.get("type") != "openai-compatible":
+        return None
+    return {
+        "provider": stage["provider"],
+        "type": "openai-compatible",
+        "base_url": provider.get("base_url"),
+        # Same precedence as backend.generate and the provider: CLI, stage, provider.
+        "model": model or stage.get("model") or provider.get("model"),
+    }
+
+
+def _provider_options(cfg: DreamConfig, provider: str, model: str | None) -> str:
+    """The stage settings; openai-compatible rows also record the effective request."""
+    options = cfg.stage("distill")
+    snapshot = _local_route_snapshot(cfg, model) if provider == "openai-compatible" else None
+    if snapshot is not None:
+        options[_EFFECTIVE_REQUEST_KEY] = snapshot
+    return json.dumps(options, sort_keys=True)
+
+
+def _same_local_route(options: str, served_model: str | None, stage: dict, current: dict) -> bool:
+    try:
+        previous = json.loads(options)
+    except ValueError:
+        return False
+    if not isinstance(previous, dict):
+        return False
+    snapshot = previous.get(_EFFECTIVE_REQUEST_KEY)
+    if snapshot is not None:
+        return snapshot == current
+    # A row written before the snapshot existed cannot confirm base_url, and
+    # confirms the effective model only when the stage named it or the server
+    # reported the currently requested name. Anything else is re-run.
+    if previous.get("provider") != stage["provider"] or previous.get("model") != stage.get("model"):
+        return False
+    return stage.get("model") is not None or served_model == current["model"]
+
+
+def _drop_unchanged_local_routes(conn: sqlite3.Connection, rows: list, stage: dict, current: dict) -> list:
+    """Refresh filter for an openai-compatible distill route.
+
+    Such rows record provider "openai-compatible" and the server-reported
+    model, which never equal the stage's provider name and model, so the
+    column comparison flags every session. Compare the recorded effective
+    request (provider name, base_url and the stage's model, else the
+    provider's) with the current one instead. Rows recorded by another
+    provider type, or without provider_options, keep the column comparison.
+    """
+    recorded = {
+        row[0]: (row[1], row[2], row[3])
+        for row in conn.execute(
+            """
+            SELECT d.session_id, d.provider_options, d.model,
+                   COALESCE(d.source_revision, '') <> COALESCE(s.source_revision, '')
+                OR COALESCE(d.parser_version, '') <> COALESCE(s.parser_version, '')
+                OR COALESCE(d.prompt_version, '') <> ?
+            FROM distilled d JOIN sessions s ON s.session_id = d.session_id
+            WHERE d.provider = 'openai-compatible'
+            """,
+            (prompt_version(),),
+        )
+    }
+    kept = []
+    for row in rows:
+        options, served_model, content_changed = recorded.get(row[0], (None, None, True))
+        if options is not None and not content_changed and _same_local_route(options, served_model, stage, current):
+            continue
+        kept.append(row)
+    return kept
+
+
 def sessions_needing_distill(
     conn: sqlite3.Connection,
     min_chars: int = 500,
     project_slug: str | None = None,
     config: DreamConfig | None = None,
     refresh_config: bool = False,
+    model: str | None = None,
 ) -> list[tuple[str, int]]:
     cfg = config or load_config()
     stage = cfg.stage("distill")
     provider_name = stage["provider"]
     model_name = stage.get("model")
+    # ``model`` is the --model override, which takes precedence in the request as well.
+    current_route = _local_route_snapshot(cfg, model) if refresh_config else None
     sql = """
         SELECT s.session_id, s.total_chars
         FROM sessions s
@@ -234,10 +322,15 @@ def sessions_needing_distill(
                OR COALESCE(d.provider, '') <> ?
                OR COALESCE(d.model, '') <> COALESCE(?, '')
            ))
+           -- Every openai-compatible row reaches the effective-route comparison:
+           -- with a route literally named "openai-compatible" and a stage model
+           -- equal to the served one, the columns above match a changed base_url.
+           OR (? AND d.provider = 'openai-compatible')
         )
           AND s.total_chars >= ?
     """
-    params: list = [int(refresh_config), prompt_version(), provider_name, model_name, min_chars]
+    params: list = [int(refresh_config), prompt_version(), provider_name, model_name,
+                    int(current_route is not None), min_chars]
     if project_slug:
         sql += " AND s.project_slug = ?"
         params.append(project_slug)
@@ -245,4 +338,7 @@ def sessions_needing_distill(
     policy = load_retention_policy(cfg.memory_root)
     excluded_sessions = {row[0] for row in conn.execute("SELECT session_id, project_slug FROM sessions")
                          if policy.excludes(project_slug=row[1])}
-    return [(r[0], r[1]) for r in conn.execute(sql, params).fetchall() if r[0] not in excluded_sessions]
+    rows = conn.execute(sql, params).fetchall()
+    if current_route is not None:
+        rows = _drop_unchanged_local_routes(conn, rows, stage, current_route)
+    return [(r[0], r[1]) for r in rows if r[0] not in excluded_sessions]

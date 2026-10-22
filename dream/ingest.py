@@ -7,7 +7,9 @@ import sys
 from pathlib import Path
 from typing import Callable, Iterator
 
+import recall_usage
 from config import DreamConfig, load_config
+from recall_hook_state import marker_root as recall_marker_root
 from sources.base import Message, ParsedSession
 from sources.claude_jsonl import ClaudeJSONLSource
 from sources.registry import create_source
@@ -85,6 +87,19 @@ def ingest_parsed_session(
             [(session_id, message.seq, message.role, message.timestamp, message.text) for message in parsed.messages],
         )
     return True, len(parsed.messages)
+
+
+def harvest_recall_usage(conn: sqlite3.Connection, marker_root: Path | None = None) -> int:
+    """Count old recall hook markers into recall_usage before ingesting.
+
+    Usage is evidence only, so a failure here never stops ingestion: it is
+    reported on stderr and counts nothing.
+    """
+    try:
+        return recall_usage.harvest(conn, recall_marker_root() if marker_root is None else marker_root)
+    except Exception as exc:
+        print(f"recall usage harvest skipped: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 0
 
 
 class IngestionResults(list[tuple[str, int, int, int]]):

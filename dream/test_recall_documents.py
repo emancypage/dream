@@ -660,3 +660,68 @@ def test_ingest_command_keeps_printing_summary_and_synchronizes(tmp_path,
         assert c.execute(
             "SELECT COUNT(*) FROM recall_documents WHERE source_kind='raw_transcript'"
         ).fetchone()[0] == 0
+
+
+# ------------------------------------------------------- stored path text
+
+
+def _path_texts(conn: sqlite3.Connection) -> dict[str, tuple]:
+    return {
+        row[0]: row[1:]
+        for row in conn.execute("SELECT id, path_text, project_slug, source_path, text FROM recall_documents")
+    }
+
+
+def test_sync_stores_the_normalized_path_text_and_refreshes_it_on_change(tmp_path):
+    from recall_query import document_path_text
+
+    conn = _db(tmp_path)
+    root = _memory_root(tmp_path, {"notes/API-Gateway.md": "Deploy\\Runbook for the gateway"})
+    synchronize_recall_documents(conn, root, include_raw_transcripts=False, now=NOW, constitution_path=None)
+    [(stored, slug, path, text)] = _path_texts(conn).values()
+    assert stored == document_path_text(slug, path, text) == "notes api gateway.md deploy runbook for the gateway"
+
+    root.joinpath("notes/API-Gateway.md").write_text("Rollback steps", encoding="utf-8")
+    synchronize_recall_documents(conn, root, include_raw_transcripts=False, now=NOW, constitution_path=None)
+    [(stored, slug, path, text)] = _path_texts(conn).values()
+    assert stored == document_path_text(slug, path, text) == "notes api gateway.md rollback steps"
+    conn.close()
+
+
+def test_rows_indexed_before_path_text_existed_are_backfilled_without_an_fts_rebuild(tmp_path, monkeypatch):
+    from recall_query import document_path_text
+
+    db_path = tmp_path / "dream.db"
+    root = _memory_root(tmp_path, {"notes/api.md": "postgres migration runbook", "web.md": "npm deployment"})
+    conn = dream_cli.open_db(db_path)
+    synchronize_recall_documents(conn, root, include_raw_transcripts=False, now=NOW, constitution_path=None)
+    conn.execute("ALTER TABLE recall_documents DROP COLUMN path_text")  # the pre-upgrade shape
+    conn.commit()
+    conn.close()
+
+    conn = dream_cli.open_db(db_path)
+    [backup] = list(tmp_path.glob("dream.db.bak-provider-migration-*"))
+    assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 4
+    assert {value[0] for value in _path_texts(conn).values()} == {None}
+    triggers = [row[0] for row in conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name='recall_documents'")]
+    assert len(triggers) == 2 and not any("path_text" in sql for sql in triggers)
+
+    def no_rebuild(_conn):
+        raise AssertionError("an unchanged store must not rebuild the FTS index")
+
+    monkeypatch.setattr(dream_cli, "rebuild_recall_fts", no_rebuild)
+    report = synchronize_recall_documents(conn, root, include_raw_transcripts=False, now=NOW, constitution_path=None)
+    assert (report.inserted, report.updated, report.deleted, report.skipped) == (0, 0, 0, 2)
+    for stored, slug, path, text in _path_texts(conn).values():
+        assert stored == document_path_text(slug, path, text)
+    assert conn.execute("SELECT COUNT(*) FROM recall_documents_fts WHERE recall_documents_fts MATCH 'postgres'").fetchone()[0] == 1
+    conn.close()
+
+    dream_cli.open_db(db_path).close()
+    assert list(tmp_path.glob("dream.db.bak-provider-migration-*")) == [backup]
+    legacy = sqlite3.connect(backup)
+    try:
+        assert "path_text" not in {row[1] for row in legacy.execute("PRAGMA table_info(recall_documents)")}
+    finally:
+        legacy.close()

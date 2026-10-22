@@ -78,6 +78,19 @@ def excludes_source_sessions(conn, policy: RetentionPolicy, source_sessions: str
     return False
 
 
+def excludes_suggestion(conn, policy: RetentionPolicy, memory_root: Path, *, target_path: str,
+                        texts, source_sessions: str | None) -> bool:
+    """Check a stored suggestion's own fields: its target, each of ``texts`` and its provenance.
+
+    ``texts`` are the stored body, rationale, patch span and, for cleanup,
+    the preview, whose diff context can copy text outside the span.
+    """
+    return (policy.excludes(source_path=target_path)
+            or any(policy.excludes(text=text) for text in texts if text)
+            or policy.excludes_memory_path(memory_root, target_path)
+            or excludes_source_sessions(conn, policy, source_sessions))
+
+
 def empty_notes() -> dict:
     return {"summary": "", **{name: [] for name in (
         "user_facts", "preferences", "projects", "references", "decisions", "open_threads"

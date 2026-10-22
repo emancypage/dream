@@ -338,6 +338,30 @@ def serve_metrics(
         server.serve_forever()
 
 
+def _recall_usage_lines(conn: sqlite3.Connection) -> list[str]:
+    """The unused-memory gauge: a bare count, never a document id or path.
+
+    Omitted while usage is unknown (database not migrated, no marker harvested
+    yet, unreadable recall tables) and while the observation window is shorter
+    than the 90 days the gauge counts, so a dashboard never reads a partial
+    window as "unused for 90 days".
+    """
+    from recall_usage import UNUSED_DAYS, usage_report
+    try:
+        report = usage_report(conn)
+    except (ValueError, sqlite3.Error):
+        return []
+    if report.state != "observed" or report.window_shorter_than_days:
+        return []
+    return [
+        f"# HELP dream_recall_documents_unused_90d Approved memory documents automatic recall "
+        f"has not delivered in the last {UNUSED_DAYS} days; only exported once usage has been "
+        f"observed for at least {UNUSED_DAYS} days.",
+        "# TYPE dream_recall_documents_unused_90d gauge",
+        f"dream_recall_documents_unused_90d {len(report.unused)}",
+    ]
+
+
 def collect_metrics(state_path: Path, *, config=None, stale_after: float = DEFAULT_STALE_AFTER) -> str:
     """Read the review queue on every scrape, independently of nightly run state."""
     from config import load_config
@@ -348,16 +372,20 @@ def collect_metrics(state_path: Path, *, config=None, stale_after: float = DEFAU
              '# TYPE dream_character_short_review_source_up gauge']
     conn = None
     try:
-        cfg = config if config is not None else load_config()
-        conn = open_db_readonly(cfg.db_path)
-        count = pending_review_count(conn, cfg)
-    except (OSError, ValueError, sqlite3.Error):
-        lines.append('dream_character_short_review_source_up 0')
-    else:
-        lines.extend(['dream_character_short_review_source_up 1',
-                      '# HELP dream_character_short_drafts_pending Current short example drafts awaiting human review.',
-                      '# TYPE dream_character_short_drafts_pending gauge',
-                      f'dream_character_short_drafts_pending {count}'])
+        try:
+            cfg = config if config is not None else load_config()
+            conn = open_db_readonly(cfg.db_path)
+            count = pending_review_count(conn, cfg)
+        except (OSError, ValueError, sqlite3.Error):
+            lines.append('dream_character_short_review_source_up 0')
+        else:
+            lines.extend(['dream_character_short_review_source_up 1',
+                          '# HELP dream_character_short_drafts_pending Current short example drafts awaiting human review.',
+                          '# TYPE dream_character_short_drafts_pending gauge',
+                          f'dream_character_short_drafts_pending {count}'])
+        # Independent of the review queue: either can be readable without the other.
+        if conn is not None:
+            lines.extend(_recall_usage_lines(conn))
     finally:
         if conn is not None:
             conn.close()
