@@ -15,6 +15,10 @@ from character import storage
 from character.safety import policy_for, check_constitution, policy_fingerprint
 from character.types import content_hash, canonical_json, RESPONSE_SCHEMA
 
+class GenerationValidationError(ValueError):
+    """Host-authored validation reason, safe to include in stage reports."""
+
+
 PROMPTS = Path(__file__).resolve().parent.parent / 'prompts'
 def prompt_version():
     return content_hash({'templates':{name:(PROMPTS/name).read_text() for name in ('character-extract-v1.md','character-expand-v1.md','character-response-v1.md')},'schemas':[EXTRACT_SCHEMA,EXPAND_SCHEMA,RESPONSE_SCHEMA]})
@@ -87,6 +91,11 @@ def _select(conn, config, source, limit, refresh, expand_seeds=False):
                 skipped['excluded']+=1; continue
             messages=identity.pop('messages')
             for i,message in enumerate(messages):
+                # Transcript user rows also contain tool notifications and loaded
+                # skills. Their instructions are not human correction evidence.
+                if message['role']=='user' and message['content'].lstrip().startswith(('<task-notification>', 'Base directory for this skill:')):
+                    skipped['generated_message']=skipped.get('generated_message',0)+1
+                    continue
                 if message['role']!='user' or not CUE.search(message['content']) or i<1 or messages[i-1]['role']!='assistant':
                     continue
                 prior=messages[:i-1]; context=[]; count=0
@@ -137,33 +146,41 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
     def check(item, writer=None):
         current=policy_for(config)
         if policy_fingerprint(current)!=fingerprint or load_constitution(config).sha256!=doc.sha256 or prompt_version()!=version:
-            raise ValueError('inputs changed')
+            raise GenerationValidationError('inputs changed')
         check_constitution(doc,current)
         if item['kind']=='correction' and content_hash(_source(writer or conn,item['identity']['session_id']))!=item['source_hash']:
-            raise ValueError('source changed')
+            raise GenerationValidationError('source changed')
     def call(item,stage,template,payload,schema,constitution=True):
         check(item)
         system=(PROMPTS/template).read_text()+policy.context()
         if constitution: system+='\nApproved constitution:\n'+doc.text
         started_at=datetime.now(timezone.utc).isoformat()
         prompt=canonical_json(payload)
-        answer=backend.generate(stage,prompt,schema,config=config,system_prompt=system)
+        request_schema=schema
+        if stage=='character_extract':
+            # Constrain verbatim evidence at the provider boundary. Keep the
+            # host's independent evidence checks below for every returned result.
+            properties=dict(schema['properties'])
+            properties['corrected_assistant_response']={'type':'string','enum':[item['rejected']]}
+            properties['user_correction']={'type':'string','enum':[item['correction']]}
+            request_schema=dict(schema,properties=properties)
+        answer=backend.generate(stage,prompt,request_schema,config=config,system_prompt=system)
         finished_at=datetime.now(timezone.utc).isoformat()
         check(item); validate_output(answer.output,schema)
-        if not _allowed(answer.output,policy): raise ValueError('excluded output')
-        metadata={'prompt_sha256':content_hash({'system':system,'prompt':prompt,'schema':schema}),'configured_model':config.stage(stage).get('model'),'reported_model':getattr(answer,'model',None),'started_at':started_at,'finished_at':finished_at,'stage':stage,'family':provider_family(config,stage),'provider':getattr(answer,'provider',config.stage(stage)['provider']),'model':getattr(answer,'model',config.stage(stage).get('model')),'options':dict(config.stage(stage)),'duration_ms':getattr(answer,'duration_ms',None),'usage':asdict(answer.usage) if is_dataclass(getattr(answer,'usage',None)) else None}
+        if not _allowed(answer.output,policy): raise GenerationValidationError('excluded output')
+        metadata={'prompt_sha256':content_hash({'system':system,'prompt':prompt,'schema':request_schema}),'configured_model':config.stage(stage).get('model'),'reported_model':getattr(answer,'model',None),'started_at':started_at,'finished_at':finished_at,'stage':stage,'family':provider_family(config,stage),'provider':getattr(answer,'provider',config.stage(stage)['provider']),'model':getattr(answer,'model',config.stage(stage).get('model')),'options':dict(config.stage(stage)),'duration_ms':getattr(answer,'duration_ms',None),'usage':asdict(answer.usage) if is_dataclass(getattr(answer,'usage',None)) else None}
         return answer.output,metadata
     def response(item,messages,arm):
         output,meta=call(item,'character_generate','character-response-v1.md',{'messages':messages},RESPONSE_SCHEMA,arm=='chosen')
         text=output['response']
-        if not text.strip() or len(text)>config.data['character']['max_response_codepoints']: raise ValueError('invalid response length')
+        if not text.strip() or len(text)>config.data['character']['max_response_codepoints']: raise GenerationValidationError('invalid response length')
         return text,meta
     def persist(item,table,record,seed_record=None):
         check(item)
         with storage.open_writer(config) as writer:
             writer.execute('BEGIN IMMEDIATE')
             check(item,writer)
-            if not _allowed(record,policy): raise ValueError('excluded record')
+            if not _allowed(record,policy): raise GenerationValidationError('excluded record')
             if table=='character_pairs':
                 if seed_record is not None:
                     stored=storage.get_record(writer,'character_seeds',seed_record['id'])
@@ -172,12 +189,12 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
                     record['provenance']['source_content_sha256']=stored['content_sha256']
                 existing=[r for r in storage.records(writer,table) if r.get('work_key')==record['work_key']]
                 if any(r.get('generation_attempt',1)>=record['generation_attempt'] for r in existing):
-                    raise ValueError('generation attempt changed')
+                    raise GenerationValidationError('generation attempt changed')
                 dependency=record.get('moment_id') or record.get('seed_id')
                 parent_table='character_moments' if record.get('moment_id') else 'character_seeds'
                 parent=storage.get_record(writer,parent_table,dependency)
                 if parent is None or parent['content_sha256']!=record['provenance']['source_content_sha256']:
-                    raise ValueError('source record changed')
+                    raise GenerationValidationError('source record changed')
             stored_record=storage.insert_record(writer,table,record)
             storage.mark_stale(writer,doc)
             return stored_record
@@ -191,7 +208,7 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
             expanded,expansion_call=call(item,'character_generate','character-expand-v1.md',{'seed':item['seed']},EXPAND_SCHEMA)
             prompt=expanded['prompt']
             if not prompt.strip() or len(prompt)>config.data['character']['max_context_codepoints'] or is_public_input([{'content':prompt}]):
-                raise ValueError('invalid expansion length')
+                raise GenerationValidationError('invalid expansion length')
             child_seed={'id':item['seed']['id']+'-expanded-'+content_hash(prompt)[:16],'trait_id':item['seed']['trait_id'],'prompt':prompt}
             key=content_hash({'parent':item['work_key'],'prompt':prompt})
             record={'id':'seed-'+content_hash({'seed':child_seed,'constitution':doc.sha256}), 'work_key':key,'constitution_sha256':doc.sha256,'constitution_version':doc.version,'revision':1,'excluded':False,'origin':'expanded','expansion_work_key':item['work_key'],'parent_expansion_id':parent_id,'expansion_call':expansion_call,'human_seed_id':item['seed']['id'],'trait_id':item['seed']['trait_id'],'seed':child_seed,'prompt_messages':[{'role':'user','content':prompt}],'provenance':{'parent_seed_id':parent_id}}
@@ -214,9 +231,18 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
                 provenance['message_range']=[item['messages'][0]['seq'],item['messages'][-1]['seq']]
                 if moment is None:
                     output,meta=call(item,'character_extract','character-extract-v1.md',{'messages':item['messages'],'assistant_response':item['rejected'],'user_correction':item['correction'],'trait_ids':list(doc.traits)},EXTRACT_SCHEMA)
-                    if output['is_correction'] and (not output['trait_ids'] or len(set(output['trait_ids']))!=len(output['trait_ids']) or not output['rationale'].strip()):
-                        raise ValueError('positive correction needs traits and rationale')
-                    if not output['context_excerpt'].strip() or not any(output['context_excerpt'] in m['content'] for m in item['messages']) or output['corrected_assistant_response']!=item['rejected'] or output['user_correction']!=item['correction'] or any(t not in doc.traits for t in output['trait_ids']) or len(output['rationale'])>2000: raise ValueError('invalid extraction evidence')
+                    if output['is_correction'] and output['context_sufficient'] and (not output['trait_ids'] or len(set(output['trait_ids']))!=len(output['trait_ids']) or not output['rationale'].strip()):
+                        raise GenerationValidationError('positive correction needs traits and rationale')
+                    if not output['context_excerpt'].strip() or not any(output['context_excerpt'] in m['content'] for m in item['messages']):
+                        raise GenerationValidationError('context excerpt is not copied')
+                    if output['corrected_assistant_response']!=item['rejected']:
+                        raise GenerationValidationError('assistant response is not copied')
+                    if output['user_correction']!=item['correction']:
+                        raise GenerationValidationError('user correction is not copied')
+                    if any(t not in doc.traits for t in output['trait_ids']):
+                        raise GenerationValidationError('unknown extraction trait')
+                    if len(output['rationale'])>2000:
+                        raise GenerationValidationError('extraction rationale is too long')
                     moment=persist(item,'character_moments',dict(base,**output,generation_attempt=item['attempt'],id='moment-'+uuid.uuid4().hex,provenance=provenance,**item['identity'],assistant_seq=item['assistant_seq'],correction_seq=item['correction_seq'],prompt_messages=item['messages'],extraction=meta,disposition='completed'))
                 if not moment['is_correction'] or not moment['context_sufficient']:
                     skipped['negative']=skipped.get('negative',0)+1; continue
@@ -234,13 +260,15 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
                 if stored.get('parent_expansion_id'):
                     provenance['parent_expansion_id']=stored['parent_expansion_id']
                 traits=[seed['trait_id']]; rationale='Synthetic contrast for approved trait'; conflict=False; source_fields={'seed_id':stored['id']}
-            if chosen.strip()==rejected.strip(): raise ValueError('equal responses')
+            if chosen.strip()==rejected.strip(): raise GenerationValidationError('equal responses')
             pair=dict(base,id='pair-'+uuid.uuid4().hex,generation_attempt=item['attempt'],supersedes_id=item['supersedes_id'],source_kind=item['kind'],prompt_messages=item['messages'],chosen=chosen,rejected=rejected,rationale=rationale,trait_ids=traits,conflict=conflict,provenance=provenance,generator_calls=calls,status='pending',edited=False,**source_fields)
             persist(item,'character_pairs',pair,seed_record=seed_record); result['generated']+=1
             schedule_expansion(item,source_fields.get('seed_id'))
         except sqlite3.Error:
             raise
         except (ValueError,RuntimeError,TimeoutError,OSError) as exc:
-            logging.getLogger(__name__).warning('Character generation failed for %s: %s',item['work_key'],type(exc).__name__)
-            result['failures'].append({'work_id':item['work_key'],'error':type(exc).__name__})
+            reason=str(exc) if isinstance(exc,GenerationValidationError) else 'model or runtime failure'
+            error=type(exc).__name__
+            logging.getLogger(__name__).warning('Character generation failed for %s: %s: %s',item['work_key'],error,reason)
+            result['failures'].append({'work_id':item['work_key'],'error':error,'reason':reason})
     return result

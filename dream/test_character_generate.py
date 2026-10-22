@@ -295,3 +295,96 @@ def test_refresh_preserves_immutable_moment_evidence(env, monkeypatch):
     assert len(moments) == 2
     assert len({pair['moment_id'] for pair in storage.records(conn, 'character_pairs')}) == 2
     assert storage.get_record(conn, 'character_moments', first_pair['moment_id'])['content_sha256'] == first_pair['provenance']['source_content_sha256']
+
+
+@pytest.mark.parametrize('generated_text', [
+    '<task-notification>\n<summary>stop after this task</summary>\n</task-notification>',
+    'Base directory for this skill: /example/skills/planning\n\nStop before implementation.',
+])
+def test_generated_user_messages_do_not_consume_correction_limit(env, monkeypatch, generated_text):
+    g, cfg, conn = env
+    conn.execute('UPDATE messages SET text=? WHERE seq=3', (generated_text,))
+    conn.executemany('INSERT INTO messages(session_id,seq,role,text) VALUES (?,?,?,?)', [
+        ('s', 4, 'assistant', 'Another long answer'),
+        ('s', 5, 'user', "Actually, keep it short."),
+    ])
+    conn.commit()
+    _, _, items, skipped = g._select(conn, cfg, 'corrections', 1, False)
+    assert len(items) == 1
+    assert items[0]['correction'] == 'Actually, keep it short.'
+    assert skipped['generated_message'] == 1
+    # The generated entry must never reach extraction, even with spare capacity.
+    conn.execute('DELETE FROM messages WHERE seq>=4')
+    conn.commit()
+    monkeypatch.setattr(g.backend, 'generate', lambda *a, **k: pytest.fail('generated message reached model'))
+    report = g.generate_pairs(conn, cfg, source='corrections', limit=10)
+    assert report['source_items'] == 0
+    assert report['failures'] == []
+
+
+def test_correction_can_quote_generated_message_markers(env):
+    g, cfg, conn = env
+    text = "Actually, don't treat <task-notification> as my words. Base directory for this skill: is tool text."
+    conn.execute('UPDATE messages SET text=? WHERE seq=3', (text,))
+    conn.commit()
+    _, _, items, _ = g._select(conn, cfg, 'corrections', 1, False)
+    assert items[0]['correction'] == text
+
+
+@pytest.mark.parametrize(('field', 'value', 'reason'), [
+    ('context_excerpt', 'invented private excerpt', 'context excerpt is not copied'),
+    ('corrected_assistant_response', 'invented private response', 'assistant response is not copied'),
+    ('user_correction', 'invented private correction', 'user correction is not copied'),
+    ('trait_ids', ['invented-private-trait'], 'unknown extraction trait'),
+])
+def test_extraction_failures_report_safe_reason(env, monkeypatch, caplog, field, value, reason):
+    g, cfg, conn = env
+    output = extraction()
+    output[field] = value
+    monkeypatch.setattr(g.backend, 'generate', lambda *a, **k: SimpleNamespace(output=output))
+    result = g.generate_pairs(conn, cfg, source='corrections', limit=1)
+    assert result['failures'][0]['reason'] == reason
+    assert reason in caplog.text
+    assert 'invented' not in str(result) + caplog.text
+    assert not storage.records(conn, 'character_moments')
+
+
+def test_provider_error_details_do_not_leak(env, monkeypatch, caplog):
+    g, cfg, conn = env
+    def fail(*a, **k):
+        raise RuntimeError('private provider output')
+    monkeypatch.setattr(g.backend, 'generate', fail)
+    result = g.generate_pairs(conn, cfg, source='corrections', limit=1)
+    assert result['failures'][0]['reason'] == 'model or runtime failure'
+    assert 'private provider output' not in str(result) + caplog.text
+
+
+def test_insufficient_context_without_traits_is_cached_as_skipped(env, monkeypatch):
+    g, cfg, conn = env
+    output = extraction()
+    output.update(context_sufficient=False, trait_ids=[])
+    monkeypatch.setattr(g.backend, 'generate', lambda *a, **k: SimpleNamespace(output=output))
+    result = g.generate_pairs(conn, cfg, source='corrections', limit=1)
+    assert result['failures'] == []
+    assert result['skipped']['negative'] == 1
+    assert not storage.records(conn, 'character_pairs')
+    assert g.estimate(conn, cfg, source='corrections', limit=1)['source_items'] == 0
+
+
+@pytest.mark.parametrize('field', ['corrected_assistant_response', 'user_correction'])
+def test_provider_schema_constrains_copied_evidence(env, monkeypatch, field):
+    from model_types import validate_output, SchemaValidationError
+    g, cfg, conn = env
+    def fake(stage, prompt, schema, **kw):
+        assert stage == 'character_extract'
+        output = extraction()
+        validate_output(output, schema)
+        changed = dict(output, **{field: 'A rewritten version'})
+        with pytest.raises(SchemaValidationError):
+            validate_output(changed, schema)
+        output['is_correction'] = False
+        return SimpleNamespace(output=output)
+    monkeypatch.setattr(g.backend, 'generate', fake)
+    result = g.generate_pairs(conn, cfg, source='corrections', limit=1)
+    assert result['failures'] == []
+    assert result['skipped']['negative'] == 1
