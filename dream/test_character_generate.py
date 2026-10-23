@@ -371,7 +371,7 @@ def test_insufficient_context_without_traits_is_cached_as_skipped(env, monkeypat
     assert g.estimate(conn, cfg, source='corrections', limit=1)['source_items'] == 0
 
 
-@pytest.mark.parametrize('field', ['corrected_assistant_response', 'user_correction'])
+@pytest.mark.parametrize('field', ['context_excerpt', 'corrected_assistant_response', 'user_correction'])
 def test_provider_schema_constrains_copied_evidence(env, monkeypatch, field):
     from model_types import validate_output, SchemaValidationError
     g, cfg, conn = env

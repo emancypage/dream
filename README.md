@@ -85,6 +85,14 @@ Changing provider/model configuration does not automatically re-run every histor
 
 Legacy compatibility variables remain accepted: `DREAM_BACKEND`, `CLAUDE_DREAM_DB`, and `DREAM_MEMORY_ROOT`.
 
+For Claude CLI providers, `refusal_fallback_model = "claude-opus-4-8"` enables
+one retry when Claude returns `stop_reason: "refusal"`, following
+[Anthropic's fallback guidance](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback).
+Set it in `[providers.claude]`, or the selected Claude provider's table. The retry
+uses the same input, schema, subscription, and remaining timeout. Other errors
+do not trigger it. Results record the model used and include both attempts'
+token usage and cost. A refusal from the fallback model remains a failure.
+
 ### Recall and consolidation settings
 
 The packaged defaults keep the earlier behaviour: the embedder is off, usage

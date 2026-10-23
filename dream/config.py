@@ -21,7 +21,7 @@ DEFAULT_CONFIG_PATH = Path.home() / ".config" / "dream" / "config.toml"
 _TOP_KEYS = {"storage", "stages", "providers", "sources", "review", "recall", "character", "consolidate"}
 _STORAGE_KEYS = {"db_path", "memory_root"}
 _STAGE_KEYS = {"provider", "model", "reasoning_effort", "timeout_seconds"}
-_PROVIDER_KEYS = {"type", "auth", "executable", "extra_args"}
+_PROVIDER_KEYS = {"type", "auth", "executable", "extra_args", "refusal_fallback_model"}
 _SOURCE_KEYS = {"name", "type", "root", "enabled"}
 _REVIEW_KEYS = {"mode", "backup_keep"}
 _RECALL_KEYS = {
@@ -291,6 +291,10 @@ def _validate(data: dict[str, Any]) -> list[str]:
         _unknown_keys(f"provider {name}", provider, _PROVIDER_KEYS)
         if provider.get("type") not in {"codex-cli", "claude-cli"}:
             raise ConfigError(f"provider {name} has unsupported type: {provider.get('type')!r}")
+        if "refusal_fallback_model" in provider:
+            fallback = provider["refusal_fallback_model"]
+            if provider["type"] != "claude-cli" or not isinstance(fallback, str) or not fallback.strip():
+                raise ConfigError(f"provider {name} refusal_fallback_model requires claude-cli and a nonempty model ID")
     for source in data.get("sources", []):
         _unknown_keys(f"source {source.get('name', '?')}", source, _SOURCE_KEYS)
         if source.get("type") not in {"codex-jsonl", "claude-jsonl", "opencode-sqlite"}:
