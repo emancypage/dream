@@ -37,6 +37,7 @@ def generate(
         "reasoning_effort": stage_cfg.get("reasoning_effort"),
         "extra_args": provider_cfg.get("extra_args"),
         "executable": provider_cfg.get("executable"),
+        "refusal_fallback_model": provider_cfg.get("refusal_fallback_model"),
     }
     request = GenerationRequest(
         system_prompt=SYSTEM_PROMPT if system_prompt is None else system_prompt,

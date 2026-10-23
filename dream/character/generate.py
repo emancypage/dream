@@ -161,6 +161,7 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
             # Constrain verbatim evidence at the provider boundary. Keep the
             # host's independent evidence checks below for every returned result.
             properties=dict(schema['properties'])
+            properties['context_excerpt']={'type':'string','enum':[message['content'] for message in item['messages'] if message['content'].strip()]}
             properties['corrected_assistant_response']={'type':'string','enum':[item['rejected']]}
             properties['user_correction']={'type':'string','enum':[item['correction']]}
             request_schema=dict(schema,properties=properties)

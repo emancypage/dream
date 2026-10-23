@@ -14,4 +14,5 @@ class ClaudeCLIProvider:
             system_prompt=request.system_prompt,
             extra_args=request.options.get("extra_args"),
             executable=request.options.get("executable") or "claude",
+            refusal_fallback_model=request.options.get("refusal_fallback_model"),
         )
