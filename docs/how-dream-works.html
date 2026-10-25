@@ -90,7 +90,7 @@ h3{font-size:12px;font-family:var(--mono);letter-spacing:.12em;text-transform:up
   <div class="hero">
     <div class="eyebrow">dream · nightly memory and character pipeline</div>
     <h1>One night of <em>Dream</em></h1>
-    <p class="lede">During the day you talk to coding agents. At <b>04:00</b> your computer goes to sleep the way a brain does. It replays the day, keeps what matters, invents practice scenes, and forgets on purpose. The next morning, new sessions <b>remember</b>.</p>
+    <p class="lede">During the day you talk to coding agents, and Dream recalls saved memory as you work. At <b>04:00</b> the nightly job replays new chats and proposes memory updates. Optional character stages build practice answers for your review. New sessions then <b>remember</b>.</p>
   </div>
 </header>
 
@@ -121,7 +121,7 @@ h3{font-size:12px;font-family:var(--mono);letter-spacing:.12em;text-transform:up
   <section class="overview">
     <h2>The whole night on one page</h2>
     <div class="ov" id="ov"></div>
-    <p class="foot">Only two times are real schedules: 04:00 from <code>dream.timer</code> and Sundays at 12:00 from <code>dream-audit.timer</code>, which you enable yourself; each adds up to 15 minutes of random delay. The stage times after 04:00 are drawn for reading, not measured. Embedding runs inside the ingest stage, not as a stage of its own. The stages run one after another in <code>dream.service</code>. If one stage fails, the next ones still run, and the run is marked as failed health.</p>
+    <p class="foot">This page describes repository defaults. Your configuration chooses the sources, models, and optional steps. Logic checked on 25 October 2026. Only two times are real schedules: 04:00 from <code>dream.timer</code> and Sundays at 12:00 from <code>dream-audit.timer</code>, which you enable yourself; each adds up to 15 minutes of random delay. The other stage times help explain the order and are not measured. Embedding runs inside ingest and again after curation when enabled. It is not a separate service stage. The six stages run one after another in <code>dream.service</code>. If one stage fails, the next ones still run, and the run reports failed health.</p>
   </section>
 </main>
 
@@ -135,17 +135,19 @@ const STEPS = [
  {id:'day', short:'Day', level:'wake', time:'09:00 – 23:59', stage:'Awake',
   title:'Daytime: you live the day',
   what:['You work with Codex, Open Code, or Claude Code. Every chat is saved to disk as you go.',
-        'Nothing in Dream runs yet. The day only collects raw experience.'],
-  where:[['~/.codex/sessions/**/*.jsonl','Codex transcripts'],['~/.local/share/opencode/opencode.db','Open Code sessions'],['~/.claude/projects/**/*.jsonl','Claude transcripts, off by default']],
+        'Dream can recall existing memory while you work. Installed hooks add context, and agents can search on demand through MCP tools or the dream recall command.',
+        'The nightly job imports and processes the saved chats later.'],
+  where:[['~/.codex/sessions/**/*.jsonl','Codex transcripts'],['~/.local/share/opencode/opencode.db','Open Code sessions'],['~/.claude/projects/**/*.jsonl','Claude transcripts, off by default'],['dream recall "project decisions preferences"','read-only recall at any time']],
   sleep:['Short-term memory','While you are awake, the hippocampus records events fast. These new memories are fragile. Without sleep, many of them fade.'],
-  scene:{nodes:[['you',90,150,'You','daytime work','person'],['cx',320,70,'Codex CLI','chat + tools','model'],['oc',320,150,'Open Code','chat + tools','model'],['cl',320,230,'Claude Code','optional','model'],['js',575,95,'JSONL transcripts','one file per session','store'],['db',575,210,'opencode.db','SQLite','store']],
-   edges:[['you','cx','ask'],['you','oc','ask'],['you','cl','ask'],['cx','js','turn'],['cl','js','turn'],['oc','db','turn']]},
-  cap:'Each message you send becomes a turn in a transcript file.'},
+  scene:{nodes:[['you',90,80,'You','daytime work','person'],['agents',335,80,'Coding agents','your chat clients','model'],['raw',590,80,'Saved chats','JSONL / SQLite','store'],['memory',335,225,'Dream memory','memories + summaries','store'],['recall',590,225,'Daytime recall','hooks / MCP / CLI','check']],
+   edges:[['you','agents','ask'],['agents','raw','save'],['memory','recall','search'],['recall','agents','context']]},
+  cap:'Daytime recall reads saved memory. The nightly job processes new chats later.'},
 
  {id:'bed', short:'04:00', level:'n1', time:'04:00 (+ up to 15 min)', stage:'Falling asleep',
   title:'Lights out: the timer fires',
   what:['A systemd timer starts dream.service at 04:00. If the laptop was off, it runs right after the next boot.',
-        'The service starts a metrics run, then runs six stages in order. Each stage goes through dream-stage --continue-on-error, so one bad stage does not stop the night.'],
+        'The service starts a metrics run, then runs six stages in order. Each stage goes through dream-stage --continue-on-error, so one bad stage does not stop the night.',
+        'Curation applies suggestions only in auto-apply mode. Character generation and judging skip while character is disabled.'],
   where:[['dream/systemd/dream.timer','OnCalendar 04:00, Persistent=true, RandomizedDelaySec=900'],['dream/systemd/dream.service','the list of stages'],['dream-metrics start','marks the run as started']],
   sleep:['The sleep gate','Your body clock opens a window when sleep comes easily. Persistent=true is like going to bed late when you missed bedtime: the sleep still happens. The random delay is like real life. Nobody falls asleep at the exact same minute.'],
   scene:{nodes:[['tm',95,150,'dream.timer','04:00 + ≤15 min','check'],['sv',310,150,'dream.service','oneshot','check'],['mt',560,70,'dream-metrics','start','store'],['st',560,230,'dream-stage','×6, continue on error','check']],
@@ -166,14 +168,15 @@ const STEPS = [
 
  {id:'embed', short:'Embed', level:'n2', time:'~04:02', stage:'N2 · light sleep',
   title:'Embed: keep the gist, not only the words',
-  what:['Off by default. When you turn on the local embedder, dream ingest ends by sending each new or changed memory and summary to an embedding server on your own machine, such as llama-server or Ollama.',
+  what:['Optional and off by default. An embedding server on your own machine, such as llama-server or Ollama, turns memories and summaries into vectors, numbers used to match meaning.',
         'Secrets are scrubbed out first, so not even the local server sees them. A server that is not on loopback is refused unless you set remote_data_egress = true.',
+        'Dream refreshes missing vectors after ingest and again after curation. The second refresh includes new distilled summaries and accepted memory edits.',
         'The vectors go into recall_embeddings, tied to the model name and dimension. Later, a prompt is embedded once, and the nearest memories join recall as a fifth list. A Polish prompt can then find an English memory. If the server is down, recall stays as it was.'],
-  where:[['dream ingest','embeds after the recall index sync'],['dream embed --refresh','re-embed after a model change'],['[recall.embedder] enabled = false','in ~/.config/dream/config.toml']],
+  where:[['dream ingest','embeds after the recall index sync'],['dream suggestions curate-configured','refreshes embeddings after curation'],['dream embed --refresh','re-embed after a model change'],['[recall.embedder] enabled = false','in ~/.config/dream/config.toml']],
   sleep:['Gist memory','Fuzzy-trace theory (Brainerd and Reyna) says we keep two traces of an experience: the exact words and the gist. The gist lasts longer. A vector is a gist: other words, even another language, can still land near it.'],
-  scene:{nodes:[['d',90,150,'recall_documents','memories + summaries','store'],['s',270,150,'Scrubber','secrets removed','check'],['e',450,85,'Local embedder','loopback only','model'],['x',450,225,'Remote server','needs explicit consent','dim'],['v',630,85,'recall_embeddings','float32 vectors','store']],
-   edges:[['d','s','text'],['s','e','text'],['e','v','vector'],['s','x','no']]},
-  cap:'Optional and local. Without it, recall stays lexical.'},
+  scene:{nodes:[['i',80,65,'After ingest','index synced','check'],['c',80,230,'After curation','new summaries + edits','check'],['d',265,150,'recall_documents','memories + summaries','store'],['s',450,150,'Scrubber','secrets removed','check'],['e',635,65,'Embedding server','loopback by default','model'],['v',635,230,'recall_embeddings','model + dimension','store']],
+   edges:[['i','d','sync'],['c','d','sync'],['d','s','text'],['s','e','text'],['e','v','vector']]},
+  cap:'Optional refresh after ingest and curation. Without it, recall matches words.'},
 
  {id:'distill', short:'Distill', level:'n2', time:'~04:05', stage:'N2 · light sleep',
   title:'Distill: mark what to keep',
@@ -182,7 +185,7 @@ const STEPS = [
         'The nightly run handles at most 50 sessions. A session that did not change is not sent again.'],
   where:[['dream distill --yes --limit 50',''],['dream/prompts/distill.md','the prompt'],['[stages.distill] in ~/.config/dream/config.toml','provider and effort']],
   sleep:['Sleep spindles','N2 sleep has short bursts of brain waves called spindles. Studies link them to tagging which new memories to keep. Distill is the tagging step.'],
-  scene:{nodes:[['d',95,150,'dream.db','changed sessions','store'],['m',325,150,'Codex','distill · low effort','model'],['o1',590,35,'decisions','','out'],['o2',590,82,'preferences','','out'],['o3',590,129,'projects','','out'],['o4',590,176,'references','','out'],['o5',590,223,'open_threads','','out'],['o6',590,270,'user_facts','','out']],
+  scene:{nodes:[['d',95,150,'dream.db','changed sessions','store'],['m',325,150,'Distill model','configured route','model'],['o1',590,35,'decisions','','out'],['o2',590,82,'preferences','','out'],['o3',590,129,'projects','','out'],['o4',590,176,'references','','out'],['o5',590,223,'open_threads','','out'],['o6',590,270,'user_facts','','out']],
    edges:[['d','m','session'],['m','o1',''],['m','o2',''],['m','o3',''],['m','o4',''],['m','o5',''],['m','o6','']], small:true},
   cap:'This is the first step that sends transcript text to a model provider.'},
 
@@ -194,42 +197,43 @@ const STEPS = [
         'A ledger records which notes were used. Progress follows that ledger, not timestamps, so no note is lost or used twice.'],
   where:[['dream consolidate',''],['[consolidate] mode = "full"','or "subset" with subset_files = 15'],['.suggestions/','preview files for review'],['dream/prompts/consolidate.md','the prompt; consolidate-subset.md in subset mode']],
   sleep:['Slow-wave sleep','Deep sleep has big, slow brain waves. One leading theory, systems consolidation, says memories replay from the hippocampus to the cortex here. That is where they last for years.'],
-  scene:{nodes:[['n',95,85,'Distilled notes','not yet consumed','store'],['k',95,215,'Current memory','all files, or a subset','store'],['m',335,150,'Codex','consolidate · high','model'],['s',590,85,'Suggestions','.suggestions/','out'],['l',590,215,'Ledger','notes marked as used','check']],
+  scene:{nodes:[['n',95,85,'Distilled notes','not yet consumed','store'],['k',95,215,'Current memory','all files, or a subset','store'],['m',335,150,'Consolidate model','configured route','model'],['s',590,85,'Suggestions','.suggestions/','out'],['l',590,215,'Ledger','notes marked as used','check']],
    edges:[['n','m','facts'],['k','m','context'],['m','s','idea'],['m','l','ids']]},
   cap:'The deepest model call of the night. It sees what you already remember.'},
 
  {id:'curate', short:'Curate', level:'n2', time:'~04:25', stage:'N2 · light sleep',
   title:'Curate: keep, merge, or let go',
-  what:['A review model reads each pending suggestion. It chooses accept, merge, reject, or defer, and gives a reason.',
+  what:['Dream groups pending suggestions by their target file. A review model reads one group at a time. It chooses accept, merge, reject, or defer for each suggestion and gives a reason.',
         'The host code has the final word. It checks the file hash has not changed, the path stays inside the memory folder, and protected files are untouched. It makes a backup before every live write.',
-        'MEMORY.md only gets new index lines added. If a file changed during the night, the suggestion waits for the next run.'],
-  where:[['dream suggestions curate-configured',''],['[stages.review]','which model reviews'],['memory/MEMORY.md','one line per memory']],
+        'Topic files are reviewed first. MEMORY.md comes last, with the final topic text and review results. Dream updates explicitly named index lines and adds new links. It preserves other entries. Missing, pending, failed, or changed topic work defers the dependent index proposal.',
+        'This requires review.mode = "auto-apply". The default, "suggest-only", leaves suggestions pending. When enabled, the embedder refreshes new summaries and memory edits after curation.'],
+  where:[['dream suggestions curate-configured',''],['[review] mode = "auto-apply"','enables model review and checked writes'],['[stages.review]','which model reviews'],['memory/MEMORY.md','reviewed last; targeted line updates']],
   sleep:['Pruning','The synaptic homeostasis idea (Tononi and Cirelli) says sleep weakens many connections made during the day. The strong, useful ones then stand out. Rejected suggestions are the weak links.'],
-  scene:{nodes:[['s',85,150,'Suggestions','pending','out'],['r',260,150,'Review model','decides + reason','model'],['h',450,150,'Host checks','SHA · path · backup','check'],['f',635,85,'Memory files','*.md','store'],['i',635,215,'MEMORY.md','append-only index','store'],['x',450,262,'Reject / defer','kept for later','dim']],
-   edges:[['s','r','idea'],['r','h','accept'],['r','x','no'],['h','f','write'],['h','i','line']]},
-  cap:'The model proposes. The host enforces.'},
+  scene:{nodes:[['s',90,65,'By target file','pending suggestions','out'],['r',335,65,'Review model','one group at a time','model'],['h',590,65,'Host checks','SHA · path · backup','check'],['f',590,220,'Topic files','write or defer','store'],['i',335,220,'MEMORY.md last','edit + add links','store'],['e',90,220,'Refresh vectors','if embedder enabled','check']],
+   edges:[['s','r','group'],['r','h','decision'],['h','f','apply'],['f','i','final text'],['i','e','sync']]},
+  cap:'Review topic groups first, then the index. Refresh embeddings after curation.'},
 
  {id:'generate', short:'Generate', level:'rem', time:'~04:35', stage:'REM · dreaming',
   title:'Character generate: dream up practice scenes',
-  what:['This stage builds answer pairs: one answer that fits your character, and one that does not.',
+  what:['Optional. With character.enabled = true, this stage builds answer pairs: one answer that fits your character, and one that does not.',
         'Real pairs come from moments when you corrected an agent. Synthetic pairs come from seed situations for each trait in your constitution.',
         'The constitution is your own file of traits. Only you write it and approve it. At most 10 work items run per night.'],
-  where:[['dream character generate --source all --limit 10',''],['~/.config/dream/character/constitution.md','your traits'],['dream/prompts/character-*.md','extract, response, expand']],
+  where:[['dream character generate --source all --limit 10',''],['[character] enabled = false','disabled by default'],['~/.config/dream/character/constitution.md','your traits'],['dream/prompts/character-*.md','extract, response, expand']],
   sleep:['REM dreams','Most vivid dreams come in REM sleep. The threat simulation theory (Revonsuo) says dreams rehearse situations that have not happened yet. Here the night invents scenes to practise good answers.'],
-  scene:{nodes:[['c',95,80,'Corrections','you fixed an answer','person'],['t',95,220,'Constitution','your traits','person'],['m',335,150,'Codex','character generate','model'],['a',590,85,'Chosen answer','fits the traits','out'],['b',590,215,'Rejected answer','what to avoid','dim']],
+  scene:{nodes:[['c',95,80,'Corrections','you fixed an answer','person'],['t',95,220,'Constitution','your traits','person'],['m',335,150,'Writer model','enabled by config','model'],['a',590,85,'Chosen answer','fits the traits','out'],['b',590,215,'Rejected answer','what to avoid','dim']],
    edges:[['c','m','moment'],['t','m','trait'],['m','a','good'],['m','b','bad']]},
   cap:'No weights are trained. Pairs are data for review and context.'},
 
  {id:'judge', short:'Judge', level:'rem', time:'~04:45', stage:'REM · dreaming',
   title:'Character judge: a second dreamer checks',
-  what:['A judge model scores each pair against the constitution. It writes a verdict, a rationale, and flags for any conflict.',
-        'The judge must come from a different model family than the one that wrote the pair. By default the writer is Codex (OpenAI) and the judge is Claude (Anthropic).',
+  what:['Optional, like generation. A judge model checks each pair twice against the constitution, with the answer order swapped. It writes verdicts, reasons, and conflict flags. Different results are marked inconsistent.',
+        'By default the judge must come from a different model family than the writer. The default writer uses Codex from OpenAI, and the judge uses Claude from Anthropic.',
         'A verdict never accepts a pair. It only prepares the pair for you.'],
   where:[['dream character judge --limit 10',''],['[stages.character_judge] provider = "claude"',''],['dream/character/judge.py','family independence check']],
   sleep:['Lucid dreaming','In a lucid dream, part of you watches the dream and knows it is a dream. The judge is that watcher. It is a different mind from the one that made the scene.'],
-  scene:{nodes:[['p',95,150,'Answer pair','chosen vs rejected','out'],['j',330,150,'Claude','other model family','model'],['v',580,80,'Verdict','rationale + flags','check'],['q',580,225,'Review queue','waits for you','person']],
+  scene:{nodes:[['p',95,150,'Answer pair','chosen vs rejected','out'],['j',330,150,'Judge model','two orders checked','model'],['v',580,80,'Verdicts','agreement + flags','check'],['q',580,225,'Review queue','waits for you','person']],
    edges:[['p','j','pair'],['j','v','vote'],['v','q','ready']]},
-  cap:'Two model families, so one model does not grade its own work.'},
+  cap:'By default, two model families keep the writer and judge separate.'},
 
  {id:'wake', short:'Wake', level:'wake', time:'~05:00', stage:'Waking up',
   title:'Waking up: the sleep tracker report',
@@ -253,15 +257,16 @@ const STEPS = [
    edges:[['y','q','read'],['y','a','decide'],['a','s','draft'],['s','b','approve']]},
   cap:'The model proposes, the host enforces, and the human decides.'},
 
- {id:'recall', short:'Recall', level:'wake', time:'Next session', stage:'Awake',
+ {id:'recall', short:'Recall', level:'wake', time:'Session start or during work', stage:'Awake',
   title:'Recall: the day remembers the night',
-  what:['When a new session starts, the SessionStart hook adds the trusted character block and a small index of memory.',
-        'On your first prompt, the UserPromptSubmit hook searches dream.db. It ranks hits by text match, paths, projects, and recency (reciprocal rank fusion, k = 60). With the embedder on and calibrated, meaning is a fifth list.',
+  what:['When installed, the SessionStart hook adds memory context. It also adds the trusted character block only when character.hook_injection is enabled and the complete block fits the context budget. That setting is off by default.',
+        'On your first prompt by default, the UserPromptSubmit hook searches dream.db. It ranks hits by text match, paths, projects, and recency. With the embedder on and calibrated, meaning is a fifth list. Set recall.first_prompt_only = false to allow later prompt hooks too.',
+        'Agents can also search during work through the read-only MCP tools recall_search, recall_get, and memory_index, or through dream recall. These calls do not depend on a new session or first prompt.',
         'The hook opens the database read-only and has five seconds. If anything fails, it adds nothing and the session goes on. Each hook leaves a marker of the memories it selected and delivered; a later ingest counts the delivered ones as usage.'],
-  where:[['dream context session-start','SessionStart hook'],['dream context prompt','UserPromptSubmit hook'],['dream hooks install','writes the hook commands'],['[Dream recall — untrusted reference data]','how recalled text is labelled']],
+  where:[['dream context session-start','SessionStart hook'],['dream context prompt','UserPromptSubmit hook'],['dream hooks install','writes the hook commands'],['[character] hook_injection = false','trusted character context is opt-in'],['recall_search / recall_get / memory_index','read-only MCP tools for use during work'],['dream recall "project decisions preferences"','read-only CLI search']],
   sleep:['Cue-dependent memory','A smell or a word can bring back a whole memory, like Proust and his madeleine cake. Your first prompt is the cue. Dream finds what matches it.'],
-  scene:{nodes:[['s',80,85,'New session','SessionStart · 5 s','person'],['p',80,220,'First prompt','UserPromptSubmit · 5 s','person'],['r',265,155,'Search dream.db','read-only · RRF','check'],['c',455,70,'Trusted character','constitution + pairs','store'],['u',455,240,'Dream recall','untrusted reference','out'],['g',635,155,'Agent','reads as context','model']],
-   edges:[['s','c','start'],['s','r','index'],['p','r','cue'],['r','u','hits'],['c','g',''],['u','g','']]},
+  scene:{nodes:[['s',80,55,'New session','SessionStart · 5 s','person'],['p',80,150,'First prompt','default hook setting','person'],['t',80,245,'MCP / CLI','search any time','person'],['r',300,190,'Search dream.db','read-only','check'],['c',510,55,'Trusted character','optional · approved','store'],['u',510,225,'Dream recall','untrusted reference','out'],['g',635,135,'Agent','reads as context','model']],
+   edges:[['s','c','opt-in'],['s','r','context'],['p','r','cue'],['t','r','query'],['r','u','hits'],['c','g',''],['u','g','']]},
   cap:'Recall never writes to the database and never blocks your session.'},
 
  {id:'audit', short:'Audit', level:'wake', time:'Sundays 12:00, weekly', stage:'Awake',
