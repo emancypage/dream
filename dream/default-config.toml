@@ -30,6 +30,8 @@ auth = "chatgpt-subscription"
 
 [providers.claude]
 type = "claude-cli"
+# Retry a structured refusal once through the same Claude CLI subscription.
+# refusal_fallback_model = "claude-opus-4-8"
 
 # Optional local model server with an OpenAI-compatible API (llama-server,
 # Ollama, vLLM). Route a stage to it with provider = "local-qwen". The key is

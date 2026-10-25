@@ -21,6 +21,7 @@ Notes on cost / rate limits:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import tempfile
@@ -64,6 +65,23 @@ def _ensure_workdir() -> Path:
     return WORKDIR
 
 
+def _json_response(stdout: str) -> dict | None:
+    try:
+        value = json.loads(stdout)
+        if isinstance(value, dict):
+            return value
+    except json.JSONDecodeError:
+        pass
+    for line in reversed(stdout.splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
 def call_claude(
     prompt: str,
     schema: dict,
@@ -72,14 +90,16 @@ def call_claude(
     system_prompt: str = SYSTEM_PROMPT,
     extra_args: list[str] | None = None,
     executable: str = "claude",
+    refusal_fallback_model: str | None = None,
 ) -> CallResult:
     """
-    Run a single `claude --print` invocation against the user's OAuth subscription.
+    Run `claude --print` through the user's OAuth subscription.
 
     `model` accepts an alias ("haiku", "sonnet", "opus") or a full model id.
     `model=None` omits `--model` and lets Claude use its configured default.
     The schema is enforced by Claude Code (`--json-schema`); we then parse the
     `structured_output` from the wrapper JSON.
+    A configured refusal fallback retries once within the same timeout budget.
     """
     workdir = _ensure_workdir()
     schema_json = json.dumps(schema, ensure_ascii=False)
@@ -88,8 +108,6 @@ def call_claude(
         executable,
         "--print",
     ]
-    if model is not None:
-        cmd.extend(["--model", model])
     cmd += [
         "--output-format", "json",
         "--json-schema", schema_json,
@@ -112,46 +130,55 @@ def call_claude(
     env.pop("ANTHROPIC_API_KEY", None)
 
     t0 = time.monotonic()
-    try:
-        proc = subprocess.run(
-            cmd,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            cwd=workdir,
-            env=env,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise ClaudeCLIError(f"claude CLI timed out after {timeout}s") from e
-
-    if proc.returncode != 0:
-        raise ClaudeCLIError(
-            f"claude CLI exited {proc.returncode}\nstderr: {proc.stderr[:500]}"
-            f"\nstdout: {proc.stdout[:2000]}"
-        )
-
-    stdout = proc.stdout.strip()
-    if not stdout:
-        raise ClaudeCLIError("claude CLI returned empty stdout")
-
-    # `--output-format json` emits one JSON object on stdout (or possibly multiple
-    # if multi-turn — we'll take the last well-formed one).
-    parsed = None
-    for line in reversed(stdout.splitlines()):
-        line = line.strip()
-        if not line:
-            continue
+    current_model = model
+    fallback = refusal_fallback_model
+    usage = {key: None for key in (
+        "input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+    )}
+    total_cost = 0.0
+    while True:
+        remaining = timeout - (time.monotonic() - t0)
+        if remaining <= 0:
+            raise ClaudeCLIError(f"claude CLI timed out after {timeout}s")
+        model_args = ["--model", current_model] if current_model is not None else []
         try:
-            parsed = json.loads(line)
-            break
-        except json.JSONDecodeError:
-            continue
-    if parsed is None:
-        try:
-            parsed = json.loads(stdout)
-        except json.JSONDecodeError as e:
-            raise ClaudeCLIError(f"could not parse claude output: {e}\n--- stdout ---\n{stdout[:2000]}")
+            proc = subprocess.run(
+                cmd[:2] + model_args + cmd[2:],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                cwd=workdir,
+                env=env,
+                timeout=remaining,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise ClaudeCLIError(f"claude CLI timed out after {timeout}s") from e
+        stdout = proc.stdout.strip()
+        parsed = _json_response(stdout)
+        if parsed is not None:
+            for key in usage:
+                count = parsed.get("usage", {}).get(key)
+                if count is not None:
+                    usage[key] = (usage[key] or 0) + count
+            total_cost += parsed.get("total_cost_usd") or 0.0
+            if parsed.get("stop_reason") == "refusal":
+                if fallback and fallback != current_model:
+                    logging.getLogger(__name__).warning(
+                        "Claude model %s returned refusal; retrying once with %s", current_model, fallback,
+                    )
+                    current_model, fallback = fallback, None
+                    continue
+                raise ClaudeCLIError(f"claude returned stop_reason=refusal: {parsed.get('result', '')[:500]}")
+        if proc.returncode != 0:
+            raise ClaudeCLIError(
+                f"claude CLI exited {proc.returncode}\nstderr: {proc.stderr[:500]}"
+                f"\nstdout: {proc.stdout[:2000]}"
+            )
+        if not stdout:
+            raise ClaudeCLIError("claude CLI returned empty stdout")
+        if parsed is None:
+            raise ClaudeCLIError(f"could not parse claude output as JSON:\n{stdout[:2000]}")
+        break
 
     if parsed.get("is_error"):
         raise ClaudeCLIError(f"claude reported error: {parsed.get('result', '')[:500]}")
@@ -167,7 +194,6 @@ def call_claude(
                 f"no structured_output and result is not JSON.\nresult: {result_text[:500]}"
             )
 
-    usage = parsed.get("usage", {})
     elapsed_ms = int((time.monotonic() - t0) * 1000)
 
     validate_output(structured, schema)
@@ -181,9 +207,9 @@ def call_claude(
             cache_creation_tokens=usage.get("cache_creation_input_tokens"),
             cache_read_tokens=usage.get("cache_read_input_tokens"),
         ),
-        total_cost_usd=parsed.get("total_cost_usd", 0.0),
+        total_cost_usd=total_cost,
         duration_ms=elapsed_ms,
-        model=model,
+        model=current_model,
     )
 
 
