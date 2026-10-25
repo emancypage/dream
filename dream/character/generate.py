@@ -172,9 +172,16 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
         metadata={'prompt_sha256':content_hash({'system':system,'prompt':prompt,'schema':request_schema}),'configured_model':config.stage(stage).get('model'),'reported_model':getattr(answer,'model',None),'started_at':started_at,'finished_at':finished_at,'stage':stage,'family':provider_family(config,stage),'provider':getattr(answer,'provider',config.stage(stage)['provider']),'model':getattr(answer,'model',config.stage(stage).get('model')),'options':dict(config.stage(stage)),'duration_ms':getattr(answer,'duration_ms',None),'usage':asdict(answer.usage) if is_dataclass(getattr(answer,'usage',None)) else None}
         return answer.output,metadata
     def response(item,messages,arm):
-        output,meta=call(item,'character_generate','character-response-v1.md',{'messages':messages},RESPONSE_SCHEMA,arm=='chosen')
+        limit=config.data['character']['max_response_codepoints']
+        schema=dict(RESPONSE_SCHEMA,properties={**RESPONSE_SCHEMA['properties'],
+            'response':{**RESPONSE_SCHEMA['properties']['response'],'minLength':1,'maxLength':limit}})
+        output,meta=call(item,'character_generate','character-response-v1.md',
+            {'messages':messages,'max_response_codepoints':limit},schema,arm=='chosen')
         text=output['response']
-        if not text.strip() or len(text)>config.data['character']['max_response_codepoints']: raise GenerationValidationError('invalid response length')
+        if not text.strip():
+            raise GenerationValidationError(f'blank response: {len(text)} codepoints; limit {limit}')
+        if len(text)>limit:
+            raise GenerationValidationError(f'response too long: {len(text)} codepoints; limit {limit}')
         return text,meta
     def persist(item,table,record,seed_record=None):
         check(item)
