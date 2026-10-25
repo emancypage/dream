@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import json
 import sqlite3
 import sys
 from types import SimpleNamespace
@@ -192,6 +193,62 @@ def test_build_curation_prompt_rejects_complete_prompt_overrun():
         build_curation_prompt(rows, Path("/memory/root"))
 
 
+def _curation_payload(prompt):
+    decoder = json.JSONDecoder()
+    return decoder.raw_decode(prompt.split("Pending suggestion snapshots:\n", 1)[1])[0]
+
+
+def test_shared_target_body_appears_once_without_losing_suggestion_context():
+    body = "Shared target content. " * 1800
+    rows = [
+        dict(id=i, kind="patch", target_path="MEMORY.md", body=f"proposal {i}",
+             current_target_body=body, current_sha256="live-sha",
+             base_sha256=f"base-{i}", target_existed=True, conflict=bool(i % 2),
+             find_text=f"line {i}")
+        for i in range(10)
+    ]
+    prompt = build_curation_prompt(rows, Path("/memory/root"))
+    payload = _curation_payload(prompt)
+    assert prompt.count(body) == 1
+    assert payload["targets"] == [dict(target_path="MEMORY.md",
+        current_target_body=body, current_sha256="live-sha")]
+    assert len(payload["suggestions"]) == 10
+    for i, row in enumerate(payload["suggestions"]):
+        assert row["id"] == i
+        assert row["target_path"] == "MEMORY.md"
+        assert row["proposal_body"] == f"proposal {i}"
+        assert row["stored_base_sha256"] == f"base-{i}"
+        assert row["target_existed"] is True
+        assert row["conflict"] is bool(i % 2)
+        assert row["patch_find"] == f"line {i}"
+        assert "current_target_body" not in row
+        assert "current_sha256" not in row
+    assert "patch_find occurs exactly once" in prompt
+
+
+@pytest.mark.parametrize("changed", [
+    {"current_target_body": "different"},
+    {"current_sha256": "different-sha"},
+])
+def test_shared_target_rejects_conflicting_snapshots(changed):
+    row = dict(id=1, target_path="MEMORY.md", body="proposal",
+               current_target_body="live", current_sha256="live-sha")
+    with pytest.raises(ValueError, match="conflicting.*target.*MEMORY.md"):
+        build_curation_prompt([row, dict(row, id=2, **changed)], Path("/memory/root"))
+
+
+def test_shared_target_still_checks_each_snapshot_field_bound():
+    row = dict(id=1, target_path="MEMORY.md", current_target_body="live")
+    with pytest.raises(ValueError, match="suggestion ID 2.*current_target_body"):
+        build_curation_prompt([row, dict(row, id=2,
+            current_target_body="x" * (MAX_CURATION_FIELD_CHARS + 1))], Path("/memory/root"))
+
+
+def _group_decisions(prompt, decisions):
+    ids = {row["id"] for row in _curation_payload(prompt)["suggestions"]}
+    return [decision for decision in decisions if decision["suggestion_id"] in ids]
+
+
 def _sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
 
@@ -291,7 +348,7 @@ def test_curate_no_wal_uses_immutable_snapshot_without_writes(tmp_path, monkeypa
     monkeypatch.setattr(dream, "generate", fake_review, raising=False)
 
     assert run_curate(root, db_path, config, dry_run=True) == 0
-    assert opened_with_immutable_helper == [db_path]
+    assert opened_with_immutable_helper == [db_path, db_path]
     assert '"target_path": "existing.md"' in captured["prompt"]
     assert _fixture_snapshot(root, db_path) == before
     assert not Path(f"{db_path}-wal").exists()
@@ -323,12 +380,12 @@ def test_curate_accept_merge_reject_and_defer_updates_only_expected_rows(tmp_pat
         assert kwargs["config"] is config
         return SimpleNamespace(
             output={
-                "decisions": [
+                "decisions": _group_decisions(prompt, [
                     {"suggestion_id": 1, "decision": "accept", "reason": "confirmed", "body": ""},
                     {"suggestion_id": 2, "decision": "merge", "reason": "updated", "body": "model merged body"},
                     {"suggestion_id": 3, "decision": "reject", "reason": "obsolete", "body": ""},
                     {"suggestion_id": 4, "decision": "defer", "reason": "needs review", "body": ""},
-                ]
+                ])
             },
             provider="codex",
             model="gpt-5.6-luna",
@@ -560,12 +617,12 @@ def test_curate_dry_run_validates_and_writes_nothing(tmp_path, monkeypatch, caps
         dream,
         "generate",
         lambda *args, **kwargs: SimpleNamespace(
-            output={"decisions": [
+            output={"decisions": _group_decisions(args[1], [
                 {"suggestion_id": 1, "decision": "accept", "reason": "confirmed", "body": ""},
                 {"suggestion_id": 2, "decision": "merge", "reason": "updated", "body": "merged"},
                 {"suggestion_id": 3, "decision": "reject", "reason": "obsolete", "body": ""},
                 {"suggestion_id": 4, "decision": "defer", "reason": "later", "body": ""},
-            ]},
+            ])},
             provider="codex", model="gpt-5.6-luna",
         ),
         raising=False,
@@ -581,6 +638,11 @@ def test_curate_dry_run_validates_and_writes_nothing(tmp_path, monkeypatch, caps
 
 def test_curate_rejects_incomplete_response_before_any_mutation(tmp_path, monkeypatch):
     root, db_path, config = make_curation_fixture(tmp_path, auto_apply=True)
+    # Invalid output must not mutate any row of its target group.
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE suggestions SET target_path='accept.md'")
+    conn.commit()
+    conn.close()
     before = _fixture_snapshot(root, db_path)
     monkeypatch.setattr(
         dream,
@@ -597,7 +659,7 @@ def test_curate_rejects_incomplete_response_before_any_mutation(tmp_path, monkey
     assert not list(tmp_path.glob("memory-backups/*"))
 
 
-def test_curate_index_merge_keeps_existing_lines_and_appends_model_lines(tmp_path, monkeypatch):
+def test_curate_index_merge_defers_unreviewed_existing_description_change(tmp_path, monkeypatch):
     root = tmp_path / "memory"
     root.mkdir()
     (root / "MEMORY.md").write_text("- [Existing](existing.md) — keep\n", encoding="utf-8")
@@ -627,7 +689,8 @@ def test_curate_index_merge_keeps_existing_lines_and_appends_model_lines(tmp_pat
 
     assert run_curate(root, db_path, config) == 0
     result = (root / "MEMORY.md").read_text(encoding="utf-8")
-    assert result == "- [Existing](existing.md) — keep\n- [New](new.md) — added\n"
+    assert result == "- [Existing](existing.md) — keep\n"
+    assert statuses(db_path)[1] == "pending"
 
 
 def test_curate_tracks_expected_state_across_normalized_shared_index_target(
@@ -741,23 +804,23 @@ def test_curate_prompt_has_complete_body_and_never_reads_unsafe_target(tmp_path,
 
 def test_curate_prompt_snapshots_complete_current_target_body(tmp_path, monkeypatch):
     root, db_path, config = make_curation_fixture(tmp_path, auto_apply=True)
-    captured = {}
+    captured = []
 
     def fake_review(stage, prompt, schema, **kwargs):
-        captured["prompt"] = prompt
+        captured.append(prompt)
         return SimpleNamespace(
-            output={"decisions": [
+            output={"decisions": _group_decisions(prompt, [
                 {"suggestion_id": 1, "decision": "defer", "reason": "inspect", "body": ""},
                 {"suggestion_id": 2, "decision": "defer", "reason": "inspect", "body": ""},
                 {"suggestion_id": 3, "decision": "defer", "reason": "inspect", "body": ""},
                 {"suggestion_id": 4, "decision": "defer", "reason": "inspect", "body": ""},
-            ]},
+            ])},
             provider="codex", model="gpt-5.6-luna",
         )
 
     monkeypatch.setattr(dream, "generate", fake_review, raising=False)
     assert run_curate(root, db_path, config) == 0
-    assert '"current_target_body": "original accept body"' in captured["prompt"]
+    assert '"current_target_body": "original accept body"' in captured[0]
 
 
 def test_curate_merge_requires_string_body_before_mutation(tmp_path, monkeypatch):
@@ -909,7 +972,7 @@ def test_curate_merge_on_a_patch_never_leaves_the_span_as_an_update_body(tmp_pat
     conn = sqlite3.connect(db_path)
     try:
         assert conn.execute("SELECT status, kind, find_text, body FROM suggestions").fetchone() == (
-            "pending", "update", None, "intro\nmerged fact\noutro\n")
+            "pending", "patch", "o", "new fact")
     finally:
         conn.close()
 

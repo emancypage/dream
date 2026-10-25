@@ -1,4 +1,4 @@
-"""Tests for review-time helpers: append-only MEMORY.md merge + DB migration.
+"""Tests for review-time helpers: targeted MEMORY.md merge + DB migration.
 
 Runnable directly (`python3 tests/test_review_helpers.py`) or via pytest.
 """
@@ -37,14 +37,35 @@ def test_merge_appends_only_new_targets():
     assert merged.startswith(existing.rstrip("\n"))
 
 
-def test_merge_never_reverts_existing_hook():
-    # Proposed carries a STALE hook for an already-present file — must not overwrite.
-    existing = "- [Deploy runbook](deploy.md) — FRESH: staging cutover done\n"
-    proposed = "- [Deploy runbook](deploy.md) — STALE: cutover planned\n- [New](new.md) — n\n"
-    merged = _merge_index(existing, proposed)
-    assert "FRESH" in merged
-    assert "STALE" not in merged
-    assert "(new.md)" in merged
+def test_merge_updates_explicitly_named_existing_hook():
+    existing = "# Topics\n- [Deploy runbook](deploy.md) old state\n- [Other](other.md) untouched\n"
+    proposed = "- [Deploy runbook](deploy.md) current state\n- [New](new.md) new facts\n"
+    assert _merge_index(existing, proposed) == (
+        "# Topics\n- [Deploy runbook](deploy.md) current state\n"
+        "- [Other](other.md) untouched\n- [New](new.md) new facts\n"
+    )
+
+
+@pytest.mark.parametrize("ending", ["\n", "\r\n", "\r"])
+def test_merge_replaces_in_place_and_preserves_line_endings(ending):
+    existing = ending.join(["# Header", "", "- [A](a.md) old", "prose", "- [B](b.md) keep", ""])
+    expected = ending.join(["# Header", "", "- [A](a.md) new", "prose", "- [B](b.md) keep", ""])
+    assert _merge_index(existing, "- [A](a.md) new\n") == expected
+    assert _merge_index(expected, "- [A](a.md) new\n") == expected
+
+
+def test_merge_preserves_final_unterminated_line_when_updating():
+    assert _merge_index("# Header\n- [A](a.md) old", "- [A](a.md) new\n") == "# Header\n- [A](a.md) new"
+
+
+def test_merge_identical_proposed_duplicates_append_once():
+    assert _merge_index("# Header\n", "- [A](a.md) new\n- [A](a.md) new\n") == "# Header\n- [A](a.md) new\n"
+
+
+def test_merge_rejects_conflicting_duplicate_proposed_lines():
+    with pytest.raises(ValueError, match="conflicting.*index.*target"):
+        _merge_index("# Header\n", "- [A](a.md) first\n- [A](a.md) second\n")
+
 
 
 def test_merge_preserves_existing_only_target():

@@ -388,3 +388,61 @@ def test_provider_schema_constrains_copied_evidence(env, monkeypatch, field):
     result = g.generate_pairs(conn, cfg, source='corrections', limit=1)
     assert result['failures'] == []
     assert result['skipped']['negative'] == 1
+
+
+@pytest.mark.parametrize('response_limit', [37, 8000])
+def test_response_calls_communicate_configured_length_bound(env, monkeypatch, response_limit):
+    import json
+    g, cfg, conn = env
+    cfg.data['character']['max_response_codepoints'] = response_limit
+    g.load_constitution(cfg).seeds = ({'id': 'seed-a', 'trait_id': 'trait-a', 'prompt': 'Task'},)
+    calls = []
+    def fake(stage, prompt, schema, **kw):
+        data = json.loads(prompt)
+        calls.append((data, schema, kw['system_prompt']))
+        return SimpleNamespace(output={'response': 'chosen' if len(calls) == 1 else 'baseline'})
+    monkeypatch.setattr(g.backend, 'generate', fake)
+    result = g.generate_pairs(conn, cfg, source='synthetic', limit=1)
+    assert result['generated'] == 1
+    assert len(calls) == 2
+    for data, schema, system in calls:
+        assert data['max_response_codepoints'] == response_limit
+        assert schema['properties']['response']['minLength'] == 1
+        assert schema['properties']['response']['maxLength'] == response_limit
+        assert 'max_response_codepoints' in system
+        assert 'non-whitespace' in system
+
+
+@pytest.mark.parametrize(('text', 'reason'), [
+    ('', 'blank response: 0 codepoints; limit 12'),
+    ('   ', 'blank response: 3 codepoints; limit 12'),
+    ('private' * 2, 'response too long: 14 codepoints; limit 12'),
+])
+@pytest.mark.parametrize('arm', ['chosen', 'baseline'])
+def test_response_length_failures_keep_safe_lengths_and_no_pair(env, monkeypatch, caplog, text, reason, arm):
+    g, cfg, conn = env
+    cfg.data['character']['max_response_codepoints'] = 12
+    g.load_constitution(cfg).seeds = ({'id': 'seed-a', 'trait_id': 'trait-a', 'prompt': 'Task'},)
+    def fake(stage, prompt, schema, **kw):
+        current_arm = 'chosen' if 'Approved constitution:' in kw['system_prompt'] else 'baseline'
+        return SimpleNamespace(output={'response': text if current_arm == arm else 'valid'})
+    monkeypatch.setattr(g.backend, 'generate', fake)
+    result = g.generate_pairs(conn, cfg, source='synthetic', limit=1)
+    assert result['generated'] == 0
+    assert result['failures'][0]['reason'] == reason
+    assert reason in caplog.text
+    assert 'private' not in str(result) + caplog.text
+    assert not storage.records(conn, 'character_pairs')
+    assert not storage.records(conn, 'character_seeds')
+
+
+def test_response_host_bound_counts_unicode_codepoints_and_accepts_exact_limit(env, monkeypatch):
+    g, cfg, conn = env
+    cfg.data['character']['max_response_codepoints'] = 12
+    g.load_constitution(cfg).seeds = ({'id': 'seed-a', 'trait_id': 'trait-a', 'prompt': 'Task'},)
+    def fake(stage, prompt, schema, **kw):
+        return SimpleNamespace(output={'response': '😀' * 12 if 'Approved constitution:' in kw['system_prompt'] else 'baseline'})
+    monkeypatch.setattr(g.backend, 'generate', fake)
+    result = g.generate_pairs(conn, cfg, source='synthetic', limit=1)
+    assert result['generated'] == 1
+    assert storage.records(conn, 'character_pairs')[0]['chosen'] == '😀' * 12

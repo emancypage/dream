@@ -47,7 +47,7 @@ from consolidate import PatchError, patch_text, run_audit, states_deletion  # no
 from search import search as fts_search, session_summary  # noqa: E402
 from backend import active_backend, generate, preflight  # noqa: E402
 from config import load_config  # noqa: E402
-from curate import CURATION_SCHEMA, build_curation_prompt, parse_curation_output  # noqa: E402
+from curate import CURATION_SCHEMA, CurationContractError, build_curation_prompt, parse_curation_output  # noqa: E402
 from recall_documents import embed_recall_documents, synchronize_recall_documents  # noqa: E402
 from recall_context import append_diagnostic, configured_embedder, parse_hook_payload, recall_preflight, recent_diagnostic, run_context, hook_success_json  # noqa: E402
 from recall_context import RECALL_KINDS, RecallUnavailable, agent_results, recall_for_agent, validate_agent_query, with_adapters  # noqa: E402
@@ -308,28 +308,40 @@ def _index_target(line: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _index_proposal_lines(proposed: str) -> dict[str, str]:
+    """Keep each intended link line once; conflicting descriptions are ambiguous."""
+    lines = {}
+    for line in proposed.splitlines():
+        target = _index_target(line)
+        if target is None:
+            continue
+        if target in lines and lines[target] != line:
+            raise CurationContractError("conflicting proposed index lines for one target")
+        lines[target] = line
+    return lines
+
+
 def _merge_index(existing: str, proposed: str) -> str:
-    """Append-only merge for MEMORY.md.
-
-    Keep the existing index verbatim, then append only the proposed link lines
-    whose target file isn't already indexed. This can never drop or revert an
-    existing line — unlike a wholesale overwrite, which loses entries when the
-    proposed body was built from a stale/truncated snapshot (see consolidate's
-    MAX_CURRENT_MEMORY_CHARS cap and multiple index suggestions per run).
-
-    Tradeoff: an already-present file's one-line hook is NOT refreshed here; the
-    topic file stays the source of truth.
-    """
-    existing_lines = existing.splitlines()
-    have = {t for line in existing_lines if (t := _index_target(line))}
-    additions = [
-        line for line in proposed.splitlines()
-        if (t := _index_target(line)) and t not in have
-    ]
-    if not additions:
-        return existing
-    body = existing.rstrip("\n")
-    return body + "\n" + "\n".join(additions) + "\n"
+    """Update named link lines in place, append new targets, and preserve omissions."""
+    replacements = _index_proposal_lines(proposed)
+    present = set()
+    merged = []
+    newline = next((ending for line in existing.splitlines(keepends=True)
+                    if (ending := line[len(line.rstrip("\r\n")):]) in ("\r\n", "\n", "\r")), "\n")
+    for line in existing.splitlines(keepends=True):
+        text = line.rstrip("\r\n")
+        target = _index_target(text)
+        if target is not None:
+            present.add(target)
+        replacement = replacements.get(target)
+        merged.append(replacement + line[len(text):] if replacement is not None else line)
+    additions = [line for target, line in replacements.items() if target not in present]
+    body = "".join(merged)
+    if additions:
+        if body and not body.endswith(("\r", "\n")):
+            body += newline
+        body += newline.join(additions) + newline
+    return body
 
 
 def _prune_orphaned_index_lines(memory_root: Path, *, constitution_path) -> bool:
@@ -632,7 +644,7 @@ def _backup_memory(memory_root: Path) -> Path:
 
 
 def _resolved_body(kind: str, old: str, body: str | None) -> str:
-    """What review actually writes: index append-merges, everything else replaces wholesale."""
+    """Preview targeted index changes; other suggestion bodies replace wholesale."""
     return _merge_index(old, body or "") if kind == "index" else (body or "")
 
 
@@ -679,7 +691,8 @@ def _find_text(conn: sqlite3.Connection, sug_id) -> str | None:
 
 def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
                       sug_id, kind, target_path, new_content, sug_file,
-                      sync_recall: bool = True, *, constitution_path) -> bool:
+                      sync_recall: bool = True, *, constitution_path, commit: bool = True,
+                      reviewed_index: dict[str, str] | None = None) -> bool:
     """Accept one suggestion: write/merge/delete the target, mark accepted, drop the preview.
 
     Refuses (marks 'rejected' instead of touching the filesystem) if target_path would
@@ -692,26 +705,41 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
     resolved_target = tgt.resolve()
     contained = resolved_target.is_relative_to(resolved_root)
     from character.safety import is_memory_control_source
-    # MEMORY.md is never deleted, and never patched: index lines are only appended.
+    # Index writes always update only their explicitly named entries.
+    if resolved_target == resolved_root / "MEMORY.md" and kind in ("new", "update"):
+        kind = "index"
+    # MEMORY.md is never deleted or patched.
     protected = kind in ("remove", "patch") and resolved_target == resolved_root / "MEMORY.md"
     if is_memory_control_source(tgt, memory_root=memory_root, constitution_path=constitution_path):
-        _reject_suggestion(conn, sug_dir, sug_id, sug_file)
+        _reject_suggestion(conn, sug_dir, sug_id, sug_file, commit=commit)
         print(f"  rejected #{sug_id}: the constitution is human-controlled")
         return False
     if resolved_target == (resolved_root / POLICY_FILE).resolve():
-        _reject_suggestion(conn, sug_dir, sug_id, sug_file)
+        _reject_suggestion(conn, sug_dir, sug_id, sug_file, commit=commit)
         print(f"  rejected #{sug_id}: the local retention policy is user-controlled")
         return False
-    state = conn.execute(
-        "SELECT base_sha256, target_existed, source_sessions FROM suggestions WHERE id=?", (sug_id,)
-    ).fetchone()
+    state_sql = ("SELECT base_sha256, target_existed, source_sessions, body, status, target_path, kind, rationale "
+                 "FROM suggestions WHERE id=?")
+    state = conn.execute(state_sql, (sug_id,)).fetchone()
+    index_bytes = None
+    if kind == "index" and contained and not protected:
+        actual_review = ({"body": state[3], "status": state[4], "target_path": state[5], "kind": state[6]}
+                         if state is not None else None)
+        if (reviewed_index is None or actual_review != reviewed_index
+                or state[4] != "pending"
+                or _safe_suggestion_target(memory_root, state[5]) != resolved_target):
+            print(f"  conflict #{sug_id}: reviewed index proposal changed")
+            return False
+        index_existed = tgt.exists()
+        index_bytes = tgt.read_bytes() if index_existed else b""
+        new_content = _merge_index(index_bytes.decode("utf-8"), new_content or "")
     policy = load_retention_policy(memory_root)
     if kind != "remove" and (
         policy.excludes(source_path=target_path, text=new_content or "")
         or policy.excludes_memory_path(memory_root, target_path)
         or excludes_source_sessions(conn, policy, state[2] if state else None)
     ):
-        _reject_suggestion(conn, sug_dir, sug_id, sug_file)
+        _reject_suggestion(conn, sug_dir, sug_id, sug_file, commit=commit)
         print(f"  rejected #{sug_id}: excluded by local memory retention policy")
         return False
     base_sha = state[0] if state else None
@@ -734,8 +762,14 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
             print(f"  deferred #{sug_id}: {exc}")
             return False
         if policy.excludes(source_path=target_path, text=patched):
-            _reject_suggestion(conn, sug_dir, sug_id, sug_file)
+            _reject_suggestion(conn, sug_dir, sug_id, sug_file, commit=commit)
             print(f"  rejected #{sug_id}: excluded by local memory retention policy")
+            return False
+    if kind == "index" and index_bytes is not None:
+        if (conn.execute(state_sql, (sug_id,)).fetchone() != state
+                or tgt.resolve() != resolved_target or tgt.exists() != index_existed
+                or (tgt.read_bytes() if index_existed else b"") != index_bytes):
+            print(f"  conflict #{sug_id}: index or reviewed proposal changed before write")
             return False
     if contained and not protected:
         tgt.parent.mkdir(parents=True, exist_ok=True)
@@ -754,7 +788,8 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
         print(f"  refusing #{sug_id} ({target_path}): unsafe target, marking rejected")
         status = "rejected"
     conn.execute("UPDATE suggestions SET status=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?", (status, sug_id))
-    conn.commit()
+    if commit:
+        conn.commit()
     if sug_file:
         f = sug_dir / sug_file
         if f.exists():
@@ -810,8 +845,9 @@ def _curation_target_snapshot(memory_root: Path, row: tuple, find_text: str | No
         }
 
     target_existed = target.exists()
-    current_body = target.read_text(encoding="utf-8") if target_existed else ""
-    current_sha = _file_sha256(target) if target_existed else None
+    data = target.read_bytes() if target_existed else b""
+    current_body = data.decode("utf-8")
+    current_sha = hashlib.sha256(data).hexdigest() if target_existed else None
     conflict = (
         base_sha is not None and current_sha != base_sha
     ) or (
@@ -839,12 +875,13 @@ def _drop_suggestion_preview(sug_dir: Path, sug_file: str | None) -> None:
         (sug_dir / sug_file).unlink(missing_ok=True)
 
 
-def _reject_suggestion(conn: sqlite3.Connection, sug_dir: Path, sug_id, sug_file) -> None:
-    with conn:
-        conn.execute(
-            "UPDATE suggestions SET status='rejected', reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
-            (sug_id,),
-        )
+def _reject_suggestion(conn: sqlite3.Connection, sug_dir: Path, sug_id, sug_file, *, commit=True) -> None:
+    conn.execute(
+        "UPDATE suggestions SET status='rejected', reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
+        (sug_id,),
+    )
+    if commit:
+        conn.commit()
     _drop_suggestion_preview(sug_dir, sug_file)
 
 
@@ -854,152 +891,244 @@ def _curation_recheck(memory_root: Path, snapshot: dict[str, Any]) -> tuple[Path
     if target is None:
         return None, "", None, False
     exists = target.exists()
-    body = target.read_text(encoding="utf-8") if exists else ""
-    sha = _file_sha256(target) if exists else None
+    data = target.read_bytes() if exists else b""
+    body = data.decode("utf-8")
+    sha = hashlib.sha256(data).hexdigest() if exists else None
     return target, body, sha, exists
 
 
-def _apply_curated_batch(conn, memory_root: Path, snapshots, decisions, *, constitution_path) -> int:
-    by_id = {snapshot["id"]: snapshot for snapshot in snapshots}
-    expected_by_target: dict[str, dict[str, Any]] = {}
+def _curation_snapshot_matches(memory_root, snapshot, *, expected=None):
+    target, body, sha, exists = _curation_recheck(memory_root, snapshot)
+    state = expected or {
+        "body": snapshot["current_body"], "sha256": snapshot["current_sha256"],
+        "existed": snapshot["target_existed"],
+    }
+    return (target is not None and str(target) == snapshot["resolved_target"]
+            and body == state["body"] and sha == state["sha256"]
+            and exists == state["existed"])
+
+
+def _curation_index_changes(current_index, proposed):
+    """Return new or changed link lines using the index writer's exact keys."""
+    existing = {}
+    for line in current_index.splitlines():
+        if (target := _index_target(line)) is not None:
+            existing.setdefault(target, set()).add(line)
+    return {target: line for target, line in _index_proposal_lines(proposed).items()
+            if existing.get(target) != {line}}
+
+
+def _validate_index_decisions(memory_root, snapshots, decisions):
+    """Chosen index changes must agree before any row in the group is resolved."""
+    chosen = {}
     for snapshot in snapshots:
-        target = _safe_suggestion_target(memory_root, snapshot["target_path"])
-        if target is not None:
-            expected_by_target.setdefault(
-                str(target),
-                {
-                    "body": snapshot["current_body"],
-                    "sha256": snapshot["current_sha256"],
-                    "existed": snapshot["target_existed"],
-                    "host_applied": False,
-                },
+        decision = decisions[snapshot["id"]]
+        if decision.decision not in ("accept", "merge"):
+            continue
+        proposed = snapshot["body"] if decision.decision == "accept" else decision.body
+        for target, line in _index_proposal_lines(proposed).items():
+            resolved = _safe_suggestion_target(memory_root, target)
+            identity = str(resolved) if resolved is not None else target
+            match = _INDEX_LINK_RE.search(line)
+            normalized = line[:match.start(1)] + identity + line[match.end(1):]
+            if identity in chosen and chosen[identity] != normalized:
+                raise CurationContractError("conflicting index decisions for one target")
+            chosen[identity] = normalized
+
+
+def _curation_pending_target(memory_root, row):
+    """An unrelated unresolvable pending path must not block a safe topic."""
+    try:
+        return _safe_suggestion_target(memory_root, row[2])
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _curation_topic_context(conn, memory_root, snapshots, outcomes, *, constitution_path):
+    """Read only topics needed by new or changed index entries."""
+    current = snapshots[0]["current_body"]
+    references = set()
+    for snapshot in snapshots:
+        references.update(_curation_index_changes(current, snapshot["body"] or ""))
+    pending = _pending_suggestions(conn)
+    policy = load_retention_policy(memory_root)
+    from character.safety import is_memory_control_source
+    contexts, dependencies = [], {}
+    for reference in sorted(references):
+        target = _safe_suggestion_target(memory_root, reference)
+        safe = (target is not None
+                and not is_memory_control_source(target, memory_root=memory_root,
+                                                 constitution_path=constitution_path)
+                and not policy.excludes_memory_path(memory_root, reference))
+        pending_ids = [row[0] for row in pending
+                       if target is not None and _curation_pending_target(memory_root, row) == target]
+        state = {"target_path": reference, "resolved_target": str(target),
+                 "current_body": "", "current_sha256": None, "target_existed": False}
+        if safe:
+            _, state["current_body"], state["current_sha256"], state["target_existed"] = (
+                _curation_recheck(memory_root, state)
             )
-    applied: list[int] = []
-    rejected: list[int] = []
-    deferred: list[int] = []
-    conflicts: list[int] = []
-    unsafe: list[int] = []
-    backup: Path | None = None
+            if policy.excludes(source_path=reference, text=state["current_body"]):
+                safe = False
+        outcome = outcomes.get(str(target), "unchanged")
+        ready = safe and state["target_existed"] and not pending_ids and outcome != "failed"
+        dependencies[reference] = dict(state, ready=ready)
+        contexts.append({"target_path": reference,
+                         "current_target_body": state["current_body"] if safe else "",
+                         "current_sha256": state["current_sha256"] if safe else None,
+                         "target_existed": state["target_existed"] if safe else False,
+                         "pending_ids": pending_ids, "outcome": outcome if safe else "unavailable",
+                         "ready": bool(ready)})
+    return contexts, dependencies
 
-    for sug_id in sorted(decisions):
-        snapshot = by_id[sug_id]
-        decision = decisions[sug_id]
-        kind = snapshot["kind"]
-        target_path = snapshot["target_path"]
-        sug_file = snapshot["sug_file"]
-        if decision.decision == "reject":
-            _reject_suggestion(conn, memory_root / ".suggestions", sug_id, sug_file)
-            rejected.append(sug_id)
-            continue
-        if decision.decision == "defer":
-            deferred.append(sug_id)
-            continue
-        if decision.decision == "merge" and kind == "remove":
-            deferred.append(sug_id)
-            print(f"deferred #{sug_id} ({target_path}): merge is unsupported for remove suggestions")
-            continue
 
-        target = _safe_suggestion_target(memory_root, target_path)
-        if target is None:
-            _reject_suggestion(conn, memory_root / ".suggestions", sug_id, sug_file)
-            rejected.append(sug_id)
-            unsafe.append(sug_id)
-            print(f"conflict #{sug_id}: unsafe target path; rejected by host safety check")
-            continue
-        if kind in ("remove", "patch") and target == memory_root.resolve() / "MEMORY.md":
-            _reject_suggestion(conn, memory_root / ".suggestions", sug_id, sug_file)
-            rejected.append(sug_id)
-            unsafe.append(sug_id)
-            print(f"unsafe #{sug_id} ({target_path}): protected target; rejected by host safety check")
-            continue
+def _curation_index_ready(conn, memory_root, snapshot, decision, dependencies, *, constitution_path):
+    # A merge must not discard unresolved original entry changes and resolve their row.
+    references = _curation_index_changes(snapshot["current_body"], snapshot["body"] or "")
+    if decision.decision == "merge":
+        references.update(_curation_index_changes(snapshot["current_body"], decision.body))
+    pending = _pending_suggestions(conn)
+    policy = load_retention_policy(memory_root)
+    from character.safety import is_memory_control_source
+    for reference in references:
+        state = dependencies.get(reference)
+        if state is None or not state["ready"] or not _curation_snapshot_matches(memory_root, state):
+            return False
+        target = _safe_suggestion_target(memory_root, reference)
+        if (policy.excludes_memory_path(memory_root, reference)
+                or policy.excludes(source_path=reference, text=state["current_body"])
+                or is_memory_control_source(target, memory_root=memory_root, constitution_path=constitution_path)):
+            return False
+        if any(_curation_pending_target(memory_root, row) == target for row in pending):
+            return False
+    return True
 
-        rechecked_target, old, current_sha, target_existed = _curation_recheck(memory_root, snapshot)
-        expected = expected_by_target[str(target)]
-        if (
-            rechecked_target is None
-            or old != expected["body"]
-            or current_sha != expected["sha256"]
-            or target_existed != expected["existed"]
-        ):
-            deferred.append(sug_id)
-            conflicts.append(sug_id)
-            print(f"conflict #{sug_id} ({target_path}): target changed during curation")
-            continue
 
-        if (
-            not expected["host_applied"]
-            and snapshot["conflict"]
-            and decision.decision == "accept"
-        ):
-            deferred.append(sug_id)
-            conflicts.append(sug_id)
-            print(f"conflict #{sug_id} ({target_path}): initial conflict; accept deferred")
+def _curation_pending_unchanged(conn, memory_root, snapshots):
+    """The review must still own the same complete eligible pending group."""
+    current = {row[0]: tuple(row) for row in _pending_suggestions(conn)}
+    expected_ids = {snapshot["id"] for snapshot in snapshots}
+    target = snapshots[0]["resolved_target"]
+    policy = load_retention_policy(memory_root)
+    eligible = set()
+    for sug_id, row in current.items():
+        resolved = _curation_pending_target(memory_root, row)
+        if str(resolved) != target:
             continue
-        proposed_body = snapshot["body"] if decision.decision == "accept" else decision.body
-        # A merge supplies a complete body, so a merged patch applies as an update.
-        apply_kind = "update" if kind == "patch" and decision.decision == "merge" else kind
-        new_content = _resolved_body(apply_kind, old, proposed_body)
-        if backup is None:
-            backup = _backup_memory(memory_root)
-        with conn:
-            conn.execute(
-                "UPDATE suggestions SET base_sha256=?, target_existed=? WHERE id=?",
-                (expected["sha256"], int(expected["existed"]), sug_id),
-            )
-            if apply_kind != kind:
-                # Store the full merged body too: a pending update must never hold a patch span.
-                conn.execute(
-                    "UPDATE suggestions SET kind='update', find_text=NULL, body=? WHERE id=?",
-                    (proposed_body, sug_id),
-                )
-        try:
-            applied_ok = _apply_suggestion(
-                conn,
-                memory_root,
-                memory_root / ".suggestions",
-                sug_id,
-                apply_kind,
-                target_path,
-                new_content,
-                sug_file,
-                constitution_path=constitution_path,
-        )
-        except Exception as exc:
-            print(
-                f"unsafe application #{sug_id} ({target_path}): "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            unsafe.append(sug_id)
-            continue
-        if applied_ok:
-            applied.append(sug_id)
-            _, expected["body"], expected["sha256"], expected["existed"] = (
-                _curation_recheck(memory_root, snapshot)
-            )
-            expected["host_applied"] = True
-        elif sug_id not in conflicts:
-            deferred.append(sug_id)
-            conflicts.append(sug_id)
+        find = _find_text(conn, sug_id) if row[1] == "patch" else None
+        if not excludes_suggestion(conn, policy, memory_root, target_path=row[2],
+                                   source_sessions=row[5], texts=(row[3], row[4], find)):
+            eligible.add(sug_id)
+    if target != "None" and eligible != expected_ids:
+        return False
+    return all(current.get(snapshot["id"]) == snapshot["reviewed_row"]
+               and (_find_text(conn, snapshot["id"]) if snapshot["kind"] == "patch" else None)
+               == snapshot["find_text"] for snapshot in snapshots)
 
-    if applied:
-        if backup is None:
-            backup = _backup_memory(memory_root)
-        if _prune_orphaned_index_lines(memory_root, constitution_path=constitution_path):
-            _sync_recall_documents(conn, memory_root, constitution_path=constitution_path)
-            print("pruned orphaned MEMORY.md links")
-    print(f"applied IDs: {applied}")
-    print(f"rejected IDs: {rejected}")
-    print(f"deferred IDs: {deferred}")
-    print(f"conflict IDs: {conflicts}")
-    print(f"backup: {backup if backup is not None else 'none'}")
-    if unsafe:
-        print(f"unsafe IDs: {unsafe}", file=sys.stderr)
-    return 1 if unsafe else 0
+
+def _apply_curated_batch(conn, memory_root, snapshots, decisions, *, constitution_path,
+                         is_index, dependencies, backup_state):
+    """Apply one validated group under a short write lock, with one topic mutation."""
+    result = {name: [] for name in ("applied", "rejected", "deferred", "conflicts", "unsafe")}
+    by_id = {snapshot["id"]: snapshot for snapshot in snapshots}
+    mutation_ids = [sug_id for sug_id, decision in decisions.items()
+                    if decision.decision in ("accept", "merge")]
+    # The command validates this before opening a writer; keep the apply boundary authoritative.
+    if not is_index and len(mutation_ids) > 1:
+        raise CurationContractError("competing topic mutations; at most one accept or merge is allowed")
+    if is_index:
+        _validate_index_decisions(memory_root, snapshots, decisions)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not _curation_pending_unchanged(conn, memory_root, snapshots):
+            result["deferred"] = sorted(decisions)
+            result["conflicts"] = sorted(decisions)
+            return result
+        # Recheck even rejection-only groups. A combined resolution is based on this snapshot.
+        if any(snapshot["resolved_target"] != "None"
+               and not _curation_snapshot_matches(memory_root, snapshot) for snapshot in snapshots):
+            result["deferred"] = sorted(decisions)
+            result["conflicts"] = sorted(decisions)
+            return result
+        expected = {"body": snapshots[0]["current_body"],
+                    "sha256": snapshots[0]["current_sha256"],
+                    "existed": snapshots[0]["target_existed"]}
+        # Resolve sibling rejections only after the chosen combined topic write succeeds.
+        ordered = sorted(decisions) if is_index else mutation_ids + sorted(set(decisions) - set(mutation_ids))
+        mutation_failed = False
+        for sug_id in ordered:
+            snapshot, decision = by_id[sug_id], decisions[sug_id]
+            kind, target_path = snapshot["kind"], snapshot["target_path"]
+            if mutation_failed and not is_index:
+                result["deferred"].append(sug_id)
+                continue
+            if decision.decision == "defer":
+                result["deferred"].append(sug_id)
+                continue
+            if is_index and decision.decision in ("accept", "merge") and not _curation_index_ready(conn, memory_root, snapshot, decision, dependencies, constitution_path=constitution_path):
+                result["deferred"].append(sug_id)
+                print(f"deferred #{sug_id}: index dependencies are unresolved or changed")
+                continue
+            if decision.decision == "reject":
+                _reject_suggestion(conn, memory_root / ".suggestions", sug_id, snapshot["sug_file"], commit=False)
+                result["rejected"].append(sug_id)
+                continue
+            if decision.decision == "merge" and kind == "remove":
+                result["deferred"].append(sug_id)
+                mutation_failed = True
+                continue
+            target = _safe_suggestion_target(memory_root, target_path)
+            if target is None or (kind in ("remove", "patch") and target == memory_root.resolve() / "MEMORY.md"):
+                _reject_suggestion(conn, memory_root / ".suggestions", sug_id, snapshot["sug_file"], commit=False)
+                result["rejected"].append(sug_id)
+                result["unsafe"].append(sug_id)
+                mutation_failed = True
+                continue
+            if not _curation_snapshot_matches(memory_root, snapshot, expected=expected):
+                result["deferred"].append(sug_id)
+                result["conflicts"].append(sug_id)
+                mutation_failed = True
+                continue
+            if snapshot["conflict"] and decision.decision == "accept" and not result["applied"]:
+                result["deferred"].append(sug_id)
+                result["conflicts"].append(sug_id)
+                mutation_failed = True
+                continue
+            proposed_body = snapshot["body"] if decision.decision == "accept" else decision.body
+            apply_kind = "index" if is_index else "update" if kind == "patch" and decision.decision == "merge" else kind
+            new_content = _resolved_body(apply_kind, expected["body"], proposed_body)
+            if backup_state["path"] is None:
+                backup_state["path"] = _backup_memory(memory_root)
+            conn.execute("UPDATE suggestions SET base_sha256=?, target_existed=? WHERE id=? AND status='pending'",
+                         (expected["sha256"], int(expected["existed"]), sug_id))
+            if kind == "patch" and apply_kind == "update":
+                conn.execute("UPDATE suggestions SET kind='update', find_text=NULL, body=? WHERE id=? AND status='pending'",
+                             (proposed_body, sug_id))
+            applied = _apply_suggestion(conn, memory_root, memory_root / ".suggestions", sug_id,
+                                        apply_kind, snapshot["target_ref"], proposed_body if is_index else new_content, snapshot["sug_file"],
+                                        sync_recall=False, constitution_path=constitution_path, commit=False,
+                                        reviewed_index={"body": snapshot["body"], "status": "pending",
+                                                        "target_path": snapshot["target_path"], "kind": snapshot["kind"]} if is_index else None)
+            if applied:
+                result["applied"].append(sug_id)
+                _, expected["body"], expected["sha256"], expected["existed"] = _curation_recheck(memory_root, snapshot)
+            else:
+                status = conn.execute("SELECT status FROM suggestions WHERE id=?", (sug_id,)).fetchone()[0]
+                if status == "rejected":
+                    result["rejected"].append(sug_id)
+                else:
+                    result["deferred"].append(sug_id)
+                    result["conflicts"].append(sug_id)
+                mutation_failed = True
+        conn.commit()
+        return result
+    finally:
+        if conn.in_transaction:
+            conn.rollback()
 
 
 def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, rows) -> int:
-    """Curate one complete pending batch through the configured review provider."""
+    """Review topics sequentially and the dependent index last."""
     if args.config.data["review"]["mode"] != "auto-apply":
         conn.close()
         print("review.mode is suggest-only; curation disabled, leaving suggestions pending")
@@ -1008,60 +1137,145 @@ def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, ro
         conn.close()
         print("No pending suggestions.")
         return 0
-
-    try:
-        # A rule added after a suggestion was staged: its fields never reach the
-        # provider, and `dream retention --apply` rejects it.
-        policy = load_retention_policy(memory_root)
-        snapshots = []
-        for row in rows:
-            find_text = _find_text(conn, row[0]) if row[1] == "patch" else None
-            if excludes_suggestion(conn, policy, memory_root, target_path=row[2], source_sessions=row[5],
-                                   texts=(row[3], row[4], find_text)):
-                print(f"skipped #{row[0]}: excluded by local memory retention policy; "
-                      "dream retention --apply rejects it")
-                continue
-            snapshots.append(_curation_target_snapshot(memory_root, row, find_text))
-        if not snapshots:
-            conn.close()
-            print("No pending suggestions to curate.")
-            return 0
-        prompt = build_curation_prompt(snapshots, memory_root)
-        result = generate("review", prompt, CURATION_SCHEMA, config=args.config)
-        decisions = parse_curation_output(result.output, {snapshot["id"] for snapshot in snapshots})
-        missing_merge_bodies = [
-            sug_id for sug_id, decision in decisions.items()
-            if decision.decision == "merge" and not isinstance(decision.body, str)
-        ]
-        if missing_merge_bodies:
-            raise ValueError(
-                "merge decisions require string bodies: "
-                + ", ".join(str(sug_id) for sug_id in sorted(missing_merge_bodies))
-            )
-    except Exception as exc:
-        conn.close()
-        print(f"curation error: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
-
-    provider = getattr(result, "provider", None) or "unknown"
-    model = getattr(result, "model", None) or "(provider default)"
-    print(f"provider: {provider} / {model}")
     dry_run = bool(getattr(args, "dry_run", False))
-    for snapshot in snapshots:
-        decision = decisions[snapshot["id"]]
-        suffix = f" body_chars={len(decision.body)}" if decision.body is not None else ""
-        print(
-            f"decision #{snapshot['id']}: {decision.decision} — {decision.reason}{suffix}"
-        )
-    conn.close()
+    constitution_path = args.config.data['character']['constitution_path']
+    groups, outcomes = {}, {}
+    totals = {name: [] for name in ("applied", "rejected", "deferred", "conflicts", "unsafe", "failed")}
+    backup_state = {"path": None}
+    try:
+        policy = load_retention_policy(memory_root)
+        for row in rows:
+            try:
+                find = _find_text(conn, row[0]) if row[1] == "patch" else None
+                if excludes_suggestion(conn, policy, memory_root, target_path=row[2], source_sessions=row[5],
+                                       texts=(row[3], row[4], find)):
+                    print(f"skipped #{row[0]}: excluded by local memory retention policy; "
+                          "dream retention --apply rejects it")
+                    continue
+                target = _safe_suggestion_target(memory_root, row[2])
+                identity = str(target) if target is not None else f"unsafe:{row[2]}"
+                groups.setdefault(identity, []).append((tuple(row), find))
+            except Exception as exc:
+                print(f"curation target {row[2]} IDs [{row[0]}] failed: {type(exc).__name__}", file=sys.stderr)
+                totals["failed"].append(row[0])
+    except Exception as exc:
+        print(f"curation error: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    index_identity = str(memory_root.resolve() / "MEMORY.md")
+    ordered = [key for key in groups if key != index_identity]
+    if index_identity in groups:
+        ordered.append(index_identity)
+    for identity in ordered:
+        group = groups[identity]
+        ids = [row[0] for row, _ in group]
+        is_index = identity == index_identity
+        try:
+            snapshots = []
+            reader = _open_curation_readonly(args.db)
+            try:
+                policy = load_retention_policy(memory_root)
+                current_rows = _pending_suggestions(reader)
+                current_by_id = {row[0]: row for row in current_rows}
+                for old_row, _ in group:
+                    current_row = current_by_id.get(old_row[0])
+                    if current_row is not None:
+                        resolved = _safe_suggestion_target(memory_root, current_row[2])
+                        if resolved is not None and str(resolved) != identity:
+                            raise CurationContractError("resolved target changed before review")
+                for row in current_rows:
+                    resolved = _curation_pending_target(memory_root, row)
+                    key = str(resolved) if resolved is not None else f"unsafe:{row[2]}"
+                    if key != identity:
+                        continue
+                    find = _find_text(reader, row[0]) if row[1] == "patch" else None
+                    if excludes_suggestion(reader, policy, memory_root, target_path=row[2], source_sessions=row[5],
+                                           texts=(row[3], row[4], find)):
+                        print(f"skipped #{row[0]}: excluded by local memory retention policy; "
+                              "dream retention --apply rejects it")
+                        continue
+                    snapshot = _curation_target_snapshot(memory_root, row, find)
+                    if policy.excludes(source_path=row[2], text=snapshot["current_body"]):
+                        print(f"skipped #{row[0]}: current target excluded by local memory retention policy")
+                        continue
+                    snapshot.update(reviewed_row=tuple(row), resolved_target=str(resolved),
+                                    target_ref=str(resolved.relative_to(memory_root.resolve())) if resolved else row[2])
+                    snapshots.append(snapshot)
+                if not snapshots:
+                    outcomes[identity] = "excluded or no pending work"
+                    continue
+                ids = [snapshot["id"] for snapshot in snapshots]
+                contexts, dependencies = [], {}
+                if is_index:
+                    contexts, dependencies = _curation_topic_context(reader, memory_root, snapshots, outcomes,
+                                                                      constitution_path=constitution_path)
+            finally:
+                reader.close()
+            prompt = build_curation_prompt(snapshots, memory_root, topic_context=contexts)
+            if load_retention_policy(memory_root) != policy:
+                raise CurationContractError("retention policy changed before review")
+            response = generate("review", prompt, CURATION_SCHEMA, config=args.config)
+            decisions = parse_curation_output(response.output, ids)
+            if is_index:
+                _validate_index_decisions(memory_root, snapshots, decisions)
+            elif sum(d.decision in ("accept", "merge") for d in decisions.values()) > 1:
+                raise CurationContractError("competing topic mutations; at most one accept or merge is allowed")
+            print(f"provider: {getattr(response, 'provider', 'unknown')} / {getattr(response, 'model', '(provider default)')}")
+            for sug_id, decision in decisions.items():
+                print(f"decision #{sug_id}: {decision.decision} - {decision.reason} body_chars={len(decision.body)}")
+            if dry_run:
+                outcomes[identity] = "prospective, not applied"
+                totals["deferred"].extend(ids)
+                print(f"prospective IDs: {ids}; current files and pending dependencies are unchanged")
+                continue
+            writer = open_db(args.db)
+            try:
+                result = _apply_curated_batch(writer, memory_root, snapshots, decisions,
+                                               constitution_path=constitution_path, is_index=is_index,
+                                               dependencies=dependencies, backup_state=backup_state)
+            finally:
+                writer.close()
+            for key, values in result.items():
+                totals[key].extend(values)
+            outcomes[identity] = "applied" if result["applied"] else "unresolved" if result["deferred"] else "rejected"
+        except Exception as exc:
+            # Only host-authored contract errors may include details. Provider messages may contain memory.
+            detail = f": {exc}" if isinstance(exc, CurationContractError) else ""
+            print(f"curation target {group[0][0][2]} IDs {ids} failed: {type(exc).__name__}{detail}", file=sys.stderr)
+            totals["failed"].extend(ids)
+            outcomes[identity] = "failed"
+    if totals["applied"] and not dry_run:
+        writer = open_db(args.db)
+        try:
+            if _prune_orphaned_index_lines(memory_root, constitution_path=constitution_path):
+                print("pruned orphaned MEMORY.md links")
+            if not _sync_recall_documents(writer, memory_root, constitution_path=constitution_path):
+                print("curation finalization failed: recall synchronization", file=sys.stderr)
+                totals["failed"].extend(totals["applied"])
+        except Exception as exc:
+            print(f"curation finalization failed: {type(exc).__name__}", file=sys.stderr)
+            totals["failed"].extend(totals["applied"])
+        finally:
+            writer.close()
+    if dry_run:
+        unresolved = sorted(row[0] for row in rows)
+    else:
+        reader = _open_curation_readonly(args.db)
+        try:
+            unresolved = sorted(row[0] for row in _pending_suggestions(reader))
+        finally:
+            reader.close()
+    for key in ("applied", "rejected", "deferred"):
+        print(f"{key} IDs: {sorted(totals[key])}")
+    print(f"conflict IDs: {sorted(totals['conflicts'])}")
+    print(f"unresolved IDs: {unresolved}")
+    print(f"failed IDs: {sorted(set(totals['failed']))}")
     if dry_run:
         print("dry-run: no files, previews, statuses, or backups changed")
-        return 0
-    write_conn = open_db(args.db)
-    try:
-        return _apply_curated_batch(write_conn, memory_root, snapshots, decisions, constitution_path=args.config.data['character']['constitution_path'])
-    finally:
-        write_conn.close()
+    else:
+        print(f"backup: {backup_state['path'] if backup_state['path'] is not None else 'none'}")
+    return 1 if totals["failed"] or totals["unsafe"] else 0
 
 
 def _embed_after_curation(args: argparse.Namespace, memory_root: Path) -> None:
@@ -1161,7 +1375,8 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
             path = memory_root / target
             old = path.read_text(encoding="utf-8") if path.exists() else ""
             new_content = _resolved_body(kind, old, body)
-            if not _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target, new_content, preview, constitution_path=args.config.data['character']['constitution_path']):
+            if not _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target, body if kind == "index" else new_content, preview,
+                                     constitution_path=args.config.data['character']['constitution_path'], reviewed_index={"body": body, "status": "pending", "kind": kind, "target_path": target}):
                 conflicts += 1
         if _prune_orphaned_index_lines(memory_root, constitution_path=args.config.data['character']['constitution_path']):
             print("pruned orphaned MEMORY.md links")
@@ -1176,7 +1391,7 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
     if args.suggestions_cmd == "reject":
         with conn:
             conn.execute(
-                "UPDATE suggestions SET status='rejected', reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
+            "UPDATE suggestions SET status='rejected', reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
                 (sug_id,),
             )
         if preview:
@@ -1200,8 +1415,8 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
     backup = _backup_memory(memory_root)
     print(f"Backup: {backup}")
     return 0 if _apply_suggestion(
-        conn, memory_root, sug_dir, sug_id, kind, target, new_content, preview
-    , constitution_path=args.config.data['character']['constitution_path']) else 3
+        conn, memory_root, sug_dir, sug_id, kind, target, body if kind == "index" else new_content, preview,
+        constitution_path=args.config.data['character']['constitution_path'], reviewed_index={"body": body, "status": "pending", "kind": kind, "target_path": target}) else 3
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -1243,7 +1458,8 @@ def cmd_review(args: argparse.Namespace) -> int:
             tag = "no-op" if noop else ("would apply" if dry else "applied")
             print(f"  [{kind:<6}] {target_path}  (#{sug_id}) — {tag}")
             if not dry:
-                _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target_path, new_content, sug_file, constitution_path=args.config.data['character']['constitution_path'])
+                _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target_path, body if kind == "index" else new_content, sug_file,
+                                  constitution_path=args.config.data['character']['constitution_path'], reviewed_index={"body": body, "status": "pending", "kind": kind, "target_path": target_path})
         if not dry and _prune_orphaned_index_lines(memory_root, constitution_path=args.config.data['character']['constitution_path']):
             print("  pruned orphaned MEMORY.md links")
         return 0
@@ -1262,7 +1478,7 @@ def cmd_review(args: argparse.Namespace) -> int:
     for sug_id, kind, target_path, body, rationale, sources, sug_file in rows:
         tgt = memory_root / target_path
         old = tgt.read_text(encoding="utf-8") if tgt.exists() else ""
-        # `index` merges into MEMORY.md (append-only); all other kinds replace the file wholesale.
+        # Index proposals update named entries; omitted entries stay unchanged.
         new_content = _resolved_body(kind, old, body)
         print(_color("=" * 78, "grey"))
         print(f"#{sug_id}  [{_color(kind, 'yellow')}]  {target_path}")
@@ -1308,7 +1524,8 @@ def cmd_review(args: argparse.Namespace) -> int:
         if choice == "q":
             break
         if choice == "a":
-            if _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target_path, new_content, sug_file, constitution_path=args.config.data['character']['constitution_path']):
+            if _apply_suggestion(conn, memory_root, sug_dir, sug_id, kind, target_path, body if kind == "index" else new_content, sug_file,
+                                  constitution_path=args.config.data['character']['constitution_path'], reviewed_index={"body": body, "status": "pending", "kind": kind, "target_path": target_path}):
                 print(_color("  accepted.", "green"))
         elif choice == "r":
             conn.execute("UPDATE suggestions SET status='rejected', reviewed_at=CURRENT_TIMESTAMP WHERE id=?", (sug_id,))
