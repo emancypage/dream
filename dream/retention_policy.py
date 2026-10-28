@@ -15,6 +15,7 @@ class RetentionPolicy:
     memory_paths: tuple[str, ...] = ()
     project_slugs: tuple[str, ...] = ()
     text_markers: tuple[str, ...] = ()
+    session_ids: tuple[str, ...] = ()
 
     def excludes(self, *, source_path="", project_slug=None, text="") -> bool:
         return (
@@ -49,12 +50,12 @@ def load_retention_policy(memory_root: Path | None) -> RetentionPolicy:
     if not path.exists():
         return RetentionPolicy()
     data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) - {"instructions", "memory_paths", "project_slugs", "text_markers"}:
+    if not isinstance(data, dict) or set(data) - {"instructions", "memory_paths", "project_slugs", "text_markers", "session_ids"}:
         raise ValueError("invalid local retention policy fields")
     if not isinstance(data.get("instructions", ""), str):
         raise ValueError("retention instructions must be text")
     values = {}
-    for key in ("memory_paths", "project_slugs", "text_markers"):
+    for key in ("memory_paths", "project_slugs", "text_markers", "session_ids"):
         value = data.get(key, [])
         if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
             raise ValueError(f"retention {key} must contain nonempty strings")

@@ -10,6 +10,7 @@ from typing import Callable, Iterator
 import recall_usage
 from config import DreamConfig, load_config
 from recall_hook_state import marker_root as recall_marker_root
+from retention_policy import load_retention_policy
 from sources.base import Message, ParsedSession
 from sources.claude_jsonl import ClaudeJSONLSource
 from sources.registry import create_source
@@ -116,8 +117,10 @@ def ingest_source(
     force: bool = False,
     *,
     on_error: Callable[[str, Exception], None] | None = None,
+    forgotten_sessions: tuple[str, ...] = (),
 ) -> tuple[int, int, int]:
     seen = ingested = messages = 0
+    forgotten = set(forgotten_sessions)
     try:
         refs = iter(source.discover())
     except Exception as exc:
@@ -136,6 +139,9 @@ def ingest_source(
             on_error("discovery", exc)
             break
         seen += 1
+        # The retention policy lists Dream session IDs: bare for Claude, source-prefixed otherwise.
+        if {ref.external_session_id, f"{ref.source}:{ref.external_session_id}"} & forgotten:
+            continue
         try:
             parsed = source.parse(ref)
         except Exception as exc:
@@ -168,6 +174,7 @@ def ingest_configured_sources(
     force: bool = False,
 ) -> IngestionResults:
     cfg = config or load_config()
+    forgotten = load_retention_policy(cfg.memory_root).session_ids
     results = IngestionResults()
     for source_cfg in cfg.sources:
         if not source_cfg.get("enabled", True) and not (selected and source_cfg["name"] in selected):
@@ -187,7 +194,7 @@ def ingest_configured_sources(
             report_error("initialization", exc)
             results.append((name, 0, 0, 0))
             continue
-        counts = ingest_source(source, conn, force=force, on_error=report_error)
+        counts = ingest_source(source, conn, force=force, on_error=report_error, forgotten_sessions=forgotten)
         results.append((name, *counts))
     return results
 

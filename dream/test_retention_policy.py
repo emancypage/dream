@@ -346,3 +346,41 @@ def test_curation_never_sends_an_excluded_pending_patch_to_the_review_provider(s
     assert f'"id": {clean_id}' in prompt and f'"id": {sug_id}' not in prompt
     assert f"skipped #{sug_id}: excluded by local memory retention policy" in capsys.readouterr().out
     assert _status(conn, sug_id) == "pending"
+
+
+def test_cleanup_deletes_listed_sessions_with_their_transcripts(setup):
+    conn, root, cfg = setup
+    conn.execute("INSERT INTO sessions(session_id,project_slug,jsonl_path,jsonl_mtime) "
+                 "VALUES ('listed-session','other-project','/fixture',1)")
+    conn.execute("INSERT INTO messages(session_id,seq,role,text) VALUES ('listed-session',0,'user','listed transcript')")
+    conn.execute("INSERT INTO distilled(session_id,notes_json,summary,distillation_key) "
+                 "VALUES ('listed-session','{}','listed summary','listed-key')")
+    conn.commit()
+    policy = json.loads((root / POLICY_FILE).read_text())
+    (root / POLICY_FILE).write_text(json.dumps({**policy, "session_ids": ["listed-session"]}))
+    assert apply_retention(conn, root, config=cfg)["sessions"] == 1
+    assert conn.execute("SELECT count(*) FROM messages WHERE session_id='listed-session'").fetchone()[0] == 1
+    result = apply_retention(conn, root, config=cfg, apply=True)
+    for table in ("sessions", "messages", "distilled"):
+        assert conn.execute(f"SELECT count(*) FROM {table} WHERE session_id='listed-session'").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'listed'").fetchone()[0] == 0
+    # A project exclusion alone still keeps its transcripts.
+    assert conn.execute("SELECT count(*) FROM sessions WHERE session_id='private-session'").fetchone()[0] == 1
+    backup = json.loads((Path(result["backup"]) / "affected-records.json").read_text())
+    assert backup["sessions"][0]["messages"][0]["text"] == "listed transcript"
+    assert apply_retention(conn, root, config=cfg)["sessions"] == 0
+
+
+def test_ingest_skips_sessions_listed_in_retention_policy(tmp_path):
+    from test_ingest_failures import configured, source_config, transcript
+    import ingest
+    transcript(tmp_path / "codex", "forgotten")
+    transcript(tmp_path / "codex", "kept")
+    (tmp_path / "memory").mkdir()
+    (tmp_path / "memory" / POLICY_FILE).write_text(json.dumps({"session_ids": ["codex:forgotten"]}))
+    conn = dream.open_db(tmp_path / "dream.db")
+    result = ingest.ingest_configured_sources(conn, configured(tmp_path, [
+        source_config("codex", "codex-jsonl", tmp_path / "codex"),
+    ]))
+    assert conn.execute("SELECT external_session_id FROM sessions").fetchall() == [("kept",)]
+    assert result == [("codex", 2, 1, 1)]

@@ -24,6 +24,12 @@ def _patch_preview_text(root: Path, sug_file: str | None) -> str:
         return ""
 
 
+def _rows(conn, sql: str, args) -> list[dict]:
+    cursor = conn.execute(sql, args)
+    names = [column[0] for column in cursor.description]
+    return [dict(zip(names, row)) for row in cursor.fetchall()]
+
+
 def apply_retention(conn, memory_root: Path, *, config, apply=False) -> dict:
     from character.retention import collect, preview, apply_snapshot
     character_snapshot = collect(conn, config)
@@ -44,11 +50,16 @@ def apply_retention(conn, memory_root: Path, *, config, apply=False) -> dict:
             guard_control(path)
             files.append(path)
 
+    forgotten = [sid for sid in policy.session_ids
+                 if conn.execute("SELECT 1 FROM sessions WHERE session_id=?", (sid,)).fetchone()]
+
     changed = []
     for sid, project, notes_json, summary in conn.execute(
         "SELECT d.session_id, s.project_slug, d.notes_json, d.summary "
         "FROM distilled d JOIN sessions s ON s.session_id=d.session_id"
     ):
+        if sid in forgotten:
+            continue
         notes = json.loads(notes_json)
         filtered = empty_notes() if policy.excludes(project_slug=project) else filter_notes(notes, policy)
         filtered_summary = "" if policy.excludes(project_slug=project, text=summary or "") else summary
@@ -65,7 +76,7 @@ def apply_retention(conn, memory_root: Path, *, config, apply=False) -> dict:
         conn, policy, root, target_path=row[1], source_sessions=row[5],
         texts=(row[2], row[3], row[6], _patch_preview_text(root, row[4]) if row[7] == "patch" else None))]
     result = {"memory_files": [str(p.relative_to(root)) for p in files],
-              "distilled_records": len(changed), "pending_suggestions": len(pending), "applied": apply, "character": preview(character_snapshot)}
+              "distilled_records": len(changed), "sessions": len(forgotten), "pending_suggestions": len(pending), "applied": apply, "character": preview(character_snapshot)}
     if not apply:
         return result
 
@@ -83,7 +94,12 @@ def apply_retention(conn, memory_root: Path, *, config, apply=False) -> dict:
     backup_file = backup / "affected-records.json"
     with backup_file.open("x", encoding="utf-8") as handle:
         backup_file.chmod(0o600)
-        json.dump({"files": snapshots, "distilled": [row[:3] for row in changed],
+        sessions = [{
+            "session": _rows(conn, "SELECT * FROM sessions WHERE session_id=?", (sid,))[0],
+            "messages": _rows(conn, "SELECT * FROM messages WHERE session_id=? ORDER BY seq", (sid,)),
+            "distilled": _rows(conn, "SELECT * FROM distilled WHERE session_id=?", (sid,)),
+        } for sid in forgotten]
+        json.dump({"files": snapshots, "distilled": [row[:3] for row in changed], "sessions": sessions,
                    "pending_suggestions": pending, "character": character_snapshot}, handle, ensure_ascii=False, indent=2)
 
     result["character"] = apply_snapshot(conn, config, character_snapshot)
@@ -119,6 +135,9 @@ def apply_retention(conn, memory_root: Path, *, config, apply=False) -> dict:
                 deferred_sessions.append(sid)
         for row in pending:
             conn.execute("UPDATE suggestions SET status='rejected', reviewed_at=CURRENT_TIMESTAMP WHERE id=?", (row[0],))
+        for sid in forgotten:
+            for table in ("messages", "distilled", "consolidated_distillations", "sessions"):
+                conn.execute(f"DELETE FROM {table} WHERE session_id=?", (sid,))
     for row in pending:
         if row[4]:
             preview = root / ".suggestions" / row[4]
