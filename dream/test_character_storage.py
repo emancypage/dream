@@ -75,3 +75,50 @@ def test_successful_write_observes_constitution_metadata(tmp_path):
     assert observations[0]['constitution_version'] == 'human-v1'
     assert observations[0]['approved_at'] == doc.approved_at
     assert 'text' not in observations[0]
+
+
+def _writer_config(tmp_path, **character):
+    from config import load_config
+    return load_config(tmp_path / 'absent', {'storage': {'db_path': str(tmp_path / 'dream.db'), 'memory_root': str(tmp_path / 'memory')},
+                                             'character': {'state_root': str(tmp_path / 'state'), 'constitution_path': str(tmp_path / 'rules'), **character}})
+
+
+def test_writer_backs_up_character_tables_once_per_process(tmp_path):
+    import json
+    import stat
+    from character.storage import open_writer
+    config = _writer_config(tmp_path)
+    backups = tmp_path / 'state' / 'backups'
+    with open_writer(config) as writer:
+        insert_record(writer, 'character_pairs', {'id': 'p1', 'chosen': 'yes'})
+    assert not backups.exists()
+    for _ in range(3):
+        with open_writer(config) as writer:
+            insert_record(writer, 'character_pairs', {'id': f'p{_ + 2}', 'chosen': 'yes'})
+    backup, = backups.iterdir()
+    assert backup.name.startswith('character-') and backup.suffix == '.json'
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+    data = json.loads(backup.read_text(encoding='utf-8'))
+    assert [row['id'] for row in data['character_pairs']] == ['p1']
+    assert set(data) == {'character_constitutions', 'character_moments', 'character_seeds', 'character_pairs', 'character_judgments',
+                         'character_review_events', 'character_eval_runs', 'character_eval_results', 'character_short_examples'}
+
+
+def test_writer_backup_keeps_newest_snapshots_only(tmp_path):
+    import os
+    import dream
+    from character.storage import open_writer
+    config = _writer_config(tmp_path, backup_keep=2)
+    conn = dream.open_db(config.db_path)
+    insert_record(conn, 'character_pairs', {'id': 'p1'})
+    conn.commit()
+    conn.close()
+    backups = tmp_path / 'state' / 'backups'
+    backups.mkdir(parents=True)
+    for index, name in enumerate(['character-a.json', 'character-b.json', 'character-c.json', 'character-legacy.db', 'block.md.x']):
+        (backups / name).write_text('old')
+        os.utime(backups / name, (index + 1, index + 1))
+    with open_writer(config):
+        pass
+    new, = [p.name for p in backups.glob('character-*.json') if p.name not in {'character-a.json', 'character-b.json', 'character-c.json'}]
+    assert sorted(p.name for p in backups.iterdir()) == sorted(['character-c.json', new, 'character-legacy.db', 'block.md.x'])

@@ -104,6 +104,32 @@ def eligible_records(conn, config, table, constitution=None):
         blocked |= more
     return [row for row in data[_table(table)] if row['id'] not in blocked and (constitution is None or row.get('constitution_sha256') == constitution.sha256)]
 
+# (database, backup folder) pairs already backed up by this process.
+_BACKED_UP = set()
+
+def _backup_once(conn, config, path, backup_root):
+    """Snapshot the character tables once per process and keep the newest backup_keep files."""
+    key = (path, backup_root.resolve())
+    if key in _BACKED_UP:
+        return
+    conn.execute('BEGIN')
+    try:
+        data = snapshot(conn)
+    finally:
+        conn.rollback()
+    if not any(data.values()):
+        return
+    guard_path(backup_root, config)
+    backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, name = tempfile.mkstemp(prefix='character-', suffix='.json', dir=backup_root)
+    os.close(fd)
+    backup_path = guard_path(name, config)
+    backup_path.write_text(canonical_json(data), encoding='utf-8')
+    old = sorted((p for p in backup_root.glob('character-*.json') if p.name != backup_path.name), key=lambda p: p.stat().st_mtime_ns)
+    for stale in old[:max(len(old) - config.data['character']['backup_keep'] + 1, 0)]:
+        stale.unlink()
+    _BACKED_UP.add(key)
+
 @contextmanager
 def open_writer(config):
     from dream import open_db
@@ -112,19 +138,7 @@ def open_writer(config):
     guard_path(root, config)
     conn = open_db(path)
     try:
-        existing = any(records(conn, table) for table in TABLES)
-        if existing:
-            backup_root = root / 'backups'
-            guard_path(backup_root, config)
-            backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            fd, name = tempfile.mkstemp(prefix='character-', suffix='.db', dir=backup_root)
-            os.close(fd)
-            backup_path = guard_path(name, config)
-            dest = sqlite3.connect(backup_path)
-            try:
-                conn.backup(dest)
-            finally:
-                dest.close()
+        _backup_once(conn, config, path, root / 'backups')
         with conn:
             yield conn
     finally:

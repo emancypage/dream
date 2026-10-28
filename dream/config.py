@@ -437,7 +437,7 @@ def _validate_character(data):
         raise ConfigError("character must be a table")
     bools = {"enabled", "allow_same_family_judge", "hook_injection"}
     paths = {"constitution_path", "state_root"}
-    ints = {"render_max_pairs", "render_budget_codepoints", "max_context_codepoints", "max_response_codepoints", "max_seed_expansions"}
+    ints = {"render_max_pairs", "render_budget_codepoints", "max_context_codepoints", "max_response_codepoints", "max_seed_expansions", "backup_keep"}
     _unknown_keys("character", raw, bools | paths | ints)
     for key, value in raw.items():
         if key in bools and type(value) is not bool:
