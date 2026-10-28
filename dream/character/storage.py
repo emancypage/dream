@@ -80,6 +80,8 @@ def eligible_records(conn, config, table, constitution=None):
             if path and policy.excludes_memory_path(config.memory_root, path):
                 return False
             session = value.get('session_id')
+            if session in policy.session_ids:
+                return False
             if session:
                 source = conn.execute('SELECT project_slug FROM sessions WHERE session_id=?', (session,)).fetchone()
                 if source and policy.excludes(project_slug=source[0]):

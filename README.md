@@ -263,7 +263,8 @@ generated memory suggestions. For example:
   "instructions": "Do not retain the retired project, including paraphrases from old sessions.",
   "memory_paths": ["project_retired.md"],
   "project_slugs": ["retired-project"],
-  "text_markers": ["unique-retired-project-marker"]
+  "text_markers": ["unique-retired-project-marker"],
+  "session_ids": ["codex:retired-session-id"]
 }
 ```
 
@@ -280,7 +281,10 @@ clears excluded generated facts, rejects matching pending proposals (a patch als
 by its replaced span and by its preview, whose diff context can copy nearby text)
 and removes their previews, and refreshes the recall index. Until then, configured
 curation leaves a matching pending proposal out of its prompt and reports it as
-skipped. Source transcripts and existing chat messages remain unchanged.
+skipped. Source transcript files remain unchanged. Stored chat messages remain
+too, except for `session_ids`: the command also deletes each listed Dream session
+(a Claude session uses its transcript name, other sources `source:id`) with its
+messages and distilled notes, and ingestion skips those sessions afterwards.
 Pending proposals also retain their source-project exclusions. Cleanup defers
 files and distilled records changed after its snapshot and reports them for retry.
 Policies are local to the configured memory root and do not affect another machine.

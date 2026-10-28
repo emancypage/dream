@@ -116,3 +116,14 @@ def test_retention_checks_managed_file_text_without_excluded_rows(setup):
     assert result['character']['rerun_required'] is False
     assert not (Path(cfg.data['character']['state_root']) / 'block.md').exists()
     assert len(records(conn, 'character_pairs')) == 2
+
+
+def test_retention_removes_character_rows_from_listed_sessions(setup):
+    conn, cfg = setup
+    insert_record(conn, 'character_moments', {'id': 'moment-listed', 'session_id': 'listed'})
+    insert_record(conn, 'character_pairs', {'id': 'pair-listed', 'moment_id': 'moment-listed', 'status': 'pending', 'chosen': 'listed example'})
+    conn.commit()
+    (cfg.memory_root / '.dream-retention.json').write_text(json.dumps({'session_ids': ['listed']}))
+    apply_retention(conn, cfg.memory_root, config=cfg, apply=True)
+    remaining = [r['id'] for r in records(conn, 'character_pairs')]
+    assert 'pair-listed' not in remaining and 'unrelated' in remaining
