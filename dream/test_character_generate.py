@@ -149,6 +149,94 @@ def test_positive_correction_requires_traits_and_rationale(env,monkeypatch):
     assert g.generate_pairs(conn,cfg,source='corrections',limit=1)['failures']
     assert not storage.records(conn,'character_moments')
 
+
+@pytest.mark.parametrize(('changes', 'reason'), [
+    ({'trait_ids': []}, 'positive correction has no traits'),
+    ({'trait_ids': ['trait-a', 'trait-a']}, 'positive correction has duplicate traits'),
+    ({'rationale': ' \n '}, 'positive correction has blank rationale'),
+])
+@pytest.mark.parametrize('recover', [True, False])
+def test_positive_extraction_retries_once_with_safe_feedback(env, monkeypatch, caplog, changes, reason, recover):
+    g, cfg, conn = env
+    calls = []
+    def fake(stage, prompt, schema, **kwargs):
+        calls.append((stage, prompt, kwargs))
+        if stage == 'character_generate':
+            return SimpleNamespace(output={'response': 'Brief answer'})
+        if len(calls) == 1 or not recover:
+            return SimpleNamespace(output=dict(extraction(), **changes))
+        return SimpleNamespace(output=extraction())
+    monkeypatch.setattr(g.backend, 'generate', fake)
+    report = g.generate_pairs(conn, cfg, source='corrections', limit=1)
+    extraction_calls = [call for call in calls if call[0] == 'character_extract']
+    assert len(extraction_calls) == 2
+    assert extraction_calls[0][1] == extraction_calls[1][1]
+    assert extraction_calls[0][2]['config'] is extraction_calls[1][2]['config'] is cfg
+    assert reason in extraction_calls[1][2]['system_prompt']
+    assert reason in caplog.text
+    if recover:
+        assert report['failures'] == []
+        assert report['generated'] == 1
+        assert len(storage.records(conn, 'character_moments')) == 1
+        assert len(storage.records(conn, 'character_pairs')) == 1
+    else:
+        assert report['failures'][0]['reason'] == reason
+        assert report['generated'] == 0
+        assert not storage.records(conn, 'character_moments')
+        assert not storage.records(conn, 'character_pairs')
+
+
+def test_extraction_retry_can_return_negative_without_traits(env, monkeypatch):
+    g, cfg, conn = env
+    outputs = iter([dict(extraction(), trait_ids=[]),
+                    dict(extraction(), is_correction=False, trait_ids=[])])
+    monkeypatch.setattr(g.backend, 'generate', lambda *a, **k: SimpleNamespace(output=next(outputs)))
+    report = g.generate_pairs(conn, cfg, source='corrections', limit=1)
+    assert report['failures'] == []
+    assert report['skipped']['negative'] == 1
+    assert len(storage.records(conn, 'character_moments')) == 1
+    assert not storage.records(conn, 'character_pairs')
+
+
+def test_provider_schema_rejects_unapproved_traits(env, monkeypatch):
+    from model_types import validate_output, SchemaValidationError
+    g, cfg, conn = env
+    def fake(stage, prompt, schema, **kwargs):
+        with pytest.raises(SchemaValidationError):
+            validate_output(dict(extraction(), trait_ids=['unapproved']), schema)
+        validate_output(dict(extraction(), is_correction=False, trait_ids=[]), schema)
+        return SimpleNamespace(output=dict(extraction(), is_correction=False, trait_ids=[]))
+    monkeypatch.setattr(g.backend, 'generate', fake)
+    assert g.generate_pairs(conn, cfg, source='corrections', limit=1)['failures'] == []
+
+
+def test_extraction_estimate_includes_validation_retry(env):
+    g, cfg, conn = env
+    report = g.estimate(conn, cfg, source='corrections', limit=1)
+    assert report['call_bounds']['extraction'] == 2
+
+
+@pytest.mark.parametrize('failure', ['provider', 'evidence', 'unknown_trait'])
+def test_other_extraction_failures_are_not_retried(env, monkeypatch, failure):
+    g, cfg, conn = env
+    calls = []
+    def fake(stage, *args, **kwargs):
+        calls.append(stage)
+        if failure == 'provider':
+            raise RuntimeError('private provider error')
+        output = extraction()
+        if failure == 'evidence':
+            output['user_correction'] = 'invented evidence'
+        else:
+            output['trait_ids'] = ['unknown']
+        return SimpleNamespace(output=output)
+    monkeypatch.setattr(g.backend, 'generate', fake)
+    report = g.generate_pairs(conn, cfg, source='corrections', limit=1)
+    assert len(report['failures']) == 1
+    assert calls == ['character_extract']
+    assert not storage.records(conn, 'character_moments')
+    assert not storage.records(conn, 'character_pairs')
+
 def test_mixed_seedless_traits_and_template_fingerprint(env,monkeypatch,tmp_path):
     g,cfg,conn=env
     doc=g.load_constitution(cfg)
