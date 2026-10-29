@@ -134,7 +134,7 @@ def estimate(conn, config, *, source, limit, refresh=False, expand_seeds=False):
     doc,policy,items,skipped=_select(conn,config,source,limit,refresh,expand_seeds)
     corrections=sum(i['kind']=='correction' for i in items); seeds=len(items)-corrections
     expansions=min(sum(i['kind']=='synthetic' and not i.get('origin') for i in items),config.data['character']['max_seed_expansions']) if expand_seeds else 0
-    return {'source_items':len(items),'work_ids':[i['work_key'] for i in items],'work_items':[{'work_id':i['work_key'],'generation_attempt':i['attempt'],'supersedes_id':i['supersedes_id']} for i in items],'bounded_codepoints':sum(len(canonical_json(i)) for i in items),'call_bounds':{'extraction':corrections,'responses':corrections+2*seeds+2*expansions,'expansion':expansions,'judging':2*(len(items)+expansions)},'routes':{s:dict(config.stage(s)) for s in ('character_extract','character_generate')},'skipped':skipped,'failures':[]}
+    return {'source_items':len(items),'work_ids':[i['work_key'] for i in items],'work_items':[{'work_id':i['work_key'],'generation_attempt':i['attempt'],'supersedes_id':i['supersedes_id']} for i in items],'bounded_codepoints':sum(len(canonical_json(i)) for i in items),'call_bounds':{'extraction':2*corrections,'responses':corrections+2*seeds+2*expansions,'expansion':expansions,'judging':2*(len(items)+expansions)},'routes':{s:dict(config.stage(s)) for s in ('character_extract','character_generate')},'skipped':skipped,'failures':[]}
 
 
 def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=False):
@@ -150,10 +150,12 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
         check_constitution(doc,current)
         if item['kind']=='correction' and content_hash(_source(writer or conn,item['identity']['session_id']))!=item['source_hash']:
             raise GenerationValidationError('source changed')
-    def call(item,stage,template,payload,schema,constitution=True):
+    def call(item,stage,template,payload,schema,constitution=True,validation_feedback=None):
         check(item)
         system=(PROMPTS/template).read_text()+policy.context()
         if constitution: system+='\nApproved constitution:\n'+doc.text
+        if validation_feedback:
+            system+='\nExtraction validation feedback: '+validation_feedback+'. Regenerate the extraction from the same evidence. Do not invent traits or evidence to satisfy validation.'
         started_at=datetime.now(timezone.utc).isoformat()
         prompt=canonical_json(payload)
         request_schema=schema
@@ -164,6 +166,10 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
             properties['context_excerpt']={'type':'string','enum':[message['content'] for message in item['messages'] if message['content'].strip()]}
             properties['corrected_assistant_response']={'type':'string','enum':[item['rejected']]}
             properties['user_correction']={'type':'string','enum':[item['correction']]}
+            properties['trait_ids']={'type':'array','items':{'type':'string','enum':list(doc.traits)},
+                'description':'Use unique approved trait IDs. A positive correction with sufficient context requires at least one trait; otherwise the list may be empty.'}
+            properties['rationale']={'type':'string','maxLength':2000,
+                'description':'A short English reason. Must contain non-whitespace text for a positive correction with sufficient context.'}
             request_schema=dict(schema,properties=properties)
         answer=backend.generate(stage,prompt,request_schema,config=config,system_prompt=system)
         finished_at=datetime.now(timezone.utc).isoformat()
@@ -238,9 +244,23 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
                 provenance.update(item['identity']); provenance['historical_family']='anthropic' if item['identity']['source']=='claude' else 'unknown'
                 provenance['message_range']=[item['messages'][0]['seq'],item['messages'][-1]['seq']]
                 if moment is None:
-                    output,meta=call(item,'character_extract','character-extract-v1.md',{'messages':item['messages'],'assistant_response':item['rejected'],'user_correction':item['correction'],'trait_ids':list(doc.traits)},EXTRACT_SCHEMA)
-                    if output['is_correction'] and output['context_sufficient'] and (not output['trait_ids'] or len(set(output['trait_ids']))!=len(output['trait_ids']) or not output['rationale'].strip()):
-                        raise GenerationValidationError('positive correction needs traits and rationale')
+                    feedback=None
+                    for attempt in range(2):
+                        output,meta=call(item,'character_extract','character-extract-v1.md',{'messages':item['messages'],'assistant_response':item['rejected'],'user_correction':item['correction'],'trait_ids':list(doc.traits)},EXTRACT_SCHEMA,validation_feedback=feedback)
+                        reason=None
+                        if output['is_correction'] and output['context_sufficient']:
+                            if not output['trait_ids']:
+                                reason='positive correction has no traits'
+                            elif len(set(output['trait_ids']))!=len(output['trait_ids']):
+                                reason='positive correction has duplicate traits'
+                            elif not output['rationale'].strip():
+                                reason='positive correction has blank rationale'
+                        if reason is None:
+                            break
+                        if attempt:
+                            raise GenerationValidationError(reason)
+                        logging.getLogger(__name__).warning('Character extraction validation failed for %s: %s; retrying once',item['work_key'],reason)
+                        feedback=reason
                     if not output['context_excerpt'].strip() or not any(output['context_excerpt'] in m['content'] for m in item['messages']):
                         raise GenerationValidationError('context excerpt is not copied')
                     if output['corrected_assistant_response']!=item['rejected']:
