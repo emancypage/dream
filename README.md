@@ -670,6 +670,14 @@ against chosen requires `--acknowledge-flags` and a human reason. Generation
 skips traits without seeds without treating that as a failure. Seed expansion is
 explicit through `--expand-seeds` and bounded by `max_seed_expansions`.
 
+Ordinary Character writes and review decisions do not create database backups.
+The nightly service runs `dream character backup` before its pipeline. This saves
+only the nine Character tables as a private JSON snapshot, at most once per local
+calendar day, and keeps the newest `character.backup_keep` snapshots (default 14).
+Repeating the nightly service on the same day reuses that day's snapshot. These
+snapshots contain Character records, not a restorable copy of the full SQLite
+database. Schema migrations retain their separate pre-migration backup.
+
 Short examples use `dream-character-short-v1` in a separate database table. The
 input JSON contains five nonempty text fields: `situation`, `preferred`, `avoid`,
 `feedback`, and `limits`. Their combined length is at most 2500 Unicode codepoints.

@@ -1,5 +1,6 @@
 """Canonical per-table payload storage with host identities."""
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -104,41 +105,49 @@ def eligible_records(conn, config, table, constitution=None):
         blocked |= more
     return [row for row in data[_table(table)] if row['id'] not in blocked and (constitution is None or row.get('constitution_sha256') == constitution.sha256)]
 
-# (database, backup folder) pairs already backed up by this process.
-_BACKED_UP = set()
-
-def _backup_once(conn, config, path, backup_root):
-    """Snapshot the character tables once per process and keep the newest backup_keep files."""
-    key = (path, backup_root.resolve())
-    if key in _BACKED_UP:
-        return
-    conn.execute('BEGIN')
+def backup_daily(config):
+    """Save Character tables for the nightly service, at most once per local day."""
+    path = guard_path(config.db_path, config)
+    if not path.exists():
+        return {'skipped': 'database missing'}
+    root = Path(config.data['character']['state_root']).expanduser() / 'backups'
+    guard_path(root, config)
+    backup = guard_path(root / f'character-{date.today().isoformat()}.json', config, output_root=root)
+    if backup.exists():
+        return {'skipped': 'already backed up today'}
+    # A normal read-only connection includes committed WAL data. One read
+    # transaction keeps all Character tables at the same database revision.
+    conn = sqlite3.connect(f'{path.as_uri()}?mode=ro', uri=True)
     try:
+        conn.execute('BEGIN')
         data = snapshot(conn)
     finally:
-        conn.rollback()
+        conn.close()
     if not any(data.values()):
-        return
-    guard_path(backup_root, config)
-    backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd, name = tempfile.mkstemp(prefix='character-', suffix='.json', dir=backup_root)
-    os.close(fd)
-    backup_path = guard_path(name, config)
-    backup_path.write_text(canonical_json(data), encoding='utf-8')
-    old = sorted((p for p in backup_root.glob('character-*.json') if p.name != backup_path.name), key=lambda p: p.stat().st_mtime_ns)
-    for stale in old[:max(len(old) - config.data['character']['backup_keep'] + 1, 0)]:
-        stale.unlink()
-    _BACKED_UP.add(key)
+        return {'skipped': 'no character data'}
+    content = canonical_json(data)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, name = tempfile.mkstemp(prefix='.character-', suffix='.tmp', dir=root)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(content)
+        os.replace(temporary, backup)
+    finally:
+        temporary.unlink(missing_ok=True)
+    snapshots = sorted(root.glob('character-????-??-??.json'), reverse=True)
+    for stale in snapshots[config.data['character']['backup_keep']:]:
+        guard_path(stale, config, output_root=root).unlink()
+    return {'path': str(backup), 'bytes': backup.stat().st_size}
+
 
 @contextmanager
 def open_writer(config):
+    """Open a Character transaction without making a backup on each write."""
     from dream import open_db
     path = guard_path(config.db_path, config)
-    root = Path(config.data['character']['state_root']).expanduser()
-    guard_path(root, config)
     conn = open_db(path)
     try:
-        _backup_once(conn, config, path, root / 'backups')
         with conn:
             yield conn
     finally:

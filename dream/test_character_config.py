@@ -8,7 +8,7 @@ def test_character_defaults(tmp_path):
     assert cfg.data['character']['backup_keep'] == 14
     assert cfg.stage('review')['model'] == 'gpt-5.6-luna'
 
-@pytest.mark.parametrize('value', [{'auto_apply': True}, {'render_max_pairs': True}, {'enabled': 'yes'}, {'backup_keep': 0}])
+@pytest.mark.parametrize('value', [{'auto_apply': True}, {'render_max_pairs': True}, {'enabled': 'yes'}, {'backup_keep': 0}, {'backup_keep': True}])
 def test_strict_character(tmp_path, value):
     with pytest.raises(ConfigError):
         load_config(tmp_path / 'absent', {'character': value})

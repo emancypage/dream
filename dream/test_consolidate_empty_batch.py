@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent))
 import consolidate as C  # noqa: E402
+from config import load_config
 
 SCHEMA = (Path(__file__).parent / "schema.sql").read_text(encoding="utf-8")
 
@@ -18,6 +19,13 @@ def _db() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
     return conn
+
+
+def _full_config(root):
+    return load_config(root / 'missing-config.toml', overrides={
+        'storage': {'memory_root': str(root)},
+        'consolidate': {'mode': 'full'},
+    })
 
 
 def test_calls_model_with_empty_batch_when_memory_nonempty(monkeypatch):
@@ -33,7 +41,7 @@ def test_calls_model_with_empty_batch_when_memory_nonempty(monkeypatch):
         root = Path(d)
         (root / "a.md").write_text("---\nname: a\n---\nbody\n", encoding="utf-8")
         conn = _db()
-        result = C.consolidate(conn, root, since_iso="2026-01-01T00:00:00")
+        result = C.consolidate(conn, root, since_iso="2026-01-01T00:00:00", config=_full_config(root))
 
     assert len(calls) == 1
     assert result == []
@@ -46,7 +54,7 @@ def test_skips_model_when_batch_and_memory_both_empty(monkeypatch):
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)  # empty — no *.md files
         conn = _db()
-        result = C.consolidate(conn, root, since_iso="2026-01-01T00:00:00")
+        result = C.consolidate(conn, root, since_iso="2026-01-01T00:00:00", config=_full_config(root))
 
     assert calls == []
     assert result == []
@@ -66,7 +74,7 @@ def test_empty_batch_does_not_move_watermark(monkeypatch):
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_consolidate_at', '2026-06-01T00:00:00')"
         )
         conn.commit()
-        C.consolidate(conn, root, since_iso="2026-01-01T00:00:00")
+        C.consolidate(conn, root, since_iso="2026-01-01T00:00:00", config=_full_config(root))
         row = conn.execute("SELECT value FROM meta WHERE key='last_consolidate_at'").fetchone()
 
     assert row[0] == "2026-06-01T00:00:00"
