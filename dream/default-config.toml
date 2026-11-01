@@ -130,7 +130,7 @@ render_budget_codepoints = 12000
 max_context_codepoints = 12000
 max_response_codepoints = 8000
 max_seed_expansions = 0
-# Character snapshots in state_root/backups: one per command run, newest kept.
+# Nightly Character snapshots only: at most one per day, newest kept.
 backup_keep = 14
 
 [stages.character_extract]

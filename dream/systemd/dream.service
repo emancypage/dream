@@ -9,6 +9,7 @@ Type=oneshot
 # ~/.config/dream/config.toml. Include common CLI install locations only for lookup.
 Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
 ExecStartPre=%h/.local/bin/dream-metrics start
+ExecStartPre=%h/.local/bin/dream character backup
 ExecStart=%h/.local/bin/dream-stage --continue-on-error ingest -- %h/.local/bin/dream ingest
 ExecStart=%h/.local/bin/dream-stage --continue-on-error distill -- %h/.local/bin/dream distill --yes --limit 50
 ExecStart=%h/.local/bin/dream-stage --continue-on-error consolidate -- %h/.local/bin/dream consolidate

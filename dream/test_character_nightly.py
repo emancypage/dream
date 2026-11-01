@@ -5,6 +5,9 @@ import metrics
 def test_nightly_character_stages_are_separate_provider_neutral_commands(tmp_path):
     assert metrics.STAGES == ('ingest', 'distill', 'consolidate', 'curation', 'character_generate', 'character_judge')
     service = (Path(__file__).parent / 'systemd/dream.service').read_text()
+    backup = 'ExecStartPre=%h/.local/bin/dream character backup'
+    assert service.count(backup) == 1
+    assert service.index(backup) < service.index('ExecStart=')
     for stage, command in [('character_generate', 'generate --source all --limit 10'), ('character_judge', 'judge --limit 10')]:
         assert f'dream-stage --continue-on-error {stage} -- %h/.local/bin/dream character {command}' in service
     for action in ('accept', 'edit', 'review', 'render', 'export', 'eval'):

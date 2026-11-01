@@ -22,6 +22,7 @@ def positive(value):
 def register(subparsers):
     parser = subparsers.add_parser('character', help='Generate and review human-approved character examples')
     commands = parser.add_subparsers(dest='character_cmd', required=True)
+    commands.add_parser('backup', help='Save the nightly Character snapshot, at most once per day')
     for name in ('estimate', 'generate'):
         command = commands.add_parser(name)
         command.add_argument('--source', choices=('corrections', 'synthetic', 'all'), default='all')
@@ -111,6 +112,10 @@ def run(args):
     conn = None
     try:
         guard_path(cfg.db_path, cfg)
+        if action == 'backup':
+            from character.storage import backup_daily
+            print(json.dumps(backup_daily(cfg), sort_keys=True))
+            return 0
         mutation = (action in ('generate', 'judge', 'accept', 'reject', 'defer', 'edit')
                     or action == 'short' and args.short_cmd in ('draft', 'generate', 'approve', 'reject')
                     or action == 'eval' and not args.report)

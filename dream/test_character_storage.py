@@ -77,48 +77,78 @@ def test_successful_write_observes_constitution_metadata(tmp_path):
     assert 'text' not in observations[0]
 
 
-def _writer_config(tmp_path, **character):
+def _writer_config(tmp_path):
     from config import load_config
-    return load_config(tmp_path / 'absent', {'storage': {'db_path': str(tmp_path / 'dream.db'), 'memory_root': str(tmp_path / 'memory')},
-                                             'character': {'state_root': str(tmp_path / 'state'), 'constitution_path': str(tmp_path / 'rules'), **character}})
+    return load_config(tmp_path / 'absent', {
+        'storage': {'db_path': str(tmp_path / 'dream.db'), 'memory_root': str(tmp_path / 'memory')},
+        'character': {'state_root': str(tmp_path / 'state'), 'constitution_path': str(tmp_path / 'rules')},
+    })
 
 
-def test_writer_backs_up_character_tables_once_per_process(tmp_path):
-    import json
-    import stat
+def test_ordinary_writes_never_create_backups(tmp_path):
     from character.storage import open_writer
     config = _writer_config(tmp_path)
-    backups = tmp_path / 'state' / 'backups'
-    with open_writer(config) as writer:
-        insert_record(writer, 'character_pairs', {'id': 'p1', 'chosen': 'yes'})
-    assert not backups.exists()
-    for _ in range(3):
+    for index in range(4):
         with open_writer(config) as writer:
-            insert_record(writer, 'character_pairs', {'id': f'p{_ + 2}', 'chosen': 'yes'})
-    backup, = backups.iterdir()
-    assert backup.name.startswith('character-') and backup.suffix == '.json'
-    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
-    data = json.loads(backup.read_text(encoding='utf-8'))
-    assert [row['id'] for row in data['character_pairs']] == ['p1']
-    assert set(data) == {'character_constitutions', 'character_moments', 'character_seeds', 'character_pairs', 'character_judgments',
-                         'character_review_events', 'character_eval_runs', 'character_eval_results', 'character_short_examples'}
+            insert_record(writer, 'character_pairs', {'id': f'p{index}', 'chosen': 'yes'})
+    assert not (tmp_path / 'state' / 'backups').exists()
 
 
-def test_writer_backup_keeps_newest_snapshots_only(tmp_path):
+def test_nightly_backup_is_small_bounded_and_once_per_day_across_processes(tmp_path):
+    import json
     import os
-    import dream
-    from character.storage import open_writer
-    config = _writer_config(tmp_path, backup_keep=2)
-    conn = dream.open_db(config.db_path)
-    insert_record(conn, 'character_pairs', {'id': 'p1'})
+    import stat
+    import subprocess
+    import sys
+    from datetime import date
+    from dream import open_db
+
+    config = _writer_config(tmp_path)
+    conn = open_db(config.db_path)
+    insert_record(conn, 'character_pairs', {'id': 'p1', 'chosen': 'yes'})
+    conn.execute('CREATE TABLE unrelated_large_data (body BLOB)')
+    conn.execute('INSERT INTO unrelated_large_data VALUES (zeroblob(2000000))')
     conn.commit()
     conn.close()
+    config_path = tmp_path / 'config.toml'
+    config_path.write_text(
+        f'[storage]\ndb_path = "{config.db_path}"\nmemory_root = "{config.memory_root}"\n'
+        f'[character]\nstate_root = "{tmp_path / "state"}"\nbackup_keep = 2\n')
     backups = tmp_path / 'state' / 'backups'
     backups.mkdir(parents=True)
-    for index, name in enumerate(['character-a.json', 'character-b.json', 'character-c.json', 'character-legacy.db', 'block.md.x']):
-        (backups / name).write_text('old')
-        os.utime(backups / name, (index + 1, index + 1))
-    with open_writer(config):
-        pass
-    new, = [p.name for p in backups.glob('character-*.json') if p.name not in {'character-a.json', 'character-b.json', 'character-c.json'}]
-    assert sorted(p.name for p in backups.iterdir()) == sorted(['character-c.json', new, 'character-legacy.db', 'block.md.x'])
+    for day in ('2000-01-01', '2000-01-02', '2000-01-03'):
+        (backups / f'character-{day}.json').write_text('{}')
+    env = {**os.environ, 'DREAM_CONTROL_STATE_DIR': str(tmp_path / 'control')}
+    command = [sys.executable, str(Path(__file__).with_name('dream.py')),
+               '--config', str(config_path), 'character', 'backup']
+    first = subprocess.run(command, capture_output=True, text=True, env=env)
+    assert first.returncode == 0, first.stderr
+    backup = backups / f'character-{date.today().isoformat()}.json'
+    assert sorted(p.name for p in backups.iterdir()) == ['character-2000-01-03.json', backup.name]
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+    content = backup.read_bytes()
+    assert len(content) < 64000
+    data = json.loads(content)
+    assert [row['id'] for row in data['character_pairs']] == ['p1']
+    assert set(data) == {'character_constitutions', 'character_moments', 'character_seeds',
+                         'character_pairs', 'character_judgments', 'character_review_events',
+                         'character_eval_runs', 'character_eval_results', 'character_short_examples'}
+    conn = open_db(config.db_path)
+    insert_record(conn, 'character_pairs', {'id': 'p2', 'chosen': 'later'})
+    conn.commit()
+    conn.close()
+    before = backup.stat()
+    second = subprocess.run(command, capture_output=True, text=True, env=env)
+    assert second.returncode == 0, second.stderr
+    assert json.loads(second.stdout)['skipped'] == 'already backed up today'
+    assert len(list(backups.iterdir())) == 2
+    assert backup.read_bytes() == content
+    assert backup.stat().st_mtime_ns == before.st_mtime_ns
+
+
+def test_nightly_backup_skips_missing_database_without_creating_it(tmp_path):
+    from character.storage import backup_daily
+    config = _writer_config(tmp_path)
+    assert backup_daily(config) == {'skipped': 'database missing'}
+    assert not config.db_path.exists()
+    assert not (tmp_path / 'state').exists()
