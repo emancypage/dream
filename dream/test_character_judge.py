@@ -12,7 +12,8 @@ def env(tmp_path, monkeypatch):
     doc=SimpleNamespace(text='Rules',sha256='abc',version='1',traits={'brief':'Be brief'})
     for mod in (judge,review,short): monkeypatch.setattr(mod,'load_constitution',lambda *a,**k:doc)
     conn=sqlite3.connect(cfg.db_path); conn.executescript((Path(__file__).parent/'schema.sql').read_text())
-    pair=storage.insert_record(conn,'character_pairs',dict(id='p',revision=1,constitution_sha256='abc',prompt_messages=[{'role':'user','content':'Task'}],chosen='Short',rejected='Long',trait_ids=['brief'],conflict=False,status='pending',provenance={'historical_family':'anthropic'},generator_calls=[{'family':'openai','stage':'character_generate'}])); conn.commit()
+    from character.generate import prompt_version
+    pair=storage.insert_record(conn,'character_pairs',dict(prompt_version=prompt_version(),id='p',revision=1,constitution_sha256='abc',prompt_messages=[{'role':'user','content':'Task'}],chosen='Short',rejected='Long',trait_ids=['brief'],conflict=False,status='pending',provenance={'historical_family':'anthropic'},generator_calls=[{'family':'openai','stage':'character_generate'}])); conn.commit()
     return judge,review,cfg,conn,pair
 
 def verdict(winner='A',a='supports',b='violates'):
@@ -165,3 +166,13 @@ def test_stored_family_override_is_explicit_and_recorded(env, monkeypatch):
     monkeypatch.setattr(j.backend, 'generate', lambda *a, **k: SimpleNamespace(output=next(answers)))
     assert j.judge_pairs(db, c, limit=1)['judged'] == 1
     assert storage.records(db, 'character_judgments')[0]['same_family_override'] is True
+
+
+def test_old_extraction_version_does_not_consume_judgment_limit(env, monkeypatch):
+    j, r, cfg, conn, pair = env
+    storage.insert_record(conn, 'character_pairs', dict(pair, id='a-old', prompt_version='old-filter'))
+    conn.commit()
+    answers = iter([verdict(), verdict('B', 'violates', 'supports')])
+    monkeypatch.setattr(j.backend, 'generate', lambda *a, **k: SimpleNamespace(output=next(answers)))
+    assert j.judge_pairs(conn, cfg, limit=1)['judged'] == 1
+    assert storage.records(conn, 'character_judgments')[0]['pair_id'] == pair['id']

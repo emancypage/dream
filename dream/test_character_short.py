@@ -229,3 +229,63 @@ def test_real_session_start_hook_uses_only_approved_short_text(env, monkeypatch,
     text = hook()
     assert BODY['feedback'] in text and BODY['limits'] in text
     assert 'user: Task' not in text
+
+
+def test_session_start_delivers_approved_examples_within_hook_timeout(env, monkeypatch, capsys, assert_latency):
+    """Repeated full-store scans must not make approved examples miss startup."""
+    import io
+    import time
+    import dream
+
+    short, r, c, db, pair = prepared(env, monkeypatch)
+    approved = approve_example(db, c, pair)
+    event = next(e for e in storage.records(db, 'character_review_events') if e['action'] == 'accept')
+    short_event = next(e for e in storage.records(db, 'character_review_events') if e['action'] == 'short_approve')
+    # Synthetic history of the same size as the store that exceeded five seconds.
+    for index in range(150):
+        storage.insert_record(db, 'character_moments', {
+            'id': f'moment-{index}', 'constitution_sha256': 'abc',
+            'identity': {'session_id': f'history-{index}', 'source_path': 'history.md'},
+            'correction_seq': index, 'messages': [
+                {'role': 'user', 'content': f'Context message {seq}. ' + 'Visible task context. ' * 10}
+                for seq in range(40)
+            ],
+        })
+    moments = {m['id']: m for m in storage.records(db, 'character_moments')}
+    for index in range(48):
+        parent = moments[f'moment-{index}']
+        copy = storage.insert_record(db, 'character_pairs', dict(
+            pair, id=f'pair-{index}', moment_id=parent['id'],
+            status='accepted' if index < 6 else 'pending',
+            provenance={'source_content_sha256': parent['content_sha256']},
+        ))
+        if index < 6:
+            storage.insert_record(db, 'character_review_events', dict(event, id=f'accept-{index}', pair_id=copy['id']))
+            example = storage.insert_record(db, 'character_short_examples', dict(
+                approved, id=f'short-{index}', work_key=copy['id'], pair_id=copy['id'], pair_sha256=copy['content_sha256'],
+            ))
+            storage.insert_record(db, 'character_review_events', dict(
+                short_event, id=f'approve-{index}', pair_id=copy['id'], short_id=example['id'],
+                short_sha256=example['content_sha256'], pair_sha256=copy['content_sha256'],
+            ))
+    storage.insert_record(db, 'character_review_events', {
+        'id': 'deletion', 'action': 'delete', 'origin': 'human_cli', 'deletion_keys': ['prompt:unrelated'],
+    })
+    c.memory_root.mkdir()
+    (c.memory_root / '.dream-retention.json').write_text(json.dumps({
+        'text_markers': [f'excluded-topic-{index}' for index in range(40)],
+    }))
+    c.data['character']['hook_injection'] = True
+    db.commit()
+    db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    monkeypatch.setattr('backend.generate', lambda *a, **k: pytest.fail('startup must not call a model'))
+    monkeypatch.setattr(dream.sys, 'stdin', io.StringIO(json.dumps({
+        'session_id': 'latency-new-chat', 'source': 'startup', 'cwd': str(c.db_path.parent),
+    })))
+    started = time.perf_counter()
+    assert dream.cmd_context(SimpleNamespace(context_cmd='session-start', config=c, db=c.db_path, explain=False)) == 0
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    text = json.loads(capsys.readouterr().out)['hookSpecificOutput']['additionalContext']
+    assert text.count('### Human-approved short example ') == 3
+    assert BODY['preferred'] in text
+    assert_latency('approved examples at session start', elapsed_ms, 5000)

@@ -5,6 +5,12 @@ description: Use when asked to run or inspect Dream, search indexed agent conver
 
 # Dream memory pipeline
 
+## Pause and resume
+
+Use `dream pause` to turn Dream off globally for the current user, `dream resume` to turn it on, and `dream status` to check the state. Other Codex tools and hook registrations stay active.
+
+If a hook or tool reports `[Dream paused]`, skip the usual requirement to consult Dream. Do not run data commands or read Dream's memory files, database, backups, or saved conversations directly. Do not seek the same information through another path. Continue with ordinary tools and current project files. Run `dream resume` only when the user explicitly asks. Already received context cannot be erased; use a fresh chat when testing memory absence.
+
 Drive the installed `dream` CLI. Let its configuration choose transcript sources, model providers, models, storage paths, and nightly review mode. Do not encode or override a provider unless the user explicitly requests an override.
 
 ## Single memory source

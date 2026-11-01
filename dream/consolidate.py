@@ -755,7 +755,8 @@ def _consolidate_subset(
         .replace("{{current_memory}}", current_memory)
         .replace("{{distilled_batch}}", _serialize_batch(batch))
     )
-    prompt += policy.context()
+    from character.storage import memory_feedback_context, memory_feedback
+    prompt += policy.context() + memory_feedback_context(memory_feedback(conn, cfg))
     res = generate("consolidate", prompt, CONSOLIDATE_PATCH_SCHEMA, model=model, config=cfg)
     suggestions = _patch_mode_suggestions(
         res.output, memory_root, allowed=("new", "update", "index", "patch"), shown=set(shown),
@@ -817,6 +818,8 @@ def run_audit(
         return []
     index_body = next((entry.body for entry in files if entry.path.name == INDEX_FILE), "(MEMORY.md does not exist)")
     policy = load_retention_policy(memory_root)
+    from character.storage import memory_feedback_context, memory_feedback
+    feedback = memory_feedback(conn, cfg)
     chunks = audit_chunks(topics, MAX_CURRENT_MEMORY_CHARS // 4)
     # Usage is evidence the model may cite, never a reason to remove on its own;
     # _drop_fresh_removals and the review gate apply exactly as without it.
@@ -840,7 +843,7 @@ def run_audit(
                 render_memory_file(entry.path.name, entry.body, annotation=usage[entry.path.name])
                 for entry in chunk))
         )
-        prompt += policy.context()
+        prompt += policy.context() + memory_feedback_context(feedback)
         res = generate("audit", prompt, CONSOLIDATE_PATCH_SCHEMA, model=model, config=cfg)
         # audit_chunks never cuts a file, so the chunk's files are exactly what the
         # model read in full; anything else is not a valid target for this call.
@@ -851,7 +854,7 @@ def run_audit(
         runs.append((f"{audit_run}-chunk{number}", res.provider, res.model, found))
     runs = [(run_id, provider, used_model, _drop_fresh_removals(found, memory_root))
             for run_id, provider, used_model, found in runs]
-    _persist_runs(conn, memory_root, runs, batch=[])
+    _persist_runs(conn, memory_root, runs, batch=[], feedback=feedback)
     return [s for _run_id, _provider, _model, found in runs for s in found]
 
 
@@ -894,7 +897,9 @@ def consolidate(
     batch = [(sid, ts, empty_notes() if policy.excludes(project_slug=projects.get(sid))
               else filter_notes(notes, policy), dkey) for sid, ts, notes, dkey in batch]
     if mode == "subset":
-        return _consolidate_subset(
+        from character.storage import pending_memory_feedback
+        feedback_suggestions = run_audit(conn, memory_root, model=model, config=cfg) if pending_memory_feedback(conn, cfg) else []
+        return feedback_suggestions + _consolidate_subset(
             conn, memory_root, batch, policy=policy, projects=projects, settings=settings,
             model=model, cfg=cfg, embedder=embedder,
         )
@@ -919,7 +924,9 @@ def consolidate(
     # structured suggestions). 600s was too tight once a multi-night backlog piled up
     # (timed out 06-07 + 06-08, batch only ~33k chars so it's the generation, not size).
     # 1800s gives headroom; systemd unit is TimeoutStartSec=infinity so this is the only cap.
-    prompt += policy.context()
+    from character.storage import memory_feedback_context, memory_feedback
+    feedback = memory_feedback(conn, cfg)
+    prompt += policy.context() + memory_feedback_context(feedback)
     res = generate("consolidate", prompt, CONSOLIDATE_SCHEMA, model=model, config=cfg)
     payload = res.output
 
@@ -950,7 +957,7 @@ def consolidate(
 
     suggestions = _drop_fresh_removals(suggestions, memory_root)
 
-    _persist(conn, memory_root, suggestions, batch=batch, provider=res.provider, model=res.model)
+    _persist_runs(conn, memory_root, [(uuid.uuid4().hex, res.provider, res.model, suggestions)], batch=batch, feedback=feedback)
     return suggestions
 
 
@@ -971,6 +978,7 @@ def _persist_runs(
     runs: list[tuple[str, str, str | None, list[Suggestion]]],
     *,
     batch: list[tuple[str, str, dict, str]],
+    feedback=(),
 ) -> None:
     """Persist provider runs and their suggestions in one transaction.
 
@@ -1000,6 +1008,9 @@ def _persist_runs(
                     "VALUES (?, ?, ?)",
                     (dkey, sid, runs[0][0]),
                 )
+            for event in feedback:
+                conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)',
+                             ('memory_feedback_processed:' + event['id'], runs[0][0]))
     except Exception:
         for path in written:
             path.unlink(missing_ok=True)

@@ -153,7 +153,7 @@ def _validate_prompt_fields(prompt_row: dict[str, Any]) -> None:
                 )
 
 
-def build_curation_prompt(rows: Any, memory_root: str | Path, *, topic_context=()) -> str:
+def build_curation_prompt(rows: Any, memory_root: str | Path, *, topic_context=(), retention_context='') -> str:
     """Build a bounded, provider-neutral prompt from host-supplied snapshots."""
     rendered_rows = []
     targets = {}
@@ -223,7 +223,7 @@ target_existed, and conflict fields.
 Pending suggestion snapshots:
 {payload}
 """
-    prompt += load_retention_policy(Path(memory_root)).context()
+    prompt += load_retention_policy(Path(memory_root)).context() + retention_context
     if len(prompt) > MAX_CURATION_PROMPT_CHARS:
         raise CurationContractError(
             f"curation prompt limit exceeded: {len(prompt)} > "

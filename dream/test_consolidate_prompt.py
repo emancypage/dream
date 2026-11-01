@@ -169,3 +169,61 @@ def test_audit_chunks_stay_within_the_limit_with_usage_annotations(tmp_path, mon
         rendered = "\n---\n".join(C.render_memory_file(entry.path.name, entry.body, annotation=widest)
                                   for entry in chunk)
         assert len(chunk) == 1 or len(rendered) <= limit
+
+
+def _deletion_feedback(conn):
+    from character import storage
+    return storage.insert_record(conn, 'character_review_events', dict(
+        id='deletion-feedback', action='delete', origin='human_cli', deletion_keys=['prompt:hash'],
+        reason='The alpha project is retired. Remove its project-specific memories.',
+        subject={'topic':'Alpha project planning', 'project_slug':'alpha'}, created_at='2026-11-01T10:00:00Z'))
+
+
+def test_full_consolidation_receives_human_deletion_reason(tmp_path, monkeypatch):
+    root, conn = _usage_store(tmp_path)
+    _deletion_feedback(conn)
+    conn.commit()
+    calls = _fake_provider(monkeypatch)
+    C.consolidate(conn, root, config=_config(tmp_path, root, 'full'))
+    assert 'The alpha project is retired.' in calls[0]
+    assert 'Alpha project planning' in calls[0]
+    assert 'not a request to erase memories' in calls[0]
+
+
+def test_pending_feedback_triggers_memory_audit_without_new_sessions(tmp_path, monkeypatch):
+    root, conn = _usage_store(tmp_path)
+    conn.execute('DELETE FROM distilled')
+    with (root / 'project_alpha.md').open('a') as stream:
+        stream.write('\nUnrelated durable preference.\n')
+    _deletion_feedback(conn)
+    conn.commit()
+    calls = _fake_provider(monkeypatch, {'suggestions':[dict(kind='patch', target_path='project_alpha.md',
+        find='alpha facts about kwalpha.', body='', rationale='Delete retired alpha project facts per human feedback.', source_sessions=[])]})
+    cfg = _config(tmp_path, root, 'subset')
+    suggestions = C.consolidate(conn, root, config=cfg)
+    assert len(calls) == 1
+    assert 'The alpha project is retired.' in calls[0]
+    assert [s.target_path for s in suggestions] == ['project_alpha.md']
+    assert conn.execute('SELECT COUNT(*) FROM suggestions').fetchone()[0] == 1
+    assert 'alpha facts' in (root / 'project_alpha.md').read_text()
+    C.consolidate(conn, root, config=cfg)
+    assert len(calls) == 1
+
+
+def test_feedback_remains_pending_when_provider_fails(tmp_path, monkeypatch):
+    import pytest
+    root, conn = _usage_store(tmp_path)
+    conn.execute('DELETE FROM distilled')
+    with (root / 'project_alpha.md').open('a') as stream:
+        stream.write('\nUnrelated durable preference.\n')
+    _deletion_feedback(conn)
+    conn.commit()
+    cfg = _config(tmp_path, root, 'subset')
+    def fail(*a, **k):
+        raise RuntimeError('provider offline')
+    monkeypatch.setattr(C, 'generate', fail)
+    with pytest.raises(RuntimeError, match='offline'):
+        C.consolidate(conn, root, config=cfg)
+    calls = _fake_provider(monkeypatch)
+    C.consolidate(conn, root, config=cfg)
+    assert len(calls) == 1 and 'The alpha project is retired.' in calls[0]

@@ -23,6 +23,7 @@ from recall_types import RecallCandidate, RecallDiagnostics, RecallDocument, Rec
 from recall_usage import usage_map
 from storage import open_db_readonly
 from retention_policy import load_retention_policy
+from pause_control import PAUSE_NOTICE, is_paused
 
 
 def parse_hook_payload(event_name: str, payload: dict) -> RecallQuery:
@@ -373,6 +374,8 @@ def recall_for_agent(conn, settings, *, query_text, cwd, memory_root, constituti
 
 
 def _agent_store_ready(conn, settings) -> None:
+    if is_paused():
+        raise RecallUnavailable(PAUSE_NOTICE)
     if not settings.enabled:
         raise RecallUnavailable("recall disabled")
     missing = missing_recall_tables(conn)

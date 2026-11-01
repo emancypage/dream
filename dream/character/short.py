@@ -10,8 +10,9 @@ from model_types import validate_output
 from character import storage
 from character.types import canonical_json, content_hash
 from character.constitution import load_constitution
-from character.review import accepted_pairs
+from character.review import accepted_pairs, accepted_from_snapshot
 from character.safety import policy_for, check_constitution, policy_fingerprint
+from pause_control import is_paused, PAUSE_NOTICE
 
 TABLE = 'character_short_examples'
 FIELDS = ('situation', 'preferred', 'avoid', 'feedback', 'limits')
@@ -55,9 +56,10 @@ def list_examples(conn, config):
 def pending_review_count(conn, config):
     """Count current reviewable drafts without exposing any draft wording."""
     doc, _ = _context(config)
-    sources = {p['id']:p['content_sha256'] for p in accepted_pairs(conn, config, doc)}
+    data = storage.eligible_snapshot(conn, config, doc)
+    sources = {p['id']:p['content_sha256'] for p in accepted_from_snapshot(data)}
     return sum(row.get('status') == 'draft' and sources.get(row['pair_id']) == row['pair_sha256']
-               for row in storage.eligible_records(conn, config, TABLE, doc))
+               for row in data[TABLE])
 
 
 def review_reminder(conn, config):
@@ -123,6 +125,8 @@ def generate_example(conn, config, pair_id, *, expected_pair_sha):
     if not config.data['character']['enabled']:
         return {'skipped':'character disabled'}
     try:
+        if is_paused():
+            raise ValueError(PAUSE_NOTICE)
         doc, policy = _context(config)
         fingerprint = policy_fingerprint(policy)
         pair = _source(conn, config, pair_id, expected_pair_sha, doc)
@@ -136,6 +140,8 @@ def generate_example(conn, config, pair_id, *, expected_pair_sha):
                                  'trait_ids':pair['trait_ids']})
         started = datetime.now(timezone.utc).isoformat()
         answer = backend.generate('character_generate', prompt, SCHEMA, config=config, system_prompt=system)
+        if is_paused():
+            raise ValueError(PAUSE_NOTICE)
         finished = datetime.now(timezone.utc).isoformat()
         validate_output(answer.output, SCHEMA)
         validate_body(answer.output)
@@ -198,10 +204,12 @@ def review_example(conn, config, identity, action, *, expected_sha, reason):
 
 def approved_examples(conn, config, document=None):
     doc = document or load_constitution(config)
-    pairs = {p['id']: p for p in accepted_pairs(conn, config, doc)}
-    events = storage.eligible_records(conn, config, 'character_review_events', doc)
+    check_constitution(doc, policy_for(config))
+    data = storage.eligible_snapshot(conn, config, doc)
+    pairs = {p['id']: p for p in accepted_from_snapshot(data)}
+    events = data['character_review_events']
     selected = []
-    for row in storage.eligible_records(conn, config, TABLE, doc):
+    for row in data[TABLE]:
         pair = pairs.get(row['pair_id'])
         if row['status'] != 'approved' or pair is None or pair['content_sha256'] != row['pair_sha256']:
             continue

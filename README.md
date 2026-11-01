@@ -124,6 +124,22 @@ preflight check and the recall diagnostics name the problem. The dense list reac
 `dream recall-calibrate --mode lexical_plus_embedder --apply` has stored a
 threshold for the current model and dimension.
 
+## Pause and resume
+
+```bash
+dream pause
+dream status
+dream resume
+```
+
+Pause is global for the current user. It does not depend on the selected database or configuration profile. It leaves other Codex tools, skills, instructions, and hook registrations in place.
+
+While paused, Dream supplies no recalled memories or character context. Its hooks return a control notice telling the agent to skip Dream and not read its memory files, database, backups, or saved conversations directly. Data commands such as `search`, `ingest`, `distill`, and `consolidate` skip their work. Status and pause/resume controls remain available even without a database. Existing MCP servers check pause on every memory request and can resume without reconnecting.
+
+The marker is `~/.local/state/dream/paused`. `DREAM_CONTROL_STATE_DIR` selects a separate control directory for isolated tests. Pause does not edit client configuration, move data, change file permissions, or cancel work already in progress. It does not erase memories already in a chat, so use a fresh chat for a comparison. Agent compliance with the pause notice is a behavior requirement. Pause does not remove filesystem access.
+
+After installing this update, reconnect existing Dream MCP servers once to load the new code. Later pause/resume changes need no server restart. Leave Dream paused until you want to enable it; agents must resume only at the user's request.
+
 ## Privacy and data flow
 
 - **Local reads.** `dream ingest` and `dream search` read only local transcript stores (by default Codex JSONL under `~/.codex/sessions` and Open Code SQLite at `~/.local/share/opencode/opencode.db`) and the local Dream SQLite database. By default they make no network or model calls. When `[recall.embedder]` is enabled, `dream ingest` (like `dream embed`, `dream recall-eval` and `dream recall-calibrate --mode lexical_plus_embedder`) also sends scrubbed document text to the configured embedding server, loopback only unless `remote_data_egress = true`; `dream search` never transmits anything.
@@ -179,6 +195,15 @@ The service completes its remaining commands, but run metrics retain every
 failed stage and report failed health rather than a clean success. Direct CLI
 commands and `dream-stage` without that flag retain their nonzero exit status.
 Interruptions and terminated stage processes still stop the service.
+
+The summary stage retries a known temporary Codex error once, after five seconds.
+This includes interrupted response streams, request timeouts, temporary server
+errors, and request rate limits. Both attempts use the same prompt, model,
+authentication, sandbox, and configured timeout. The retry is logged. A second
+failure keeps the summary pending and marks the stage as failed. Authentication,
+billing, configuration, invalid output, unknown errors, and the CLI process time
+limit do not trigger this retry. Other stages and providers keep their current
+behavior.
 
 The OpenCode adapter supports the legacy workspace `branch` column and the
 new workspace schema that omits it. Missing branch metadata becomes `null`;
