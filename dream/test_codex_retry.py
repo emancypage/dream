@@ -69,6 +69,7 @@ def _config(tmp_path):
     "Internal server error",
     "rate_limit_exceeded: please slow down",
     "Rate limit exceeded, please retry later",
+    "Selected model is at capacity. Please try a different model.",
 ])
 def test_summary_retries_one_temporary_codex_error(monkeypatch, tmp_path, message, capsys):
     calls, delays = _codex_process(monkeypatch, tmp_path, [("error", message), ("ok", NOTES)])
