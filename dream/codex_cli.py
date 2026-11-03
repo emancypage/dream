@@ -8,6 +8,7 @@ Mechanism (verified against codex-cli 0.135.0):
   * `codex exec` runs non-interactively, prompt piped on stdin (`-` arg).
   * `--output-schema FILE`  enforces the final-message JSON shape (≈ claude's --json-schema).
   * `--output-last-message FILE` writes ONLY the final agent message — clean JSON, no JSONL noise.
+  * `--json`                 exposes failure events without echoing the input prompt to stderr.
   * `--ephemeral`            no session persistence (≈ claude's --no-session-persistence).
   * `--ignore-user-config`   skip ~/.codex/config.toml (MCP plugins, hooks, xhigh default);
                              auth still resolves from CODEX_HOME. We supply model+effort ourselves.
@@ -22,7 +23,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -78,6 +81,62 @@ def _parse_json(raw: str) -> dict:
     raise ProviderError(f"could not parse codex output as JSON:\n{raw[:2000]}")
 
 
+def _failure_message(stdout: str) -> str | None:
+    """Read only error events, never worker output or startup diagnostics."""
+    for line in reversed(stdout.splitlines()):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "turn.failed":
+            error = event.get("error")
+            message = error.get("message") if isinstance(error, dict) else None
+        elif event.get("type") == "error":
+            message = event.get("message")
+        else:
+            continue
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    return None
+
+
+def _failure_detail(stdout: str, stderr: str) -> str:
+    message = _failure_message(stdout)
+    if message:
+        return f"error: {message[-2000:]}"
+    return f"stderr: {stderr.strip()[-2000:]}"
+
+
+def _temporary_failure(stdout: str) -> bool:
+    message = (_failure_message(stdout) or "").casefold()
+    statuses = re.findall(
+        r"\b(?:unexpected status|http(?: status)?|status(?: code)?)\s*[:=]?\s*(\d{3})\b",
+        message,
+    )
+    if any(status.startswith("4") and status != "429" for status in statuses):
+        return False
+    if any(term in message for term in (
+        "authentication", "unauthorized", "forbidden", "quota", "billing",
+        "usage limit", "usage_limit", "spend limit", "spend_limit", "credit balance", "credit_balance",
+        "context length", "context_length", "invalid schema", "invalid request",
+        "context window", "context_window", "certificate", "refusal", "model refused",
+        "not supported", "model_not_found", "does not exist", "sign in", "log in",
+        "login", "access token", "refresh token",
+    )):
+        return False
+    return any(status in {"500", "502", "503", "504"} for status in statuses) or any(
+        term in message for term in (
+            "stream disconnected before completion", "error sending request for url",
+            "connection reset", "request timed out", "temporarily overloaded",
+            "server_overloaded", "server_is_overloaded", "service unavailable",
+            "internal server error", "rate_limit_exceeded", "rate limit reached",
+            "rate limit exceeded", "too many requests", "slow_down",
+        )
+    )
+
+
 def call_codex(
     prompt: str,
     schema: dict,
@@ -87,11 +146,13 @@ def call_codex(
     extra_args: list[str] | None = None,
     reasoning_effort: str | None = None,
     executable: str = "codex",
+    retry_temporary_errors: bool = False,
 ) -> CallResult:
-    """Single `codex exec` invocation against the user's ChatGPT subscription.
+    """Invoke `codex exec` against the user's ChatGPT subscription.
 
     Token usage is unavailable from --output-last-message and is returned as null.
     `model=None` lets Codex use its own default model.
+    The summary stage enables one retry for known temporary error events.
     """
     workdir = ensure_workdir()
     if model is None:
@@ -116,6 +177,7 @@ def call_codex(
             "-s", "workspace-write",
             "--ephemeral",
             "--ignore-user-config",
+            "--json",
             "--skip-git-repo-check",
             "-C", str(workdir),
             "--output-schema", str(schema_path),
@@ -131,30 +193,33 @@ def call_codex(
         env.pop("CODEX_API_KEY", None)
 
         t0 = time.monotonic()
-        try:
-            proc = subprocess.run(
-                cmd,
-                input=full_prompt,
-                capture_output=True,
-                text=True,
-                cwd=workdir,
-                env=env,
-                timeout=timeout,
+        for attempt in range(2 if retry_temporary_errors else 1):
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    input=full_prompt,
+                    capture_output=True,
+                    text=True,
+                    cwd=workdir,
+                    env=env,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as e:
+                raise ProviderError(f"codex CLI timed out after {timeout}s") from e
+
+            raw = out_path.read_text(encoding="utf-8").strip() if proc.returncode == 0 and out_path.exists() else ""
+            if proc.returncode == 0 and raw:
+                break
+            detail = _failure_detail(proc.stdout, proc.stderr)
+            failure = (
+                f"codex CLI exited {proc.returncode}\n{detail}" if proc.returncode != 0
+                else f"codex produced no --output-last-message\n{detail}"
             )
-        except subprocess.TimeoutExpired as e:
-            raise ProviderError(f"codex CLI timed out after {timeout}s") from e
-
-        if proc.returncode != 0:
-            raise ProviderError(
-                f"codex CLI exited {proc.returncode}\nstderr: {proc.stderr[:500]}"
-            )
-
-        raw = out_path.read_text(encoding="utf-8").strip() if out_path.exists() else ""
-
-    if not raw:
-        raise ProviderError(
-            f"codex produced no --output-last-message\nstderr: {proc.stderr[:500]}"
-        )
+            if not retry_temporary_errors or attempt == 1 or proc.returncode < 0 or not _temporary_failure(proc.stdout):
+                raise ProviderError(failure)
+            print(f"distill: temporary Codex error; retrying once in 5s.\n{detail}", file=sys.stderr)
+            out_path.unlink(missing_ok=True)
+            time.sleep(5)
 
     structured = _parse_json(raw)
     validate_output(structured, schema)

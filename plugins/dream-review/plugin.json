@@ -1,0 +1,23 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dream-review",
+  "version": "0.1.6",
+  "description": "Local human review of Dream answer pairs and short examples.",
+  "extensions": {
+    "com.openai": {
+      "requires_local_executor": true,
+      "interface": {
+        "displayName": "Dream Review",
+        "shortDescription": "Review Dream examples",
+        "longDescription": "Compare full answer pairs, save your choice and reason directly in local Dream, then separately edit and approve short examples. Shows review history and stale items.",
+        "category": "Productivity",
+        "capabilities": ["Interactive", "Read", "Write"],
+        "defaultPrompt": "Open Dream Review beside this chat.",
+        "logo": "./assets/icon.svg",
+        "composerIcon": "./assets/icon.svg",
+        "brandColor": "#82B6FF",
+        "brandColorDark": "#82B6FF"
+      }
+    }
+  }
+}

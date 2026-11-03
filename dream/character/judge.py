@@ -13,7 +13,7 @@ from character.constitution import load_constitution
 from character.safety import policy_for,check_constitution,policy_fingerprint
 from character.types import content_hash,canonical_json
 from character.review import candidate_hash, check_source_parent
-from character.generate import _source
+from character.generate import _source, prompt_version as generation_prompt_version
 
 PROMPT=Path(__file__).resolve().parent.parent/'prompts'/'character-judge-v1.md'
 ASSESSMENT={'type':'object','properties':{'trait_id':{'type':'string'},'a_assessment':{'type':'string','enum':['supports','violates','unclear']},'b_assessment':{'type':'string','enum':['supports','violates','unclear']},'rationale':{'type':'string'}},'required':['trait_id','a_assessment','b_assessment','rationale'],'additionalProperties':False}
@@ -46,7 +46,7 @@ def judge_pairs(conn,config,*,limit):
     if family in other_families and not override: raise ValueError('judge must use an independent family')
     identity=content_hash({'route':config.stage('character_judge'),'family':family,'prompt_version':version})
     done=storage.eligible_records(conn,config,'character_judgments',doc)
-    pairs=[p for p in storage.eligible_records(conn,config,'character_pairs',doc) if p.get('status') not in ('accepted','rejected','stale') and not any(j.get('pair_id')==p['id'] and j.get('pair_revision')==p['revision'] and j.get('pair_sha256')==p['content_sha256'] and j.get('judge_identity')==identity and j.get('complete') is True for j in done)][:limit]
+    pairs=[p for p in storage.eligible_records(conn,config,'character_pairs',doc) if p.get('prompt_version') == generation_prompt_version() and p.get('status') not in ('accepted','rejected','stale') and not any(j.get('pair_id')==p['id'] and j.get('pair_revision')==p['revision'] and j.get('pair_sha256')==p['content_sha256'] and j.get('judge_identity')==identity and j.get('complete') is True for j in done)][:limit]
     source_snapshots={}
     def session_snapshot(pair,db,parent):
         session_id=pair.get('session_id') or pair.get('provenance',{}).get('session_id')

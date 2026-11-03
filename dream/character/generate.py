@@ -30,7 +30,12 @@ EXTRACT_SCHEMA = {'type':'object','properties':{
     'additionalProperties':False}
 EXTRACT_SCHEMA['required'] = list(EXTRACT_SCHEMA['properties'])
 EXPAND_SCHEMA = {'type':'object','properties':{'prompt':{'type':'string'}},'required':['prompt'],'additionalProperties':False}
-CUE = re.compile(r"(?<!\w)(?:nie(?: tak)?|źle|cofnij|stop|don't|actually|that's wrong)(?!\w)", re.I)
+# Broad candidate discovery only; the extractor must verify an actual problem.
+CUE = re.compile(
+    r"(?<!\w)(?:nie(?: tak)?|źle|cofnij|stop|przestań|krócej|prościej|"
+    r"za dużo|(?:za|zbyt) dług\w*|miałeś|miałaś|prosiłem|prosiłam|"
+    r"zignorowałeś|zignorowałaś|ignorujesz|don't|actually|that's wrong|"
+    r"too long|shorter|i asked|you (?:ignored|didn't|did not))(?!\w)", re.I)
 
 
 def public_probe_inputs():
@@ -65,6 +70,9 @@ def _select(conn, config, source, limit, refresh, expand_seeds=False):
     items=[]; settings=config.data['character']
     moments=storage.eligible_records(conn,config,'character_moments',doc); pairs=storage.eligible_records(conn,config,'character_pairs',doc)
     def add(item):
+        if storage.is_deleted(conn, item):
+            skipped['deleted'] = skipped.get('deleted', 0) + 1
+            return
         if is_public_input(item['messages'], item.get('seed', {}).get('id')):
             skipped['public_probe']=skipped.get('public_probe',0)+1
             return
@@ -80,7 +88,7 @@ def _select(conn, config, source, limit, refresh, expand_seeds=False):
             child_pairs=[p for p in pairs if expanded and p.get('seed_id')==expanded['id']]
             expansion_only=not refresh and expanded is None
         item['expansion_only']=expansion_only
-        if not refresh and (previous and not expansion_only or old and (not old.get('is_correction') or not old.get('context_sufficient'))):
+        if not refresh and (previous and not expansion_only or old and (not old.get('is_correction') or not old.get('context_sufficient') or old.get('agreement') == 'unclear')):
             skipped['completed']+=1; return
         item['moment']=old if not refresh else None
         items.append(item)
@@ -144,6 +152,8 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
     result={'generated':0,'source_items':len(items),'failures':[],'skipped':skipped}
     expansion_budget=config.data['character']['max_seed_expansions'] if expand_seeds else 0
     def check(item, writer=None):
+        if storage.is_deleted(writer or conn, item):
+            raise GenerationValidationError('source permanently deleted by human')
         current=policy_for(config)
         if policy_fingerprint(current)!=fingerprint or load_constitution(config).sha256!=doc.sha256 or prompt_version()!=version:
             raise GenerationValidationError('inputs changed')
@@ -181,8 +191,11 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
         limit=config.data['character']['max_response_codepoints']
         schema=dict(RESPONSE_SCHEMA,properties={**RESPONSE_SCHEMA['properties'],
             'response':{**RESPONSE_SCHEMA['properties']['response'],'minLength':1,'maxLength':limit}})
+        payload={'messages':messages,'max_response_codepoints':limit}
+        if item['kind']=='correction':
+            payload.update(assistant_response=item['rejected'],user_correction=item['correction'])
         output,meta=call(item,'character_generate','character-response-v1.md',
-            {'messages':messages,'max_response_codepoints':limit},schema,arm=='chosen')
+            payload,schema,arm=='chosen')
         text=output['response']
         if not text.strip():
             raise GenerationValidationError(f'blank response: {len(text)} codepoints; limit {limit}')
@@ -228,6 +241,8 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
             record={'id':'seed-'+content_hash({'seed':child_seed,'constitution':doc.sha256}), 'work_key':key,'constitution_sha256':doc.sha256,'constitution_version':doc.version,'revision':1,'excluded':False,'origin':'expanded','expansion_work_key':item['work_key'],'parent_expansion_id':parent_id,'expansion_call':expansion_call,'human_seed_id':item['seed']['id'],'trait_id':item['seed']['trait_id'],'seed':child_seed,'prompt_messages':[{'role':'user','content':prompt}],'provenance':{'parent_seed_id':parent_id}}
             stored=persist(item,'character_seeds',record)
         child_seed=stored['seed']; key=stored['work_key']
+        if storage.is_deleted(conn, {'seed': child_seed, 'messages': stored['prompt_messages']}):
+            return
         previous=[p for p in storage.records(conn,'character_pairs') if p.get('work_key')==key]
         if refresh or not previous:
             items.append({'kind':'synthetic','seed':child_seed,'stored_seed':stored,'messages':stored['prompt_messages'],'work_key':key,'attempt':max((p['generation_attempt'] for p in previous),default=0)+1,'supersedes_id':max(previous,key=lambda p:p['generation_attempt'])['id'] if previous else None,'origin':'expanded','parent_expansion_id':stored['parent_expansion_id'],'expansion_call':stored['expansion_call']})
@@ -272,7 +287,7 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
                     if len(output['rationale'])>2000:
                         raise GenerationValidationError('extraction rationale is too long')
                     moment=persist(item,'character_moments',dict(base,**output,generation_attempt=item['attempt'],id='moment-'+uuid.uuid4().hex,provenance=provenance,**item['identity'],assistant_seq=item['assistant_seq'],correction_seq=item['correction_seq'],prompt_messages=item['messages'],extraction=meta,disposition='completed'))
-                if not moment['is_correction'] or not moment['context_sufficient']:
+                if not moment['is_correction'] or not moment['context_sufficient'] or moment['agreement'] == 'unclear':
                     skipped['negative']=skipped.get('negative',0)+1; continue
                 chosen,meta=response(item,item['messages'],'chosen'); calls=[meta]; rejected=item['rejected']; traits=moment['trait_ids']; rationale=moment['rationale']; conflict=moment['agreement']=='conflict'
                 provenance['source_content_sha256']=moment['content_sha256']

@@ -39,6 +39,8 @@ def generate(
         "executable": provider_cfg.get("executable"),
         "refusal_fallback_model": provider_cfg.get("refusal_fallback_model"),
     }
+    if stage == "distill" and provider_cfg["type"] == "codex-cli":
+        options["retry_temporary_errors"] = True
     request = GenerationRequest(
         system_prompt=SYSTEM_PROMPT if system_prompt is None else system_prompt,
         prompt=prompt,

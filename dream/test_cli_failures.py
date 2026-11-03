@@ -5,10 +5,11 @@ import dream
 from config import load_config
 
 
-def test_distill_returns_nonzero_when_provider_call_fails(monkeypatch, tmp_path):
+def test_distill_returns_nonzero_when_provider_call_fails(monkeypatch, tmp_path, capsys):
     conn = sqlite3.connect(":memory:")
     monkeypatch.setattr(dream, "open_db", lambda _path: conn)
-    monkeypatch.setattr(dream, "sessions_needing_distill", lambda *a, **k: [("session", 1000)])
+    session_id = "codex:00000000-0000-4000-8000-000000000001"
+    monkeypatch.setattr(dream, "sessions_needing_distill", lambda *a, **k: [(session_id, 1000)])
 
     def fail(*args, **kwargs):
         raise RuntimeError("provider failed")
@@ -26,6 +27,7 @@ def test_distill_returns_nonzero_when_provider_call_fails(monkeypatch, tmp_path)
         refresh=False,
     )
     assert dream.cmd_distill(args) == 1
+    assert session_id in capsys.readouterr().out
 
 
 def test_read_only_commands_work_without_database_directory_write_access(tmp_path, capsys):

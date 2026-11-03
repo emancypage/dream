@@ -25,7 +25,14 @@ def check_source_parent(conn, config, pair, document):
     if parent_id is None:
         return None
     table='character_moments' if pair.get('moment_id') else 'character_seeds'
-    parent=next((row for row in storage.eligible_records(conn,config,table,document) if row['id']==parent_id),None)
+    return _check_source_parent(pair, storage.eligible_records(conn,config,table,document))
+
+
+def _check_source_parent(pair, parents):
+    parent_id=pair.get('moment_id') or pair.get('seed_id')
+    if parent_id is None:
+        return None
+    parent=next((row for row in parents if row['id']==parent_id),None)
     if parent is None or parent['content_sha256']!=pair.get('provenance',{}).get('source_content_sha256'):
         raise ValueError('source evidence changed or unavailable')
     return parent
@@ -36,7 +43,11 @@ def _pairs(conn,config,doc):
 
 
 def _judgments(conn,config,pair,doc,*,exact=True):
-    return [j for j in storage.eligible_records(conn,config,'character_judgments',doc)
+    return _matching_judgments(storage.eligible_records(conn,config,'character_judgments',doc), pair, exact=exact)
+
+
+def _matching_judgments(rows,pair,*,exact):
+    return [j for j in rows
             if j.get('pair_id')==pair['id'] and j.get('complete') is True
             and j.get('candidate_sha256')==candidate_hash(pair)
             and (not exact or j.get('pair_revision')==pair['revision'] and j.get('pair_sha256')==pair['content_sha256'])]
@@ -61,17 +72,23 @@ def show_pair(conn,config,id):
 
 def accepted_pairs(conn,config,document=None):
     doc,_=_context(config,document)
-    events=storage.eligible_records(conn,config,'character_review_events',doc)
+    return accepted_from_snapshot(storage.eligible_snapshot(conn,config,doc))
+
+
+def accepted_from_snapshot(data):
+    """Validate human decisions against the same policy-filtered source rows."""
+    events=data['character_review_events']
     accepted=[]
-    for pair in _pairs(conn,config,doc):
+    for pair in data['character_pairs']:
         if pair.get('status')!='accepted' or pair.get('accepted_revision')!=pair['revision'] or pair.get('accepted_candidate_sha256')!=candidate_hash(pair): continue
         event=next((e for e in events if e.get('pair_id')==pair['id'] and e.get('action')=='accept' and e.get('origin')=='human_cli' and e.get('accepted_revision')==pair['revision'] and e.get('candidate_sha256')==candidate_hash(pair) and e.get('answer')==pair.get('accepted_answer')),None)
         if event is None: continue
         try:
-            check_source_parent(conn,config,pair,doc)
+            table='character_moments' if pair.get('moment_id') else 'character_seeds'
+            _check_source_parent(pair,data[table])
         except ValueError:
             continue
-        judgments=_judgments(conn,config,pair,doc,exact=False)
+        judgments=_matching_judgments(data['character_judgments'],pair,exact=False)
         oriented=dict(pair)
         if pair.get('accepted_answer')=='right':
             oriented.update(chosen=pair['rejected'],rejected=pair['chosen'])
@@ -118,3 +135,53 @@ def review_pair(conn,config,id,action,*,expected_sha,reason='',body=None,acknowl
         storage.insert_record(writer,'character_review_events',dict(id='review-'+uuid.uuid4().hex,revision=1,pair_id=id,pair_revision=pair['revision'],pair_sha256=expected_sha,candidate_sha256=candidate_hash(updated),accepted_revision=updated['revision'] if action=='accept' else None,answer=answer if action=='accept' else None,action=action,reason=reason,origin='human_cli',old_status=pair['status'],new_status=updated['status'],acknowledged_flags=flags if acknowledge_flags else [],created_at=datetime.now(timezone.utc).isoformat(),constitution_sha256=doc.sha256,constitution_version=doc.version,prompt_version=pair.get('prompt_version'),provenance=pair.get('provenance',{})))
         storage.mark_stale(writer,doc)
         return updated
+
+
+def delete_pair(conn, config, id, *, expected_sha, reason=''):
+    """Remove a pair; retain suppression hashes and optional human memory feedback."""
+    if not isinstance(reason, str) or len(reason) > 2000:
+        raise ValueError('invalid deletion reason')
+    reason = reason.strip()
+    doc, policy = _context(config, load_constitution(config, require_approved=False))
+    if not storage._text_allowed(reason, policy):
+        raise ValueError('deletion reason conflicts with policy')
+    fingerprint = policy_fingerprint(policy)
+    # Deletion also applies to stale items; it requires no answer or judgment.
+    initial = next((p for p in storage.eligible_records(conn, config, 'character_pairs') if p['id'] == id), None)
+    if initial is None or initial['content_sha256'] != expected_sha:
+        raise ValueError('pair changed or unavailable')
+    with storage.open_writer(config) as writer:
+        writer.execute('BEGIN IMMEDIATE')
+        current_doc, current_policy = _context(config, load_constitution(config, require_approved=False))
+        if current_doc.sha256 != doc.sha256 or policy_fingerprint(current_policy) != fingerprint:
+            raise ValueError('inputs changed')
+        pair = next((p for p in storage.eligible_records(writer, config, 'character_pairs') if p['id'] == id), None)
+        if pair is None or pair['content_sha256'] != expected_sha:
+            raise ValueError('pair changed or unavailable')
+        keys = storage.deletion_keys(writer, pair)
+        identities = {p['id']: storage.deletion_keys(writer, p)
+                      for p in storage.records(writer, 'character_pairs')}
+        pair_ids = set()
+        # Include every matching version and retain each source identity, so
+        # changing context bounds cannot bring a removed source back.
+        while True:
+            matching = {id for id, source_keys in identities.items() if source_keys & keys}
+            if matching == pair_ids:
+                break
+            pair_ids = matching
+            for id in pair_ids:
+                keys.update(identities[id])
+        short_ids = {s['id'] for s in storage.records(writer, 'character_short_examples')
+                     if s['pair_id'] in pair_ids}
+        for table in ('character_short_examples', 'character_judgments', 'character_review_events', 'character_pairs'):
+            for row in storage.records(writer, table):
+                if row['id'] in pair_ids or row.get('pair_id') in pair_ids or row.get('short_id') in short_ids:
+                    writer.execute(f'DELETE FROM {table} WHERE id=?', (row['id'],))
+        storage.insert_record(writer, 'character_review_events', dict(
+            id='deletion-' + uuid.uuid4().hex, action='delete', origin='human_cli',
+            deletion_keys=sorted(keys), reason=reason,
+            subject=dict(topic=next((m['content'][:500] for m in reversed(pair.get('prompt_messages', []))
+                                     if m.get('role') == 'user'), ''),
+                         project_slug=pair.get('project_slug') or pair.get('provenance', {}).get('project_slug')) if reason else {},
+            created_at=datetime.now(timezone.utc).isoformat()))
+    return dict(saved=True, deleted=True)

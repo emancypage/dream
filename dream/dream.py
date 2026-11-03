@@ -13,6 +13,8 @@ Subcommands:
   mcp           Read-only recall tools over MCP stdio (serve), and client install/uninstall
   review        Walk pending suggestions, accept/reject interactively
   status        Show DB stats
+  pause         Pause Dream without changing other tools
+  resume        Resume Dream
 
 Safe defaults:
   * `ingest` is idempotent (content-revision checked)
@@ -56,6 +58,7 @@ from recall_render import delivered_ids  # noqa: E402
 from recall_hooks import install_hooks, uninstall_hooks  # noqa: E402
 from storage import open_db_readonly  # noqa: E402
 from retention_policy import POLICY_FILE, excludes_source_sessions, excludes_suggestion, load_retention_policy  # noqa: E402
+from pause_control import PAUSE_NOTICE, is_paused, pause, resume  # noqa: E402
 
 
 def _sync_recall_documents(conn: sqlite3.Connection, memory_root,
@@ -461,7 +464,7 @@ def cmd_distill(args: argparse.Namespace) -> int:
         try:
             res = distill_session(conn, sid, model=args.model, config=args.config, memory_root=args.config.memory_root)
         except Exception as e:
-            print(f"  {_color('!', 'red')} {sid[:8]}…: {type(e).__name__}: {e}")
+            print(f"  {_color('!', 'red')} {sid}: {type(e).__name__}: {e}")
             failures += 1
             continue
         if res is None:
@@ -1210,9 +1213,17 @@ def _cmd_curate_configured(args: argparse.Namespace, conn, memory_root: Path, ro
                 if is_index:
                     contexts, dependencies = _curation_topic_context(reader, memory_root, snapshots, outcomes,
                                                                       constitution_path=constitution_path)
+                feedback_ids = {match for snapshot in snapshots for match in
+                                re.findall(r'\bdeletion-[a-zA-Z0-9-]+', snapshot['rationale'] or '')}
+                retention_context = ''
+                if feedback_ids:
+                    from character.storage import memory_feedback, memory_feedback_context
+                    retention_context = memory_feedback_context(
+                        [e for e in memory_feedback(reader, args.config) if e['id'] in feedback_ids])
             finally:
                 reader.close()
-            prompt = build_curation_prompt(snapshots, memory_root, topic_context=contexts)
+            prompt = build_curation_prompt(snapshots, memory_root, topic_context=contexts,
+                                           retention_context=retention_context)
             if load_retention_policy(memory_root) != policy:
                 raise CurationContractError("retention policy changed before review")
             response = generate("review", prompt, CURATION_SCHEMA, config=args.config)
@@ -1540,6 +1551,10 @@ def cmd_review(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    print("Dream state:        active")
+    if not args.db.exists():
+        print("DB:                 not initialized")
+        return 0
     conn = open_db_readonly(args.db)
     def scalar(sql: str, *p: Any) -> int:
         return conn.execute(sql, p).fetchone()[0]
@@ -1814,6 +1829,13 @@ def _context_failure(args, exc: Exception, *, explain: bool) -> int:
 
 def cmd_context(args: argparse.Namespace) -> int:
     explain = bool(getattr(args, "explain", False))
+    if is_paused():
+        if explain:
+            print(json.dumps({"paused": True, "candidate_ids": [], "selected_codepoints": len(PAUSE_NOTICE)}))
+        else:
+            event = "UserPromptSubmit" if args.context_cmd == "prompt" else "SessionStart"
+            print(hook_success_json(event, PAUSE_NOTICE))
+        return 0
     conn = None
     attempt_token = None
     payload = {}
@@ -2085,6 +2107,9 @@ def main(argv: list[str] | None = None) -> int:
                      help="List approved memory files not recalled in the last 90 days (read-only)")
     pst.set_defaults(func=cmd_status)
 
+    sub.add_parser("pause", help="Pause Dream globally without changing other tools")
+    sub.add_parser("resume", help="Resume Dream globally")
+
     pret = sub.add_parser("retention", help="Preview or apply local memory exclusions")
     pret.add_argument("--memory")
     pret.add_argument("--apply", action="store_true", help="Back up and remove excluded generated memories")
@@ -2148,11 +2173,32 @@ def main(argv: list[str] | None = None) -> int:
     register_character(sub)
 
     args = p.parse_args(argv)
+    # Controls must work even with a missing database or broken provider configuration.
+    if args.cmd == "pause":
+        pause()
+        print(PAUSE_NOTICE)
+        return 0
+    if args.cmd == "resume":
+        resume()
+        print("Dream state: active")
+        return 0
+    if is_paused():
+        if args.cmd == "context":
+            return cmd_context(args)
+        # The MCP transport stays connected so each request can observe resume.
+        # Hook installation is also a control operation and exposes no memories.
+        if args.cmd not in {"mcp", "hooks"}:
+            print(PAUSE_NOTICE)
+            return 0
     # The options as given; args.config and args.db are replaced by what they resolve to.
     args.config_option, args.db_option = args.config, args.db
     try:
         args.config = load_config(Path(args.config).expanduser() if args.config else None)
     except Exception as exc:
+        if args.cmd == "status":
+            print("Dream state:        active")
+            print(f"Configuration unavailable: {type(exc).__name__}")
+            return 0
         if args.cmd == "context":
             if getattr(args, "explain", False):
                 print(json.dumps({"error": type(exc).__name__, "message": str(exc)[:400]}, separators=(",", ":")))

@@ -1,4 +1,5 @@
 import sqlite3
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -21,7 +22,7 @@ def env(tmp_path, monkeypatch):
 def extraction(**changes):
     return dict(is_correction=True,context_excerpt='Explain it',corrected_assistant_response='Long answer',user_correction='Nie tak, shorter please',trait_ids=['trait-a'],agreement='agrees',context_sufficient=True,rationale='Too long',**changes)
 
-def test_estimate_and_correction_no_leak(env,monkeypatch):
+def test_correction_reaches_response_generator_without_extraction_rationale(env,monkeypatch):
     g,cfg,conn=env
     calls=[]
     def fake(stage,prompt,schema,**kw):
@@ -31,10 +32,16 @@ def test_estimate_and_correction_no_leak(env,monkeypatch):
     assert g.estimate(conn,cfg,source='all',limit=1)['source_items']==1
     assert calls==[]
     assert g.generate_pairs(conn,cfg,source='all',limit=1)['generated']==1
-    assert 'Nie tak' not in calls[1][1] and 'Too long' not in calls[1][1]
+    payload = json.loads(calls[1][1])
+    assert payload['user_correction'] == 'Nie tak, shorter please'
+    assert payload['assistant_response'] == 'Long answer'
+    assert payload['messages'] == [{'seq': 1, 'role': 'user', 'content': 'Explain it'}]
+    assert 'Too long' not in calls[1][1]
     pair=storage.records(conn,'character_pairs')[0]
     assert pair['provenance']['historical_family']=='anthropic'
     assert pair['status']=='pending'
+    assert pair['prompt_messages'] == [{'seq': 1, 'role': 'user', 'content': 'Explain it'}]
+    assert pair['rejected'] == 'Long answer'
     assert g.generate_pairs(conn,cfg,source='all',limit=1)['generated']==0
     assert g.generate_pairs(conn,cfg,source='all',limit=1,refresh=True)['generated']==1
     assert len(storage.records(conn,'character_pairs'))==2
@@ -534,3 +541,133 @@ def test_response_host_bound_counts_unicode_codepoints_and_accepts_exact_limit(e
     result = g.generate_pairs(conn, cfg, source='synthetic', limit=1)
     assert result['generated'] == 1
     assert storage.records(conn, 'character_pairs')[0]['chosen'] == '😀' * 12
+
+
+def test_form_decisions_and_later_correction_reach_replacement_generation(env, tmp_path, monkeypatch):
+    from ingest import ingest_parsed_session
+    from sources.claude_jsonl import ClaudeJSONLSource
+
+    g, cfg, conn = env
+    conn.execute('DELETE FROM messages')
+    conn.execute('DELETE FROM sessions')
+    conn.commit()
+    root = tmp_path / 'history'
+    project = root / 'project'
+    project.mkdir(parents=True)
+    rows = [
+        {'type': 'user', 'message': {'content': 'Review the migration plan.'}},
+        {'type': 'assistant', 'message': {'content': [
+            {'type': 'tool_use', 'id': 'form', 'name': 'AskUserQuestion',
+             'input': {'questions': [{'question': 'Keep monitoring?'}]}}]}},
+        {'type': 'user', 'message': {'content': [
+            {'type': 'tool_result', 'tool_use_id': 'form',
+             'content': 'Keep Grafana and commit on a branch.'}]}},
+        {'type': 'assistant', 'message': {'content': [
+            {'type': 'text', 'text': 'I will keep Grafana and add a worker.'}]}},
+        {'type': 'user', 'message': {'content': 'Nie chcę workera, usuń tę funkcję.'}},
+    ]
+    (project / 'form-session.jsonl').write_text('\n'.join(json.dumps(row) for row in rows))
+    source = ClaudeJSONLSource(root)
+    ingest_parsed_session(source.parse(next(iter(source.discover()))), conn)
+    seen = []
+
+    def provider(stage, prompt, schema, **kwargs):
+        data = json.loads(prompt)
+        if stage == 'character_extract':
+            return SimpleNamespace(output={
+                'is_correction': True, 'context_sufficient': True,
+                'context_excerpt': data['messages'][0]['content'],
+                'corrected_assistant_response': data['assistant_response'],
+                'user_correction': data['user_correction'],
+                'trait_ids': ['trait-a'], 'agreement': 'agrees',
+                'rationale': 'Remove the unwanted worker, preserve approved monitoring.',
+            })
+        seen.append(data)
+        return SimpleNamespace(output={'response': 'Keep Grafana; remove the worker feature.'})
+
+    monkeypatch.setattr(g.backend, 'generate', provider)
+    result = g.generate_pairs(conn, cfg, source='corrections', limit=1)
+    assert result['failures'] == []
+    assert result['generated'] == 1
+    assert len(seen) == 1
+    context = seen[0]['messages']
+    assert [turn['role'] for turn in context] == ['user', 'assistant', 'user']
+    assert 'Keep monitoring?' in context[1]['content']
+    assert 'Keep Grafana and commit on a branch.' in context[2]['content']
+    assert seen[0]['user_correction'] == 'Nie chcę workera, usuń tę funkcję.'
+    assert seen[0]['assistant_response'] == 'I will keep Grafana and add a worker.'
+    pair = storage.records(conn, 'character_pairs')[0]
+    assert pair['prompt_messages'] == context
+    assert pair['chosen'] == 'Keep Grafana; remove the worker feature.'
+    assert pair['rejected'] == 'I will keep Grafana and add a worker.'
+
+
+@pytest.mark.parametrize('source', ['corrections', 'synthetic'])
+def test_deleted_pair_never_regenerates_after_config_and_prompt_changes(env, monkeypatch, source):
+    from character import review
+    g, cfg, conn = env
+    doc = g.load_constitution(cfg)
+    doc.seeds = ({'id':'seed-a','trait_id':'trait-a','prompt':'Explain a task'},)
+    monkeypatch.setattr(review, 'load_constitution', g.load_constitution)
+    def fake(stage, *a, **k):
+        return SimpleNamespace(output=extraction() if stage == 'character_extract' else
+                               {'response':'Brief answer' if 'Approved constitution:' in k['system_prompt'] else 'Baseline'})
+    monkeypatch.setattr(g.backend, 'generate', fake)
+    assert g.generate_pairs(conn, cfg, source=source, limit=1)['generated'] == 1
+    pair = storage.records(conn, 'character_pairs')[0]
+    review.delete_pair(conn, cfg, pair['id'], expected_sha=pair['content_sha256'])
+    cfg.data['character']['max_response_codepoints'] += 1
+    monkeypatch.setattr(g, 'prompt_version', lambda: 'new-template')
+    doc.sha256 = 'new-constitution'
+    if source == 'synthetic':
+        doc.seeds = ({'id':'seed-a','trait_id':'trait-a','prompt':'Changed task wording'},)
+    else:
+        conn.execute("UPDATE messages SET text='Changed context' WHERE session_id='s' AND seq=1")
+        conn.commit()
+    monkeypatch.setattr(g.backend, 'generate', lambda *a, **k: pytest.fail('deleted source reached provider'))
+    assert g.generate_pairs(conn, cfg, source=source, limit=1, refresh=True, expand_seeds=True)['generated'] == 0
+    assert storage.records(conn, 'character_pairs') == []
+
+
+def test_deletion_during_generation_discards_in_flight_output(env, monkeypatch):
+    from character import review
+    g, cfg, conn = env
+    monkeypatch.setattr(review, 'load_constitution', g.load_constitution)
+    monkeypatch.setattr(g.backend, 'generate', lambda stage, *a, **k: SimpleNamespace(
+        output=extraction() if stage == 'character_extract' else {'response':'Brief answer'}))
+    assert g.generate_pairs(conn, cfg, source='corrections', limit=1)['generated'] == 1
+    pair = storage.records(conn, 'character_pairs')[0]
+    def delete_then_return(stage, *a, **k):
+        review.delete_pair(conn, cfg, pair['id'], expected_sha=pair['content_sha256'])
+        return SimpleNamespace(output=extraction())
+    monkeypatch.setattr(g.backend, 'generate', delete_then_return)
+    result = g.generate_pairs(conn, cfg, source='corrections', limit=1, refresh=True)
+    assert result['generated'] == 0 and result['failures']
+    assert storage.records(conn, 'character_pairs') == []
+
+
+def test_unclear_feedback_never_generates_a_pair_or_retries_cached_moment(env, monkeypatch):
+    g, cfg, conn = env
+    stages = []
+    def extract(stage, *a, **k):
+        stages.append(stage)
+        assert stage == 'character_extract'
+        return SimpleNamespace(output=dict(extraction(), agreement='unclear'))
+    monkeypatch.setattr(g.backend, 'generate', extract)
+    result = g.generate_pairs(conn, cfg, source='corrections', limit=1)
+    assert result['generated'] == 0
+    assert storage.records(conn, 'character_pairs') == []
+    assert stages == ['character_extract']
+    assert g.estimate(conn, cfg, source='corrections', limit=1)['source_items'] == 0
+
+
+@pytest.mark.parametrize('feedback', [
+    'Za dużo żargonu. Wyjaśnij prosto.',
+    'Miałeś sprawdzić wynik przed ogłoszeniem sukcesu.',
+    'You ignored my instruction to wait.',
+])
+def test_explicit_communication_complaints_are_candidates_without_bare_negation(env, feedback):
+    g, cfg, conn = env
+    conn.execute("UPDATE messages SET text=? WHERE session_id='s' AND seq=3", (feedback,))
+    conn.commit()
+    assert g.estimate(conn, cfg, source='corrections', limit=1)['source_items'] == 1

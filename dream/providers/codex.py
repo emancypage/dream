@@ -15,4 +15,5 @@ class CodexCLIProvider:
             extra_args=request.options.get("extra_args"),
             reasoning_effort=request.options.get("reasoning_effort"),
             executable=request.options.get("executable") or "codex",
+            retry_temporary_errors=request.options.get("retry_temporary_errors", False),
         )

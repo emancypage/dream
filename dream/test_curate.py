@@ -1019,3 +1019,28 @@ def test_curation_prompt_bounds_the_patch_find_field():
             [{"id": 8, "kind": "patch", "find_text": "x" * (MAX_CURATION_FIELD_CHARS + 1)}],
             Path("/memory/root"),
         )
+
+
+def test_human_retention_feedback_is_included_within_prompt_budget():
+    import curate
+    context = '\nHuman says: the alpha project is retired.'
+    assert context in build_curation_prompt([], Path('/memory/root'), retention_context=context)
+    with pytest.raises(curate.CurationContractError, match='prompt limit'):
+        build_curation_prompt([], Path('/memory/root'), retention_context='x' * curate.MAX_CURATION_PROMPT_CHARS)
+
+
+def test_review_receives_the_human_reason_cited_by_a_suggestion(tmp_path, monkeypatch):
+    from character import storage
+    root, db_path, config = make_curation_fixture(tmp_path, target='alpha.md')
+    with sqlite3.connect(db_path) as conn:
+        storage.insert_record(conn, 'character_review_events', dict(id='deletion-alpha', action='delete',
+            origin='human_cli', deletion_keys=['prompt:hash'], reason='The alpha project is retired.',
+            subject={'topic':'Alpha plans'}, created_at='2026-11-01T12:00:00Z'))
+        conn.execute("UPDATE suggestions SET rationale='Human feedback deletion-alpha: obsolete plans'")
+    calls = []
+    def review(stage, prompt, schema, **kwargs):
+        calls.append(prompt)
+        return SimpleNamespace(output={'decisions':[_decision(1)]}, provider='fake', model='fake')
+    monkeypatch.setattr(dream, 'generate', review)
+    assert run_curate(root, db_path, config, dry_run=True) == 0
+    assert 'The alpha project is retired.' in calls[0]
