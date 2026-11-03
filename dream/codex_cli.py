@@ -130,6 +130,7 @@ def _temporary_failure(stdout: str) -> bool:
         term in message for term in (
             "stream disconnected before completion", "error sending request for url",
             "connection reset", "request timed out", "temporarily overloaded",
+            "selected model is at capacity",
             "server_overloaded", "server_is_overloaded", "service unavailable",
             "internal server error", "rate_limit_exceeded", "rate limit reached",
             "rate limit exceeded", "too many requests", "slow_down",
