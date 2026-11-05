@@ -4,11 +4,14 @@ from datetime import datetime, timedelta, timezone
 from recall_hook_state import claim_hook_event, finish_hook_event, successful_session_start_ids
 
 
-def _make_running_marker_stale(root):
-    marker = next(root.glob("*.json"))
-    payload = json.loads(marker.read_text(encoding="utf-8"))
-    payload["started_at"] = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat().replace("+00:00", "Z")
-    marker.write_text(json.dumps(payload), encoding="utf-8")
+def _make_running_marker_stale(root, session_id, event):
+    for marker in root.glob("*.json"):
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        if (payload["session_id"], payload["event"]) == (session_id, event):
+            payload["started_at"] = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat().replace("+00:00", "Z")
+            marker.write_text(json.dumps(payload), encoding="utf-8")
+            return
+    raise AssertionError(f"Marker not found for {session_id!r}, {event!r}")
 
 
 def test_prompt_event_is_deduplicated_after_success(tmp_path, monkeypatch):
@@ -40,7 +43,7 @@ def test_failed_and_stale_events_can_retry_once(tmp_path, monkeypatch):
     assert not claim_hook_event("session-1", "prompt")
 
     assert claim_hook_event("session-2", "prompt")
-    _make_running_marker_stale(tmp_path)
+    _make_running_marker_stale(tmp_path, "session-2", "prompt")
     assert claim_hook_event("session-2", "prompt")
 
 
@@ -66,7 +69,7 @@ def test_attempt_token_prevents_an_old_attempt_from_finishing(tmp_path, monkeypa
     monkeypatch.setenv("DREAM_RECALL_STATE_ROOT", str(tmp_path))
 
     first_attempt = claim_hook_event("token-session", "prompt")
-    _make_running_marker_stale(tmp_path)
+    _make_running_marker_stale(tmp_path, "token-session", "prompt")
     second_attempt = claim_hook_event("token-session", "prompt")
     assert first_attempt != second_attempt
 
