@@ -81,3 +81,35 @@ def test_complete_frontmatter_is_preserved(replacement):
 def test_plain_markdown_is_supported():
     entry = MemoryFile(Path("/memory/topic.md"), "x" * 41_000, "sha")
     assert check_output(entry, {"body": "x" * 10_000, "dropped_summary": "", "folded_ids": []}, set(), SETTINGS)[0] == "x" * 10_000
+
+
+@pytest.mark.parametrize("with_bom", [False, True])
+def test_bom_frontmatter_keeps_original_marker_and_complete_header(with_bom):
+    head = "---\nname: topic\nmetadata:\n  type: project\n---\n"
+    entry = MemoryFile(Path("/memory/topic.md"), "\ufeff" + head + "x" * 45_000, "sha")
+    body = ("\ufeff" if with_bom else "") + head + "x" * 10_000
+    assert check_output(entry, {"body": body, "dropped_summary": "", "folded_ids": []}, set(), SETTINGS)[0] == "\ufeff" + head + "x" * 10_000
+
+
+@pytest.mark.parametrize("header", ["", "---\nname: other\n---\n", "---\nname: topic\nmetadata:\n  type: changed\n---\n", "---\nname: topic\nmetadata:\n  type: project\n---broken\n"])
+def test_bom_frontmatter_cannot_be_removed_or_changed(header):
+    entry = MemoryFile(Path("/memory/topic.md"), "\ufeff---\nname: topic\nmetadata:\n  type: project\n---\n" + "x" * 45_000, "sha")
+    with pytest.raises(CompactionError, match="frontmatter"):
+        check_output(entry, {"body": header + "x" * 10_000, "dropped_summary": "", "folded_ids": []}, set(), SETTINGS)
+
+
+@pytest.mark.parametrize("length", [2000, 2001])
+def test_dropped_summary_limit_matches_schema(length):
+    output = {"body": HEAD + "x" * 10_000, "dropped_summary": "ą" * length, "folded_ids": []}
+    assert compact.COMPACT_SCHEMA["properties"]["dropped_summary"]["maxLength"] == 2000
+    if length == 2000:
+        assert check_output(_file("a.md", 41_000), output, set(), SETTINGS)[1] == output["dropped_summary"]
+    else:
+        with pytest.raises(CompactionError, match="dropped_summary longer"):
+            check_output(_file("a.md", 41_000), output, set(), SETTINGS)
+
+
+def test_bom_plain_markdown_still_refuses_empty_output():
+    entry = MemoryFile(Path("/memory/topic.md"), "\ufeff" + "x" * 45_000, "sha")
+    with pytest.raises(CompactionError, match="empty body"):
+        check_output(entry, {"body": " " * 10_000, "dropped_summary": "", "folded_ids": []}, set(), SETTINGS)

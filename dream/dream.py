@@ -551,7 +551,8 @@ def cmd_audit(args: argparse.Namespace) -> int:
     return _print_suggestions(memory_root, suggestions)
 
 
-def expire_suggestions(conn: sqlite3.Connection, memory_root: Path, days: int) -> list[int]:
+def expire_suggestions(conn: sqlite3.Connection, memory_root: Path, days: int, *,
+                       failures: list[dict]) -> list[int]:
     rows = conn.execute(
         "SELECT id, sug_file FROM suggestions WHERE status='pending' AND created_at < datetime('now', ?) ORDER BY id",
         (f"-{days} days",),
@@ -565,8 +566,18 @@ def expire_suggestions(conn: sqlite3.Connection, memory_root: Path, days: int) -
         conn.commit()
         if changed:
             expired.append(sug_id)
-            _drop_suggestion_preview(memory_root / ".suggestions", sug_file)
+            _cleanup_delegate_preview(memory_root / ".suggestions", sug_id, sug_file, failures)
     return expired
+
+
+def _cleanup_delegate_preview(sug_dir, sug_id, sug_file, failures, *, file_name=None):
+    try:
+        _drop_suggestion_preview(sug_dir, sug_file)
+    except OSError:
+        failure = {"suggestion_id": sug_id, "error": "preview cleanup failed"}
+        if file_name is not None:
+            failure["file"] = file_name
+        failures.append(failure)
 
 
 def _compaction_pending(conn, memory_root, entry, policy):
@@ -638,21 +649,21 @@ def compact_memory(conn: sqlite3.Connection, memory_root: Path, *, config, model
                 (name, result.body, result.dropped_summary, entry.sha256, "compact-" + uuid.uuid4().hex),
             ).lastrowid
             if not _apply_suggestion(conn, memory_root, sug_dir, sug_id, "update", name, result.body, None, False,
-                                     constitution_path=constitution_path, commit=False):
+                                     constitution_path=constitution_path, commit=False, diagnostic_stream=sys.stderr):
                 failures.append({"file": name, "error": "apply refused"})
                 continue
             rows = [row for row, _ in snapshots]
             folded = [row[0] for row in rows if row[0] in result.folded_ids]
             dropped = [row[0] for row in rows if row[0] not in result.folded_ids]
             for row in rows:
-                if row[0] in result.folded_ids:
-                    conn.execute("UPDATE suggestions SET status='accepted', reviewed_at=CURRENT_TIMESTAMP WHERE id=?", (row[0],))
-                    _drop_suggestion_preview(sug_dir, row[6])
-                else:
-                    _reject_suggestion(conn, sug_dir, row[0], row[6], commit=False)
+                status = "accepted" if row[0] in result.folded_ids else "rejected"
+                conn.execute("UPDATE suggestions SET status=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
+                             (status, row[0]))
             conn.commit()
             compacted.append({"file": name, "old_chars": len(entry.body), "new_chars": len(result.body),
                               "folded": folded, "dropped": dropped})
+            for row in rows:
+                _cleanup_delegate_preview(sug_dir, row[0], row[6], failures, file_name=name)
         finally:
             if conn.in_transaction:
                 conn.rollback()
@@ -671,8 +682,10 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         return 1
     conn = open_db(args.db)
     memory_root = Path(args.memory)
-    result = {"expired": expire_suggestions(conn, memory_root, settings.suggestion_expiry_days),
-              **compact_memory(conn, memory_root, config=args.config, model=args.model)}
+    failures: list[dict] = []
+    expired = expire_suggestions(conn, memory_root, settings.suggestion_expiry_days, failures=failures)
+    result = {"expired": expired, **compact_memory(conn, memory_root, config=args.config, model=args.model)}
+    result["failures"] = failures + result["failures"]
     print(json.dumps(result, ensure_ascii=False))
     return 1 if result["failures"] else 0
 
@@ -825,7 +838,7 @@ def _find_text(conn: sqlite3.Connection, sug_id) -> str | None:
 def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
                       sug_id, kind, target_path, new_content, sug_file,
                       sync_recall: bool = True, *, constitution_path, commit: bool = True,
-                      reviewed_index: dict[str, str] | None = None) -> bool:
+                      reviewed_index: dict[str, str] | None = None, diagnostic_stream=None) -> bool:
     """Accept one suggestion: write/merge/delete the target, mark accepted, drop the preview.
 
     Refuses (marks 'rejected' instead of touching the filesystem) if target_path would
@@ -845,11 +858,11 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
     protected = kind in ("remove", "patch") and resolved_target == resolved_root / "MEMORY.md"
     if is_memory_control_source(tgt, memory_root=memory_root, constitution_path=constitution_path):
         _reject_suggestion(conn, sug_dir, sug_id, sug_file, commit=commit)
-        print(f"  rejected #{sug_id}: the constitution is human-controlled")
+        print(f"  rejected #{sug_id}: the constitution is human-controlled", file=diagnostic_stream)
         return False
     if resolved_target == (resolved_root / POLICY_FILE).resolve():
         _reject_suggestion(conn, sug_dir, sug_id, sug_file, commit=commit)
-        print(f"  rejected #{sug_id}: the local retention policy is user-controlled")
+        print(f"  rejected #{sug_id}: the local retention policy is user-controlled", file=diagnostic_stream)
         return False
     state_sql = ("SELECT base_sha256, target_existed, source_sessions, body, status, target_path, kind, rationale "
                  "FROM suggestions WHERE id=?")
@@ -861,7 +874,7 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
         if (reviewed_index is None or actual_review != reviewed_index
                 or state[4] != "pending"
                 or _safe_suggestion_target(memory_root, state[5]) != resolved_target):
-            print(f"  conflict #{sug_id}: reviewed index proposal changed")
+            print(f"  conflict #{sug_id}: reviewed index proposal changed", file=diagnostic_stream)
             return False
         index_existed = tgt.exists()
         index_bytes = tgt.read_bytes() if index_existed else b""
@@ -873,7 +886,7 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
         or excludes_source_sessions(conn, policy, state[2] if state else None)
     ):
         _reject_suggestion(conn, sug_dir, sug_id, sug_file, commit=commit)
-        print(f"  rejected #{sug_id}: excluded by local memory retention policy")
+        print(f"  rejected #{sug_id}: excluded by local memory retention policy", file=diagnostic_stream)
         return False
     base_sha = state[0] if state else None
     target_existed = state[1] if state else None
@@ -883,7 +896,7 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
         base_sha is None and target_existed == 0 and tgt.exists()
     )
     if conflict:
-        print(f"  conflict #{sug_id} ({target_path}): target changed since suggestion")
+        print(f"  conflict #{sug_id} ({target_path}): target changed since suggestion", file=diagnostic_stream)
         return False
     if kind == "patch" and contained and not protected:
         find, rationale = _patch_fields(conn, sug_id)
@@ -892,17 +905,17 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
             patched = patch_text(tgt.read_bytes().decode("utf-8") if tgt.exists() else "",
                                  find or "", new_content or "", allow_empty=allow_empty)
         except (PatchError, OSError, UnicodeDecodeError) as exc:
-            print(f"  deferred #{sug_id}: {exc}")
+            print(f"  deferred #{sug_id}: {exc}", file=diagnostic_stream)
             return False
         if policy.excludes(source_path=target_path, text=patched):
             _reject_suggestion(conn, sug_dir, sug_id, sug_file, commit=commit)
-            print(f"  rejected #{sug_id}: excluded by local memory retention policy")
+            print(f"  rejected #{sug_id}: excluded by local memory retention policy", file=diagnostic_stream)
             return False
     if kind == "index" and index_bytes is not None:
         if (conn.execute(state_sql, (sug_id,)).fetchone() != state
                 or tgt.resolve() != resolved_target or tgt.exists() != index_existed
                 or (tgt.read_bytes() if index_existed else b"") != index_bytes):
-            print(f"  conflict #{sug_id}: index or reviewed proposal changed before write")
+            print(f"  conflict #{sug_id}: index or reviewed proposal changed before write", file=diagnostic_stream)
             return False
     if contained and not protected:
         tgt.parent.mkdir(parents=True, exist_ok=True)
@@ -914,11 +927,11 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
             try:
                 apply_patch(tgt, find or "", new_content or "", expected_sha=base_sha, allow_empty=allow_empty)
             except PatchError as exc:
-                print(f"  deferred #{sug_id}: {exc}")
+                print(f"  deferred #{sug_id}: {exc}", file=diagnostic_stream)
                 return False
         status = "accepted"
     else:
-        print(f"  refusing #{sug_id} ({target_path}): unsafe target, marking rejected")
+        print(f"  refusing #{sug_id} ({target_path}): unsafe target, marking rejected", file=diagnostic_stream)
         status = "rejected"
     conn.execute("UPDATE suggestions SET status=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?", (status, sug_id))
     if commit:

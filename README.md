@@ -584,7 +584,8 @@ refuses and `dream preflight` reports `FAIL  delegate`. Each run:
    suggestions, and asks for a shorter body that folds in the patches that are
    still valid;
 3. checks the answer (no longer than `compact_over_chars` and at least a
-   quarter of `compact_target_chars`, identical complete frontmatter, only
+   quarter of `compact_target_chars`, identical complete frontmatter (preserving
+   an original UTF-8 BOM), a `dropped_summary` of at most 2,000 characters, only
    patch ids it was sent, unchanged file on disk, retention policy) and writes
    it through the suggestion apply path, after a backup under `memory-backups/`;
 4. marks the folded patches accepted and rejects the file's other eligible pending
@@ -596,6 +597,10 @@ line with `expired`, `compacted` and `failures`. Files above 200,000 characters
 are reported as failures without using a compaction slot. Changed pending
 suggestions or retention rules abort the file before writing. Recall synchronization
 failures also make the stage exit 1 while preserving the list of compacted files.
+Dream deletes previews after committing suggestion statuses. If deletion fails,
+Dream records the error in `failures`, processes the remaining files, synchronizes
+the recall index and exits with code 1. The report still lists the file in `compacted`
+if Dream shortened it successfully.
 
 **Provider executable.** `executable` under `[providers.<name>]` may be an
 absolute path. Dream then puts that file's directory first on the child

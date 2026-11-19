@@ -62,7 +62,7 @@ def _fake(monkeypatch, answer):
 
 
 def _result(capsys):
-    return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    return json.loads(capsys.readouterr().out)
 
 
 def test_disabled_delegate_makes_no_call(tmp_path, monkeypatch):
@@ -133,7 +133,9 @@ def test_file_changed_during_the_run_is_not_overwritten(tmp_path, monkeypatch, c
     assert topic.read_text(encoding="utf-8").endswith("\nowner edit\n")
     assert _status(conn, p1) == "pending"
     assert conn.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0] == 1
-    assert _result(capsys)["failures"][0]["error"] == "apply refused"
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["failures"][0]["error"] == "apply refused"
+    assert "conflict #" in captured.err
 
 
 def test_provider_failure_does_not_block_the_next_file(tmp_path, monkeypatch, capsys):
@@ -371,7 +373,7 @@ def test_topic_deleted_during_generation_does_not_block_next_file(tmp_path, monk
     assert not big.exists()
 
 
-def test_expiry_commits_each_status_before_preview_deletion_error(tmp_path, monkeypatch):
+def test_expiry_commits_each_status_before_preview_deletion_error(tmp_path, monkeypatch, capsys):
     root, conn, args = _setup(tmp_path)
     sug_dir = root / ".suggestions"
     sug_dir.mkdir()
@@ -389,8 +391,10 @@ def test_expiry_commits_each_status_before_preview_deletion_error(tmp_path, monk
         return unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "unlink", failing_unlink)
-    with pytest.raises(OSError, match="synthetic deletion error"):
-        dream.expire_suggestions(conn, root, 14)
+    assert dream.cmd_delegate(args) == 1
+    result = _result(capsys)
+    assert result == {"expired": ids, "compacted": [], "failures": [
+        {"suggestion_id": ids[1], "error": "preview cleanup failed"}]}
     reader = dream.open_db(args.db)
     try:
         assert [_status(reader, sug_id) for sug_id in ids] == ["rejected", "rejected"]
@@ -416,7 +420,137 @@ def test_expiry_skips_suggestion_reviewed_after_selection(tmp_path, monkeypatch)
             writer.close()
 
     monkeypatch.setattr(dream, "_drop_suggestion_preview", drop_preview)
-    assert dream.expire_suggestions(conn, root, 14) == [first]
+    assert dream.expire_suggestions(conn, root, 14, failures=[]) == [first]
     assert _status(conn, first) == "rejected"
     assert _status(conn, second) == "accepted"
     assert removed == [None]
+
+
+@pytest.mark.parametrize("folded", [False, True])
+def test_preview_cleanup_failure_keeps_committed_compaction_and_recall(tmp_path, monkeypatch, capsys, folded):
+    root, conn, args = _setup(tmp_path)
+    for name, chars in [("big.md", 50_000), ("topic.md", 45_000)]:
+        (root / name).write_text(_body(chars), encoding="utf-8")
+    sug_id = _suggest(conn, "big.md")
+    previews = root / ".suggestions"
+    previews.mkdir()
+    preview = previews / "pending-patch.md"
+    preview.write_text("synthetic patch preview")
+    conn.execute("UPDATE suggestions SET sug_file=? WHERE id=?", (preview.name, sug_id))
+    conn.commit()
+    unlink = Path.unlink
+
+    def failing_unlink(path, *unlink_args, **kwargs):
+        if path == preview:
+            reader = dream.open_db(args.db)
+            try:
+                assert _status(reader, sug_id) == ("accepted" if folded else "rejected")
+            finally:
+                reader.close()
+            raise PermissionError("private cleanup detail")
+        return unlink(path, *unlink_args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    _fake(monkeypatch, lambda prompt: {"body": _body(20_000), "dropped_summary": "", "folded_ids": [sug_id] if folded and "# File `big.md`" in prompt else []})
+    assert dream.cmd_delegate(args) == 1
+    result = _result(capsys)
+    assert {item["file"] for item in result["compacted"]} == {"big.md", "topic.md"}
+    assert result["failures"] == [{"file": "big.md", "suggestion_id": sug_id, "error": "preview cleanup failed"}]
+    assert preview.exists()
+    assert not conn.in_transaction
+    for name in ["big.md", "topic.md"]:
+        assert (root / name).read_text() == _body(20_000)
+        assert conn.execute("SELECT text FROM recall_documents WHERE source_kind='approved_memory' AND source_path=?", (name,)).fetchone()[0] == _body(20_000)
+    assert conn.execute("SELECT COUNT(*) FROM suggestions WHERE consolidation_run_id LIKE 'compact-%' AND status='accepted'").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+def test_missing_cli_after_expiry_reports_json(tmp_path, monkeypatch, capsys, provider):
+    import claude_cli
+    import codex_cli
+
+    root, conn, args = _setup(tmp_path)
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    monkeypatch.setattr(codex_cli, "ensure_workdir", lambda: workdir)
+    monkeypatch.setattr(claude_cli, "_ensure_workdir", lambda: workdir)
+    args.config.data["stages"]["delegate"]["provider"] = provider
+    args.config.data["providers"][provider]["executable"] = str(tmp_path / "missing-private-program")
+    old = _suggest(conn, "topic.md", age_days=15)
+    (root / "topic.md").write_text(_body(45_000))
+    assert dream.cmd_delegate(args) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"expired": [old], "compacted": [], "failures": [{"file": "topic.md", "error": "launch_error"}]}
+    assert captured.err == ""
+    assert _status(conn, old) == "rejected"
+    assert (root / "topic.md").read_text() == _body(45_000)
+
+
+def test_oversized_dropped_summary_changes_nothing(tmp_path, monkeypatch, capsys):
+    root, conn, args = _setup(tmp_path)
+    (root / "topic.md").write_text(_body(45_000))
+    sug_id = _suggest(conn, "topic.md")
+    _fake(monkeypatch, lambda prompt: {"body": _body(20_000), "dropped_summary": "x" * 2001, "folded_ids": [sug_id]})
+    assert dream.cmd_delegate(args) == 1
+    assert _result(capsys)["failures"] == [{"file": "topic.md", "error": "dropped_summary longer than 2000 characters"}]
+    assert (root / "topic.md").read_text() == _body(45_000)
+    assert _status(conn, sug_id) == "pending"
+    assert conn.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM recall_documents").fetchone()[0] == 0
+    assert not (tmp_path / "memory-backups").exists()
+
+
+@pytest.mark.parametrize("expiry", [False, True])
+def test_cli_with_unwritable_previews_finishes_compaction(tmp_path, expiry):
+    import os
+    import subprocess
+    import sys
+
+    root, conn, args = _setup(tmp_path)
+    (root / "topic.md").write_text(_body(45_000))
+    sug_id = _suggest(conn, "topic.md", age_days=15 if expiry else 0)
+    previews = root / ".suggestions"
+    previews.mkdir()
+    preview = previews / "pending-patch.md"
+    preview.write_text("synthetic patch preview")
+    conn.execute("UPDATE suggestions SET sug_file=? WHERE id=?", (preview.name, sug_id))
+    conn.commit()
+    executable = tmp_path / "fake-codex"
+    answer = {"body": _body(20_000), "dropped_summary": "", "folded_ids": [] if expiry else [sug_id]}
+    executable.write_text(
+        f"#!{sys.executable}\nimport json, pathlib, sys\n"
+        f"pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_text(json.dumps({answer!r}))\n"
+    )
+    executable.chmod(0o755)
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f"[storage]\ndb_path={json.dumps(str(args.db))}\nmemory_root={json.dumps(str(root))}\n"
+        "[review]\nmode='auto-apply'\n[delegate]\nenabled=true\n"
+        "[stages.delegate]\nprovider='codex'\nmodel='fake-model'\n"
+        f"[providers.codex]\nexecutable={json.dumps(str(executable))}\n"
+    )
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("DREAM_") and key != "CLAUDE_DREAM_DB"}
+    env.update({"HOME": str(tmp_path), "DREAM_MEMORY_ROOT": str(root),
+                "CLAUDE_DREAM_DB": str(args.db), "DREAM_CONTROL_STATE_DIR": str(tmp_path / "control")})
+    previews.chmod(0o555)
+    try:
+        if os.access(previews, os.W_OK):
+            pytest.skip("directory permissions do not block writes for this user")
+        proc = subprocess.run([sys.executable, str(ROOT / "dream.py"), "--config", str(config), "delegate", "memory"],
+                              text=True, capture_output=True, env=env, timeout=15)
+    finally:
+        previews.chmod(0o755)
+    assert proc.returncode == 1, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["expired"] == ([sug_id] if expiry else [])
+    assert result["compacted"] == [{"file": "topic.md", "old_chars": 45_000, "new_chars": 20_000,
+                                   "folded": [] if expiry else [sug_id], "dropped": []}]
+    failure = {"suggestion_id": sug_id, "error": "preview cleanup failed"}
+    if not expiry:
+        failure["file"] = "topic.md"
+    assert result["failures"] == [failure]
+    assert _status(conn, sug_id) == ("rejected" if expiry else "accepted")
+    assert preview.exists()
+    assert (root / "topic.md").read_text() == _body(20_000)
+    assert conn.execute("SELECT text FROM recall_documents WHERE source_path='topic.md'").fetchone()[0] == _body(20_000)

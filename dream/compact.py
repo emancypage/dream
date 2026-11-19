@@ -12,6 +12,7 @@ from config import DelegateSettings, DreamConfig
 from consolidate import INDEX_FILE, MemoryFile
 
 MAX_COMPACT_INPUT_CHARS = 200_000
+MAX_DROPPED_SUMMARY_CHARS = 2_000
 PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "delegate-compact.md"
 COMPACT_SCHEMA = {
     "type": "object",
@@ -19,7 +20,7 @@ COMPACT_SCHEMA = {
     "additionalProperties": False,
     "properties": {
         "body": {"type": "string"},
-        "dropped_summary": {"type": "string", "maxLength": 2000},
+        "dropped_summary": {"type": "string", "maxLength": MAX_DROPPED_SUMMARY_CHARS},
         "folded_ids": {"type": "array", "items": {"type": "integer"}},
     },
 }
@@ -45,12 +46,14 @@ def select_files(files: list[MemoryFile], settings: DelegateSettings) -> list[Me
 
 
 def _frontmatter(body: str) -> str | None:
-    if not body.startswith("---\n"):
+    start = 1 if body.startswith("\ufeff") else 0
+    if not body.startswith("---\n", start):
         return None
-    closing = re.search(r"^---(?:\n|$)", body[4:], re.MULTILINE)
+    opening_end = start + 4
+    closing = re.search(r"^---(?:\n|$)", body[opening_end:], re.MULTILINE)
     if closing is None:
         raise CompactionError("invalid frontmatter delimiter")
-    return body[:4 + closing.end()]
+    return body[:opening_end + closing.end()]
 
 
 def build_prompt(entry: MemoryFile, patches: list[dict], settings: DelegateSettings, policy_context: str) -> str:
@@ -68,8 +71,12 @@ def build_prompt(entry: MemoryFile, patches: list[dict], settings: DelegateSetti
 
 def check_output(entry: MemoryFile, output: dict, patch_ids: set[int],
                  settings: DelegateSettings) -> tuple[str, str, tuple[int, ...]]:
+    if len(output["dropped_summary"]) > MAX_DROPPED_SUMMARY_CHARS:
+        raise CompactionError(f"dropped_summary longer than {MAX_DROPPED_SUMMARY_CHARS} characters")
     body = output["body"]
-    if not body.strip():
+    if entry.body.startswith("\ufeff") and not body.startswith("\ufeff"):
+        body = "\ufeff" + body
+    if not body.removeprefix("\ufeff").strip():
         raise CompactionError("empty body")
     if len(body) > settings.compact_over_chars:
         raise CompactionError("body longer than compact_over_chars")

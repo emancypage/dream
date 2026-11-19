@@ -228,6 +228,8 @@ def call_codex(
                 )
             except subprocess.TimeoutExpired as e:
                 raise ProviderError(f"codex CLI timed out after {timeout}s", code="timeout") from e
+            except OSError:
+                raise ProviderError("codex CLI could not start", code="launch_error") from None
 
             raw = out_path.read_text(encoding="utf-8").strip() if proc.returncode == 0 and out_path.exists() else ""
             if proc.returncode == 0 and raw:

@@ -154,6 +154,8 @@ def call_claude(
             )
         except subprocess.TimeoutExpired as e:
             raise ClaudeCLIError(f"claude CLI timed out after {timeout}s") from e
+        except OSError:
+            raise ProviderError("claude CLI could not start", code="launch_error") from None
         stdout = proc.stdout.strip()
         parsed = _json_response(stdout)
         if parsed is not None:
