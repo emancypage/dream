@@ -9,7 +9,7 @@ from pathlib import Path
 
 import backend
 from config import DelegateSettings, DreamConfig
-from consolidate import INDEX_FILE, MemoryFile, _FRONTMATTER_NAME
+from consolidate import INDEX_FILE, MemoryFile
 
 MAX_COMPACT_INPUT_CHARS = 200_000
 PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "delegate-compact.md"
@@ -40,16 +40,17 @@ class Compaction:
 
 
 def select_files(files: list[MemoryFile], settings: DelegateSettings) -> list[MemoryFile]:
-    over = [entry for entry in files if entry.path.name != INDEX_FILE and len(entry.body) > settings.compact_over_chars]
+    over = [entry for entry in files if entry.path.name != INDEX_FILE and settings.compact_over_chars < len(entry.body) <= MAX_COMPACT_INPUT_CHARS]
     return sorted(over, key=lambda entry: len(entry.body), reverse=True)[:settings.compact_max_files_per_run]
 
 
-def _frontmatter_name(body: str) -> str | None:
+def _frontmatter(body: str) -> str | None:
     if not body.startswith("---\n"):
         return None
-    end = body.find("\n---", 4)
-    match = _FRONTMATTER_NAME.search(body[4:end if end != -1 else len(body)])
-    return match.group(1).strip() if match else None
+    closing = re.search(r"^---(?:\n|$)", body[4:], re.MULTILINE)
+    if closing is None:
+        raise CompactionError("invalid frontmatter delimiter")
+    return body[:4 + closing.end()]
 
 
 def build_prompt(entry: MemoryFile, patches: list[dict], settings: DelegateSettings, policy_context: str) -> str:
@@ -72,9 +73,8 @@ def check_output(entry: MemoryFile, output: dict, patch_ids: set[int],
         raise CompactionError("empty body")
     if len(body) > settings.compact_over_chars:
         raise CompactionError("body longer than compact_over_chars")
-    name = _frontmatter_name(entry.body)
-    if name is not None and _frontmatter_name(body) != name:
-        raise CompactionError("frontmatter name changed")
+    if _frontmatter(entry.body) != _frontmatter(body):
+        raise CompactionError("frontmatter changed")
     folded = tuple(output["folded_ids"])
     if not set(folded) <= patch_ids:
         raise CompactionError("unknown folded id")

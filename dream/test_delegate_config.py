@@ -25,3 +25,15 @@ def test_enabled_delegate_requires_an_explicit_model(tmp_path):
     cfg = load_config(tmp_path / "absent", {"delegate": {"enabled": True},
                                             "stages": {"delegate": {"model": "fake-model"}}})
     assert cfg.delegate_settings().enabled is True
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_default_preflight_includes_delegate_only_when_enabled(tmp_path, monkeypatch, enabled):
+    import backend
+    stages = {stage: {"provider": "claude"} for stage in ("distill", "consolidate", "audit", "review")}
+    stages["delegate"] = {"provider": "codex", "model": "fake"}
+    cfg = load_config(tmp_path / "absent", {"stages": stages, "delegate": {"enabled": enabled}})
+    monkeypatch.setattr(backend, "preflight_provider", lambda cfg: (cfg["type"] != "codex-cli", cfg["type"]))
+    results = backend.preflight(cfg)
+    assert [name for name, *_ in results] == (["claude", "codex"] if enabled else ["claude"])
+    assert backend.preflight(cfg, stages=["delegate"])[0][:2] == ("codex", False)

@@ -38,7 +38,7 @@ def test_prompt_does_not_expand_placeholders_inside_the_data():
 @pytest.mark.parametrize("output, message", [
     ({"body": "", "dropped_summary": "", "folded_ids": []}, "empty body"),
     ({"body": HEAD + "x" * 40_001, "dropped_summary": "", "folded_ids": []}, "body longer than compact_over_chars"),
-    ({"body": "---\nname: other\n---\nshort", "dropped_summary": "", "folded_ids": []}, "frontmatter name changed"),
+    ({"body": "---\nname: other\n---\nshort", "dropped_summary": "", "folded_ids": []}, "frontmatter changed"),
     ({"body": HEAD + "short", "dropped_summary": "", "folded_ids": [9]}, "unknown folded id"),
     ({"body": HEAD + "short", "dropped_summary": "", "folded_ids": [7, 7]}, "duplicate folded id"),
     ({"body": HEAD + "ok", "dropped_summary": "", "folded_ids": []}, "body shorter than a quarter of compact_target_chars"),
@@ -58,3 +58,26 @@ def test_propose_uses_the_delegate_stage_and_stops_before_the_provider_on_oversi
     with pytest.raises(CompactionError, match="input longer than 200000 characters"):
         propose(_file("big.md", 200_001), [], config=cfg, policy_context="")
     assert calls == ["delegate"]
+
+
+def test_oversized_files_do_not_consume_selection_slots():
+    files = [_file("huge.md", 200_001), _file("b.md", 55_000), _file("c.md", 45_000)]
+    assert [f.path.name for f in select_files(files, SETTINGS)] == ["b.md", "c.md"]
+
+
+@pytest.mark.parametrize("replacement", [
+    "---\nname: topic\ndescription: changed\nmetadata:\n  type: project\n---\n",
+    "---\nname: topic\ndescription: original\nmetadata:\n  type: changed\n---\n",
+    "---\nname: topic\ndescription: original\nmetadata:\n  type: project\n",
+    "---\nname: topic\ndescription: original\nmetadata:\n  type: project\n---broken\n",
+])
+def test_complete_frontmatter_is_preserved(replacement):
+    head = "---\nname: topic\ndescription: original\nmetadata:\n  type: project\n---\n"
+    entry = MemoryFile(Path("/memory/topic.md"), _file("a.md", 41_000).body.replace(HEAD, head), "sha")
+    with pytest.raises(CompactionError, match="frontmatter"):
+        check_output(entry, {"body": replacement + "x" * 10_000, "dropped_summary": "", "folded_ids": []}, set(), SETTINGS)
+
+
+def test_plain_markdown_is_supported():
+    entry = MemoryFile(Path("/memory/topic.md"), "x" * 41_000, "sha")
+    assert check_output(entry, {"body": "x" * 10_000, "dropped_summary": "", "folded_ids": []}, set(), SETTINGS)[0] == "x" * 10_000

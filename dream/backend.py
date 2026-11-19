@@ -54,7 +54,8 @@ def generate(
 
 def preflight(config: DreamConfig | None = None, *, stages=None) -> list[tuple[str, bool, str]]:
     cfg = config or load_config()
-    selected = stages if stages is not None else [name for name in cfg.data["stages"] if not name.startswith("character_")]
+    selected = stages if stages is not None else [name for name in cfg.data["stages"] if not name.startswith("character_")
+                                               and (name != "delegate" or cfg.delegate_settings().enabled)]
     used = {cfg.stage(name)["provider"] for name in selected}
     return [
         (name, *preflight_provider(cfg.provider(name)))

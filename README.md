@@ -584,15 +584,18 @@ refuses and `dream preflight` reports `FAIL  delegate`. Each run:
    suggestions, and asks for a shorter body that folds in the patches that are
    still valid;
 3. checks the answer (no longer than `compact_over_chars` and at least a
-   quarter of `compact_target_chars`, same frontmatter `name`, only
+   quarter of `compact_target_chars`, identical complete frontmatter, only
    patch ids it was sent, unchanged file on disk, retention policy) and writes
    it through the suggestion apply path, after a backup under `memory-backups/`;
-4. marks the folded patches accepted and rejects the file's other pending
+4. marks the folded patches accepted and rejects the file's other eligible pending
    suggestions, because they were written against the old body.
 
 A failed check or model call writes nothing for that file and makes the stage
 exit 1; the file is tried again the next night. The command prints one JSON
-line with `expired`, `compacted` and `failures`.
+line with `expired`, `compacted` and `failures`. Files above 200,000 characters
+are reported as failures without using a compaction slot. Changed pending
+suggestions or retention rules abort the file before writing. Recall synchronization
+failures also make the stage exit 1 while preserving the list of compacted files.
 
 **Provider executable.** `executable` under `[providers.<name>]` may be an
 absolute path. Dream then puts that file's directory first on the child

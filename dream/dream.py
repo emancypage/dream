@@ -48,7 +48,7 @@ from ingest import discover_jsonl, harvest_recall_usage, home_project_slug, inge
 from distill import distill_session, sessions_needing_distill  # noqa: E402
 from consolidate import consolidate as run_consolidate  # noqa: E402
 from consolidate import PatchError, memory_files, patch_text, run_audit, states_deletion  # noqa: E402
-from compact import CompactionError, propose as propose_compaction, select_files as select_compaction_files  # noqa: E402
+from compact import MAX_COMPACT_INPUT_CHARS, CompactionError, propose as propose_compaction, select_files as select_compaction_files  # noqa: E402
 from model_types import ProviderError  # noqa: E402
 from search import search as fts_search, session_summary  # noqa: E402
 from backend import active_backend, generate, preflight  # noqa: E402
@@ -556,59 +556,108 @@ def expire_suggestions(conn: sqlite3.Connection, memory_root: Path, days: int) -
         "SELECT id, sug_file FROM suggestions WHERE status='pending' AND created_at < datetime('now', ?) ORDER BY id",
         (f"-{days} days",),
     ).fetchall()
+    expired = []
     for sug_id, sug_file in rows:
-        _reject_suggestion(conn, memory_root / ".suggestions", sug_id, sug_file)
-    return [row[0] for row in rows]
+        changed = conn.execute(
+            "UPDATE suggestions SET status='rejected', reviewed_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'",
+            (sug_id,),
+        ).rowcount
+        conn.commit()
+        if changed:
+            expired.append(sug_id)
+            _drop_suggestion_preview(memory_root / ".suggestions", sug_file)
+    return expired
+
+
+def _compaction_pending(conn, memory_root, entry, policy):
+    snapshots = []
+    for row in _pending_suggestions(conn):
+        if _curation_pending_target(memory_root, row) != entry.path.resolve():
+            continue
+        find = _find_text(conn, row[0]) if row[1] == "patch" else None
+        if not excludes_suggestion(conn, policy, memory_root, target_path=row[2],
+                                   source_sessions=row[5], texts=(row[3], row[4], find)):
+            snapshots.append((tuple(row), find))
+    return snapshots
 
 
 def compact_memory(conn: sqlite3.Connection, memory_root: Path, *, config, model: str | None = None) -> dict:
+    from character.safety import is_memory_control_source
+
     constitution_path = config.data["character"]["constitution_path"]
     sug_dir = memory_root / ".suggestions"
-    policy_context = load_retention_policy(memory_root).context()
     compacted: list[dict] = []
     failures: list[dict] = []
     backed_up = False
+    settings = config.delegate_settings()
     files = memory_files(memory_root, constitution_path=constitution_path)
-    for entry in select_compaction_files(files, config.delegate_settings()):
+    for entry in files:
+        if entry.path.name != "MEMORY.md" and len(entry.body) > max(settings.compact_over_chars, MAX_COMPACT_INPUT_CHARS):
+            failures.append({"file": entry.path.name, "error": f"input longer than {MAX_COMPACT_INPUT_CHARS} characters"})
+    for entry in select_compaction_files(files, settings):
         name = entry.path.name
-        rows = [row for row in _pending_suggestions(conn)
-                if _safe_suggestion_target(memory_root, row[2]) == entry.path.resolve()]
-        patches = [{"id": row[0], "find": _find_text(conn, row[0]) or "", "replacement": row[3], "rationale": row[4] or ""}
-                   for row in rows if row[1] == "patch"]
+        policy = load_retention_policy(memory_root)
+        if (policy.excludes(source_path=name, text=entry.body) or policy.excludes_memory_path(memory_root, name)
+                or is_memory_control_source(entry.path, memory_root=memory_root, constitution_path=constitution_path)):
+            continue
+        if _file_sha256(entry.path) != entry.sha256:
+            failures.append({"file": name, "error": "apply refused"})
+            continue
+        snapshots = _compaction_pending(conn, memory_root, entry, policy)
+        patches = [{"id": row[0], "find": find or "", "replacement": row[3], "rationale": row[4] or ""}
+                   for row, find in snapshots if row[1] == "patch"]
         try:
-            result = propose_compaction(entry, patches, config=config, policy_context=policy_context, model=model)
+            if load_retention_policy(memory_root) != policy:
+                raise CompactionError("retention policy changed before compaction")
+            result = propose_compaction(entry, patches, config=config, policy_context=policy.context(), model=model)
         except CompactionError as exc:
             failures.append({"file": name, "error": str(exc)})
             continue
         except ProviderError as exc:
             failures.append({"file": name, "error": exc.code or "provider_error"})
             continue
-        if not backed_up:
-            _backup_memory(memory_root)
-            backed_up = True
-        sug_id = conn.execute(
-            "INSERT INTO suggestions(kind, target_path, body, rationale, status, base_sha256, target_existed, "
-            "consolidation_run_id) VALUES ('update', ?, ?, ?, 'pending', ?, 1, ?)",
-            (name, result.body, result.dropped_summary, entry.sha256, "compact-" + uuid.uuid4().hex),
-        ).lastrowid
-        if not _apply_suggestion(conn, memory_root, sug_dir, sug_id, "update", name, result.body, None, False,
-                                 constitution_path=constitution_path, commit=False):
-            conn.rollback()
-            failures.append({"file": name, "error": "apply refused"})
-            continue
-        folded = [row[0] for row in rows if row[0] in result.folded_ids]
-        dropped = [row[0] for row in rows if row[0] not in result.folded_ids]
-        for row in rows:
-            if row[0] in result.folded_ids:
-                conn.execute("UPDATE suggestions SET status='accepted', reviewed_at=CURRENT_TIMESTAMP WHERE id=?", (row[0],))
-                _drop_suggestion_preview(sug_dir, row[6])
-            else:
-                _reject_suggestion(conn, sug_dir, row[0], row[6], commit=False)
-        conn.commit()
-        compacted.append({"file": name, "old_chars": len(entry.body), "new_chars": len(result.body),
-                          "folded": folded, "dropped": dropped})
-    if compacted:
-        _sync_recall_documents(conn, memory_root, constitution_path=constitution_path)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            current_policy = load_retention_policy(memory_root)
+            if (current_policy != policy
+                    or current_policy.excludes(source_path=name, text=entry.body)
+                    or current_policy.excludes_memory_path(memory_root, name)
+                    or excludes_suggestion(conn, current_policy, memory_root, target_path=name,
+                                           source_sessions=None, texts=(result.body, result.dropped_summary))):
+                failures.append({"file": name, "error": "excluded or changed retention policy"})
+                continue
+            if _compaction_pending(conn, memory_root, entry, current_policy) != snapshots:
+                failures.append({"file": name, "error": "pending suggestions changed"})
+                continue
+            if not backed_up:
+                _backup_memory(memory_root)
+                backed_up = True
+            sug_id = conn.execute(
+                "INSERT INTO suggestions(kind, target_path, body, rationale, status, base_sha256, target_existed, "
+                "consolidation_run_id) VALUES ('update', ?, ?, ?, 'pending', ?, 1, ?)",
+                (name, result.body, result.dropped_summary, entry.sha256, "compact-" + uuid.uuid4().hex),
+            ).lastrowid
+            if not _apply_suggestion(conn, memory_root, sug_dir, sug_id, "update", name, result.body, None, False,
+                                     constitution_path=constitution_path, commit=False):
+                failures.append({"file": name, "error": "apply refused"})
+                continue
+            rows = [row for row, _ in snapshots]
+            folded = [row[0] for row in rows if row[0] in result.folded_ids]
+            dropped = [row[0] for row in rows if row[0] not in result.folded_ids]
+            for row in rows:
+                if row[0] in result.folded_ids:
+                    conn.execute("UPDATE suggestions SET status='accepted', reviewed_at=CURRENT_TIMESTAMP WHERE id=?", (row[0],))
+                    _drop_suggestion_preview(sug_dir, row[6])
+                else:
+                    _reject_suggestion(conn, sug_dir, row[0], row[6], commit=False)
+            conn.commit()
+            compacted.append({"file": name, "old_chars": len(entry.body), "new_chars": len(result.body),
+                              "folded": folded, "dropped": dropped})
+        finally:
+            if conn.in_transaction:
+                conn.rollback()
+    if compacted and not _sync_recall_documents(conn, memory_root, constitution_path=constitution_path):
+        failures.append({"error": "recall synchronization failed"})
     return {"compacted": compacted, "failures": failures}
 
 

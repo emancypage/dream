@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import pytest
 
 import compact
 import dream
@@ -178,7 +179,7 @@ def test_renamed_frontmatter_is_refused(tmp_path, monkeypatch, capsys):
                                        "dropped_summary": "", "folded_ids": []})
     assert dream.cmd_delegate(args) == 1
     assert (root / "topic.md").read_text(encoding="utf-8") == _body(45_000)
-    assert _result(capsys)["failures"][0]["error"] == "frontmatter name changed"
+    assert _result(capsys)["failures"][0]["error"] == "frontmatter changed"
 
 
 ROOT = Path(__file__).parent
@@ -213,3 +214,209 @@ def test_preflight_fails_the_delegate_with_suggest_only(tmp_path, monkeypatch, c
     code, lines = _preflight(tmp_path, monkeypatch, capsys, {
         "review": {"mode": "suggest-only"}, "delegate": {"enabled": True}, "stages": {"delegate": {"model": "m"}}})
     assert code == 1 and "FAIL  delegate: requires review.mode = auto-apply" in lines
+
+
+@pytest.mark.parametrize("field", ["body", "rationale", "find_text", "source_sessions"])
+def test_retention_excluded_suggestion_fields_are_not_sent_or_decided(tmp_path, monkeypatch, capsys, field):
+    root, conn, args = _setup(tmp_path)
+    (root / "topic.md").write_text(_body(45_000), encoding="utf-8")
+    (root / ".dream-retention.json").write_text(json.dumps({"text_markers": ["PRIVATE-MARKER"], "project_slugs": ["excluded"]}))
+    sug_id = _suggest(conn, "topic.md")
+    value = "PRIVATE-MARKER"
+    if field == "source_sessions":
+        conn.execute("INSERT INTO sessions(session_id, project_slug, jsonl_path, jsonl_mtime) VALUES ('excluded-session', 'excluded', '/synthetic/excluded.jsonl', 0)")
+        value = "excluded-session"
+    conn.execute(f"UPDATE suggestions SET {field}=? WHERE id=?", (value, sug_id))
+    conn.commit()
+    prompts = _fake(monkeypatch, lambda prompt: {"body": _body(20_000), "dropped_summary": "", "folded_ids": []})
+    assert dream.cmd_delegate(args) == 0
+    assert f'"id": {sug_id}' not in prompts[0]
+    assert _status(conn, sug_id) == "pending"
+    assert _result(capsys)["compacted"][0]["dropped"] == []
+
+
+@pytest.mark.parametrize("change", ["reject", "find", "body", "new"])
+def test_changed_pending_group_aborts_compaction(tmp_path, monkeypatch, capsys, change):
+    root, conn, args = _setup(tmp_path)
+    topic = root / "topic.md"
+    topic.write_text(_body(45_000), encoding="utf-8")
+    sug_id = _suggest(conn, "topic.md")
+
+    def answer(prompt):
+        writer = dream.open_db(args.db)
+        if change == "new":
+            _suggest(writer, "topic.md")
+        else:
+            field, value = {"reject": ("status", "rejected"), "find": ("find_text", "changed"),
+                            "body": ("body", "changed")}[change]
+            writer.execute(f"UPDATE suggestions SET {field}=? WHERE id=?", (value, sug_id))
+            writer.commit()
+        writer.close()
+        return {"body": _body(20_000), "dropped_summary": "", "folded_ids": [sug_id]}
+
+    _fake(monkeypatch, answer)
+    assert dream.cmd_delegate(args) == 1
+    assert topic.read_text() == _body(45_000)
+    assert _status(conn, sug_id) == ("rejected" if change == "reject" else "pending")
+    assert _result(capsys)["failures"] == [{"file": "topic.md", "error": "pending suggestions changed"}]
+    assert not (tmp_path / "memory-backups").exists()
+
+
+@pytest.mark.parametrize("change", ["policy", "body", "dropped_summary"])
+def test_retention_is_rechecked_after_generation(tmp_path, monkeypatch, capsys, change):
+    root, conn, args = _setup(tmp_path)
+    topic = root / "topic.md"
+    topic.write_text(_body(45_000), encoding="utf-8")
+    policy = root / ".dream-retention.json"
+    policy.write_text(json.dumps({"text_markers": ["PRIVATE-MARKER"]}))
+    sug_id = _suggest(conn, "topic.md")
+
+    def answer(prompt):
+        output = {"body": _body(20_000), "dropped_summary": "", "folded_ids": [sug_id]}
+        if change == "policy":
+            policy.write_text(json.dumps({"memory_paths": ["topic.md"]}))
+        else:
+            output[change] += "PRIVATE-MARKER"
+        return output
+
+    _fake(monkeypatch, answer)
+    assert dream.cmd_delegate(args) == 1
+    assert topic.read_text() == _body(45_000)
+    assert _status(conn, sug_id) == "pending"
+    assert _result(capsys)["compacted"] == []
+    assert not (tmp_path / "memory-backups").exists()
+
+
+def test_policy_change_between_files_prevents_next_model_call(tmp_path, monkeypatch, capsys):
+    root, conn, args = _setup(tmp_path)
+    (root / "big.md").write_text(_body(50_000), encoding="utf-8")
+    (root / "topic.md").write_text(_body(45_000), encoding="utf-8")
+
+    def answer(prompt):
+        (root / ".dream-retention.json").write_text(json.dumps({"memory_paths": ["topic.md"]}))
+        return {"body": _body(20_000), "dropped_summary": "", "folded_ids": []}
+
+    prompts = _fake(monkeypatch, answer)
+    assert dream.cmd_delegate(args) == 1
+    assert len(prompts) == 1
+    assert (root / "topic.md").read_text() == _body(45_000)
+    assert _result(capsys)["compacted"] == []
+
+
+def test_oversized_files_are_reported_without_starving_eligible_topics(tmp_path, monkeypatch, capsys):
+    root, conn, args = _setup(tmp_path)
+    for name, chars in [("huge.md", 200_001), ("big.md", 200_002), ("topic.md", 45_000), ("other.md", 44_000), ("last.md", 43_000)]:
+        (root / name).write_text(_body(chars), encoding="utf-8")
+    prompts = _fake(monkeypatch, lambda prompt: {"body": _body(20_000), "dropped_summary": "", "folded_ids": []})
+    assert dream.cmd_delegate(args) == 1
+    result = _result(capsys)
+    assert len(prompts) == 2
+    assert {item["file"] for item in result["compacted"]} == {"topic.md", "other.md"}
+    assert {item["file"] for item in result["failures"]} == {"huge.md", "big.md"}
+
+
+def test_recall_finalization_failure_keeps_compacted_list_and_fails_stage(tmp_path, monkeypatch, capsys):
+    root, conn, args = _setup(tmp_path)
+    (root / "topic.md").write_text(_body(45_000), encoding="utf-8")
+    _fake(monkeypatch, lambda prompt: {"body": _body(20_000), "dropped_summary": "", "folded_ids": []})
+
+    monkeypatch.setattr(dream, "_sync_recall_documents", lambda *args, **kwargs: False)
+    assert dream.cmd_delegate(args) == 1
+    result = _result(capsys)
+    assert result["compacted"][0]["file"] == "topic.md"
+    assert (root / "topic.md").read_text() == _body(20_000)
+    assert result["failures"][0]["error"].startswith("recall synchronization failed")
+    assert "private detail" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("change", ["shrink", "delete"])
+def test_later_topic_changed_by_earlier_call_is_not_sent(tmp_path, monkeypatch, capsys, change):
+    root, conn, args = _setup(tmp_path)
+    (root / "big.md").write_text(_body(50_000), encoding="utf-8")
+    topic = root / "topic.md"
+    topic.write_text(_body(45_000), encoding="utf-8")
+
+    def answer(prompt):
+        if change == "shrink":
+            topic.write_text("owner edit", encoding="utf-8")
+        else:
+            topic.unlink()
+        return {"body": _body(20_000), "dropped_summary": "", "folded_ids": []}
+
+    prompts = _fake(monkeypatch, answer)
+    assert dream.cmd_delegate(args) == 1
+    assert len(prompts) == 1
+    result = _result(capsys)
+    assert result["failures"] == [{"file": "topic.md", "error": "apply refused"}]
+    assert (topic.read_text() if topic.exists() else None) == ("owner edit" if change == "shrink" else None)
+
+
+def test_topic_deleted_during_generation_does_not_block_next_file(tmp_path, monkeypatch, capsys):
+    root, conn, args = _setup(tmp_path)
+    big = root / "big.md"
+    big.write_text(_body(50_000), encoding="utf-8")
+    (root / "topic.md").write_text(_body(45_000), encoding="utf-8")
+
+    def answer(prompt):
+        if "# File `big.md`" in prompt:
+            big.unlink()
+        return {"body": _body(20_000), "dropped_summary": "", "folded_ids": []}
+
+    prompts = _fake(monkeypatch, answer)
+    assert dream.cmd_delegate(args) == 1
+    assert len(prompts) == 2
+    result = _result(capsys)
+    assert result["compacted"][0]["file"] == "topic.md"
+    assert result["failures"] == [{"file": "big.md", "error": "apply refused"}]
+    assert not big.exists()
+
+
+def test_expiry_commits_each_status_before_preview_deletion_error(tmp_path, monkeypatch):
+    root, conn, args = _setup(tmp_path)
+    sug_dir = root / ".suggestions"
+    sug_dir.mkdir()
+    ids = [_suggest(conn, "topic.md", age_days=15) for _ in range(2)]
+    previews = [sug_dir / f"{sug_id}.md" for sug_id in ids]
+    for sug_id, preview in zip(ids, previews):
+        preview.write_text("synthetic preview", encoding="utf-8")
+        conn.execute("UPDATE suggestions SET sug_file=? WHERE id=?", (preview.name, sug_id))
+    conn.commit()
+    unlink = Path.unlink
+
+    def failing_unlink(path, *args, **kwargs):
+        if path == previews[1]:
+            raise OSError("synthetic deletion error")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    with pytest.raises(OSError, match="synthetic deletion error"):
+        dream.expire_suggestions(conn, root, 14)
+    reader = dream.open_db(args.db)
+    try:
+        assert [_status(reader, sug_id) for sug_id in ids] == ["rejected", "rejected"]
+    finally:
+        reader.close()
+    assert not conn.in_transaction
+    assert not previews[0].exists()
+    assert previews[1].exists()
+
+
+def test_expiry_skips_suggestion_reviewed_after_selection(tmp_path, monkeypatch):
+    root, conn, args = _setup(tmp_path)
+    first, second = [_suggest(conn, "topic.md", age_days=15) for _ in range(2)]
+    removed = []
+
+    def drop_preview(sug_dir, sug_file):
+        removed.append(sug_file)
+        writer = dream.open_db(args.db)
+        try:
+            writer.execute("UPDATE suggestions SET status='accepted' WHERE id=?", (second,))
+            writer.commit()
+        finally:
+            writer.close()
+
+    monkeypatch.setattr(dream, "_drop_suggestion_preview", drop_preview)
+    assert dream.expire_suggestions(conn, root, 14) == [first]
+    assert _status(conn, first) == "rejected"
+    assert _status(conn, second) == "accepted"
+    assert removed == [None]
