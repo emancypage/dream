@@ -161,6 +161,7 @@ def test_positive_correction_requires_traits_and_rationale(env,monkeypatch):
     ({'trait_ids': []}, 'positive correction has no traits'),
     ({'trait_ids': ['trait-a', 'trait-a']}, 'positive correction has duplicate traits'),
     ({'rationale': ' \n '}, 'positive correction has blank rationale'),
+    ({'context_excerpt': 'invented excerpt'}, 'context excerpt is not copied'),
 ])
 @pytest.mark.parametrize('recover', [True, False])
 def test_positive_extraction_retries_once_with_safe_feedback(env, monkeypatch, caplog, changes, reason, recover):
@@ -223,7 +224,7 @@ def test_extraction_estimate_includes_validation_retry(env):
     assert report['call_bounds']['extraction'] == 2
 
 
-@pytest.mark.parametrize('failure', ['provider', 'evidence', 'unknown_trait'])
+@pytest.mark.parametrize('failure', ['provider', 'unknown_trait'])
 def test_other_extraction_failures_are_not_retried(env, monkeypatch, failure):
     g, cfg, conn = env
     calls = []
@@ -231,12 +232,7 @@ def test_other_extraction_failures_are_not_retried(env, monkeypatch, failure):
         calls.append(stage)
         if failure == 'provider':
             raise RuntimeError('private provider error')
-        output = extraction()
-        if failure == 'evidence':
-            output['user_correction'] = 'invented evidence'
-        else:
-            output['trait_ids'] = ['unknown']
-        return SimpleNamespace(output=output)
+        return SimpleNamespace(output=dict(extraction(), trait_ids=['unknown']))
     monkeypatch.setattr(g.backend, 'generate', fake)
     report = g.generate_pairs(conn, cfg, source='corrections', limit=1)
     assert len(report['failures']) == 1
@@ -428,8 +424,6 @@ def test_correction_can_quote_generated_message_markers(env):
 
 @pytest.mark.parametrize(('field', 'value', 'reason'), [
     ('context_excerpt', 'invented private excerpt', 'context excerpt is not copied'),
-    ('corrected_assistant_response', 'invented private response', 'assistant response is not copied'),
-    ('user_correction', 'invented private correction', 'user correction is not copied'),
     ('trait_ids', ['invented-private-trait'], 'unknown extraction trait'),
 ])
 def test_extraction_failures_report_safe_reason(env, monkeypatch, caplog, field, value, reason):
@@ -466,23 +460,48 @@ def test_insufficient_context_without_traits_is_cached_as_skipped(env, monkeypat
     assert g.estimate(conn, cfg, source='corrections', limit=1)['source_items'] == 0
 
 
-@pytest.mark.parametrize('field', ['context_excerpt', 'corrected_assistant_response', 'user_correction'])
-def test_provider_schema_constrains_copied_evidence(env, monkeypatch, field):
-    from model_types import validate_output, SchemaValidationError
+def _string_literals(node):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == 'enum':
+                yield from (v for v in value if isinstance(v, str))
+            elif key == 'const' and isinstance(value, str):
+                yield value
+            else:
+                yield from _string_literals(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _string_literals(value)
+
+
+def test_provider_schema_has_no_literal_with_quote_or_newline(env, monkeypatch):
     g, cfg, conn = env
+    conn.execute('UPDATE messages SET text=? WHERE seq=1', ('Explain "it"\nplease',))
+    conn.execute('UPDATE messages SET text=? WHERE seq=2', ('Long\nanswer "quoted"',))
+    conn.commit()
+    schemas = []
     def fake(stage, prompt, schema, **kw):
-        assert stage == 'character_extract'
-        output = extraction()
-        validate_output(output, schema)
-        changed = dict(output, **{field: 'A rewritten version'})
-        with pytest.raises(SchemaValidationError):
-            validate_output(changed, schema)
-        output['is_correction'] = False
-        return SimpleNamespace(output=output)
+        schemas.append(schema)
+        return SimpleNamespace(output=dict(extraction(), context_excerpt='Explain "it"', is_correction=False, trait_ids=[]))
     monkeypatch.setattr(g.backend, 'generate', fake)
     result = g.generate_pairs(conn, cfg, source='corrections', limit=1)
     assert result['failures'] == []
-    assert result['skipped']['negative'] == 1
+    assert schemas
+    assert [v for v in _string_literals(schemas[0]) if '"' in v or '\n' in v] == []
+
+
+def test_host_keeps_the_supplied_response_and_correction(env, monkeypatch):
+    g, cfg, conn = env
+    def fake(stage, prompt, schema, **kw):
+        if stage == 'character_generate':
+            return SimpleNamespace(output={'response': 'Brief answer'})
+        return SimpleNamespace(output=dict(extraction(), corrected_assistant_response='A rewritten version', user_correction='Also rewritten'))
+    monkeypatch.setattr(g.backend, 'generate', fake)
+    result = g.generate_pairs(conn, cfg, source='corrections', limit=1)
+    assert result['failures'] == []
+    assert result['generated'] == 1
+    moment = storage.records(conn, 'character_moments')[0]
+    assert (moment['corrected_assistant_response'], moment['user_correction']) == ('Long answer', 'Nie tak, shorter please')
 
 
 @pytest.mark.parametrize('response_limit', [37, 8000])
