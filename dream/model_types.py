@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -13,6 +14,13 @@ WORKDIR = Path.home() / ".cache" / "dream" / "workdir"
 def ensure_workdir() -> Path:
     WORKDIR.mkdir(parents=True, exist_ok=True)
     return WORKDIR
+
+
+def child_env(executable: str | None) -> dict[str, str]:
+    env = os.environ.copy()
+    if executable and os.path.isabs(executable):
+        env["PATH"] = os.pathsep.join(filter(None, [os.path.dirname(executable), env.get("PATH", "")]))
+    return env
 
 
 class ProviderError(RuntimeError):

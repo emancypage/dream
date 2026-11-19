@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 from pathlib import Path
 
-from model_types import ModelProvider, ProviderError
+from model_types import ModelProvider, ProviderError, child_env
 
 
 def create_provider(provider_type: str, settings: dict | None = None) -> ModelProvider:
@@ -37,8 +38,16 @@ def preflight_provider(config: dict) -> tuple[bool, str]:
     resolved = shutil.which(executable) if executable else None
     if not resolved:
         return False, f"executable not found: {executable}"
+    try:
+        proc = subprocess.run([resolved, "--version"], capture_output=True, text=True,
+                              timeout=10, env=child_env(resolved), check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False, f"{resolved}: cannot start"
+    if proc.returncode != 0:
+        return False, f"{resolved}: cannot start (exit {proc.returncode})"
+    version = next(iter(proc.stdout.splitlines()), "").strip()
     if provider_type == "codex-cli" and config.get("auth") == "chatgpt-subscription":
         auth = Path.home() / ".codex" / "auth.json"
         if not auth.exists():
             return False, f"ChatGPT auth not found: {auth}"
-    return True, resolved
+    return True, f"{resolved} ({version})"

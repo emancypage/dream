@@ -34,6 +34,7 @@ from model_types import (
     CallResult,
     GenerationResult,
     ProviderError,
+    child_env,
     ensure_workdir,
     validate_output,
 )
@@ -208,7 +209,7 @@ def call_codex(
         if extra_args:
             cmd.extend(extra_args)
 
-        env = os.environ.copy()
+        env = child_env(executable)
         # Force ChatGPT-subscription auth; never the paid OpenAI API.
         env.pop("OPENAI_API_KEY", None)
         env.pop("CODEX_API_KEY", None)

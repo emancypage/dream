@@ -35,6 +35,7 @@ from model_types import (
     GenerationResult,
     ProviderError,
     Usage,
+    child_env,
     validate_output,
 )
 
@@ -125,7 +126,7 @@ def call_claude(
     if extra_args:
         cmd.extend(extra_args)
 
-    env = os.environ.copy()
+    env = child_env(executable)
     # Don't let the parent session's API key be picked up — we explicitly want OAuth.
     env.pop("ANTHROPIC_API_KEY", None)
 
