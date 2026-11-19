@@ -179,3 +179,37 @@ def test_renamed_frontmatter_is_refused(tmp_path, monkeypatch, capsys):
     assert dream.cmd_delegate(args) == 1
     assert (root / "topic.md").read_text(encoding="utf-8") == _body(45_000)
     assert _result(capsys)["failures"][0]["error"] == "frontmatter name changed"
+
+
+ROOT = Path(__file__).parent
+
+
+def test_nightly_unit_runs_compaction_between_distill_and_consolidate():
+    lines = [l for l in (ROOT / "systemd" / "dream.service").read_text().splitlines() if l.startswith("ExecStart=")]
+    stages = [l.split()[2] for l in lines]
+    assert stages.index("distill") < stages.index("delegate_memory") < stages.index("consolidate")
+
+
+def _preflight(tmp_path, monkeypatch, capsys, overrides):
+    monkeypatch.setattr(dream, "preflight", lambda config: [])
+    monkeypatch.setattr(dream, "recall_preflight", lambda config, db: [])
+    cfg = load_config(tmp_path / "absent", overrides)
+    code = dream.cmd_preflight(argparse.Namespace(config=cfg, db=tmp_path / "dream.db"))
+    return code, capsys.readouterr().out.splitlines()
+
+
+def test_preflight_reports_the_delegate_off(tmp_path, monkeypatch, capsys):
+    code, lines = _preflight(tmp_path, monkeypatch, capsys, {})
+    assert code == 0 and "ok  delegate: off" in lines
+
+
+def test_preflight_reports_memory_compaction(tmp_path, monkeypatch, capsys):
+    code, lines = _preflight(tmp_path, monkeypatch, capsys, {
+        "review": {"mode": "auto-apply"}, "delegate": {"enabled": True}, "stages": {"delegate": {"model": "m"}}})
+    assert code == 0 and "ok  delegate: memory compaction over 40000 characters" in lines
+
+
+def test_preflight_fails_the_delegate_with_suggest_only(tmp_path, monkeypatch, capsys):
+    code, lines = _preflight(tmp_path, monkeypatch, capsys, {
+        "review": {"mode": "suggest-only"}, "delegate": {"enabled": True}, "stages": {"delegate": {"model": "m"}}})
+    assert code == 1 and "FAIL  delegate: requires review.mode = auto-apply" in lines

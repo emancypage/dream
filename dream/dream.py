@@ -1711,6 +1711,14 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     for name, ok, detail in recall_preflight(args.config, args.db):
         print(f"{'ok' if ok else 'FAIL'}  {name}: {detail}")
         failed = failed or not ok
+    delegate = args.config.delegate_settings()
+    if not delegate.enabled:
+        print("ok  delegate: off")
+    elif args.config.data["review"]["mode"] != "auto-apply":
+        print("FAIL  delegate: requires review.mode = auto-apply")
+        failed = True
+    else:
+        print(f"ok  delegate: memory compaction over {delegate.compact_over_chars} characters")
     consolidate = args.config.consolidate_settings()
     mode = consolidate.mode if consolidate.mode == "full" else (
         f"{consolidate.mode} ({consolidate.subset_files} topic files; the weekly dream audit covers the whole store)")
