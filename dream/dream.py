@@ -8,6 +8,7 @@ Subcommands:
   distill       Run the configured distillation stage and store JSON notes
   consolidate   Run the configured consolidation stage and propose updates
   audit         Weekly staleness audit over the whole store (remove/patch only)
+  delegate      Configured-model fallback when nobody reviews (memory: expire and condense)
   search        FTS5 search over all ingested transcripts
   recall        Read-only approved-memory query for agents (prints the recall block)
   mcp           Read-only recall tools over MCP stdio (serve), and client install/uninstall
@@ -33,6 +34,7 @@ import os
 import re
 import sqlite3
 import sys
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 from typing import Any
@@ -45,7 +47,9 @@ sys.path.insert(0, str(ROOT))
 from ingest import discover_jsonl, harvest_recall_usage, home_project_slug, ingest_file, ingest_configured_sources  # noqa: E402
 from distill import distill_session, sessions_needing_distill  # noqa: E402
 from consolidate import consolidate as run_consolidate  # noqa: E402
-from consolidate import PatchError, patch_text, run_audit, states_deletion  # noqa: E402
+from consolidate import PatchError, memory_files, patch_text, run_audit, states_deletion  # noqa: E402
+from compact import CompactionError, propose as propose_compaction, select_files as select_compaction_files  # noqa: E402
+from model_types import ProviderError  # noqa: E402
 from search import search as fts_search, session_summary  # noqa: E402
 from backend import active_backend, generate, preflight  # noqa: E402
 from config import load_config  # noqa: E402
@@ -545,6 +549,83 @@ def cmd_audit(args: argparse.Namespace) -> int:
     print(f"Auditing {memory_root} for stale memories")
     suggestions = run_audit(conn, memory_root, model=args.model, config=args.config)
     return _print_suggestions(memory_root, suggestions)
+
+
+def expire_suggestions(conn: sqlite3.Connection, memory_root: Path, days: int) -> list[int]:
+    rows = conn.execute(
+        "SELECT id, sug_file FROM suggestions WHERE status='pending' AND created_at < datetime('now', ?) ORDER BY id",
+        (f"-{days} days",),
+    ).fetchall()
+    for sug_id, sug_file in rows:
+        _reject_suggestion(conn, memory_root / ".suggestions", sug_id, sug_file)
+    return [row[0] for row in rows]
+
+
+def compact_memory(conn: sqlite3.Connection, memory_root: Path, *, config, model: str | None = None) -> dict:
+    constitution_path = config.data["character"]["constitution_path"]
+    sug_dir = memory_root / ".suggestions"
+    policy_context = load_retention_policy(memory_root).context()
+    compacted: list[dict] = []
+    failures: list[dict] = []
+    backed_up = False
+    files = memory_files(memory_root, constitution_path=constitution_path)
+    for entry in select_compaction_files(files, config.delegate_settings()):
+        name = entry.path.name
+        rows = [row for row in _pending_suggestions(conn)
+                if _safe_suggestion_target(memory_root, row[2]) == entry.path.resolve()]
+        patches = [{"id": row[0], "find": _find_text(conn, row[0]) or "", "replacement": row[3], "rationale": row[4] or ""}
+                   for row in rows if row[1] == "patch"]
+        try:
+            result = propose_compaction(entry, patches, config=config, policy_context=policy_context, model=model)
+        except CompactionError as exc:
+            failures.append({"file": name, "error": str(exc)})
+            continue
+        except ProviderError as exc:
+            failures.append({"file": name, "error": exc.code or "provider_error"})
+            continue
+        if not backed_up:
+            _backup_memory(memory_root)
+            backed_up = True
+        sug_id = conn.execute(
+            "INSERT INTO suggestions(kind, target_path, body, rationale, status, base_sha256, target_existed, "
+            "consolidation_run_id) VALUES ('update', ?, ?, ?, 'pending', ?, 1, ?)",
+            (name, result.body, result.dropped_summary, entry.sha256, "compact-" + uuid.uuid4().hex),
+        ).lastrowid
+        if not _apply_suggestion(conn, memory_root, sug_dir, sug_id, "update", name, result.body, None, False,
+                                 constitution_path=constitution_path, commit=False):
+            conn.rollback()
+            failures.append({"file": name, "error": "apply refused"})
+            continue
+        folded = [row[0] for row in rows if row[0] in result.folded_ids]
+        dropped = [row[0] for row in rows if row[0] not in result.folded_ids]
+        for row in rows:
+            if row[0] in result.folded_ids:
+                conn.execute("UPDATE suggestions SET status='accepted', reviewed_at=CURRENT_TIMESTAMP WHERE id=?", (row[0],))
+                _drop_suggestion_preview(sug_dir, row[6])
+            else:
+                _reject_suggestion(conn, sug_dir, row[0], row[6], commit=False)
+        conn.commit()
+        compacted.append({"file": name, "old_chars": len(entry.body), "new_chars": len(result.body),
+                          "folded": folded, "dropped": dropped})
+    if compacted:
+        _sync_recall_documents(conn, memory_root, constitution_path=constitution_path)
+    return {"compacted": compacted, "failures": failures}
+
+
+def cmd_delegate(args: argparse.Namespace) -> int:
+    settings = args.config.delegate_settings()
+    if not settings.enabled:
+        print("delegate disabled; skipping")
+        return 0
+    if args.config.data["review"]["mode"] != "auto-apply":
+        print("delegate memory requires review.mode = auto-apply")
+        return 1
+    conn = open_db(args.db)
+    memory_root = Path(args.memory)
+    result = {"expired": expire_suggestions(conn, memory_root, settings.suggestion_expiry_days),
+              **compact_memory(conn, memory_root, config=args.config, model=args.model)}
+    print(json.dumps(result, ensure_ascii=False))
+    return 1 if result["failures"] else 0
 
 
 def cmd_search(args: argparse.Namespace) -> int:
@@ -2054,6 +2135,13 @@ def main(argv: list[str] | None = None) -> int:
     pa.add_argument("--force", action="store_true",
                     help="Audit even when consolidate.mode is full (the nightly run already audits)")
     pa.set_defaults(func=cmd_audit)
+
+    pdel = sub.add_parser("delegate", help="Decisions the configured delegate model makes when nobody reviews")
+    pdel_sub = pdel.add_subparsers(dest="delegate_cmd", required=True)
+    pdel_mem = pdel_sub.add_parser("memory", help="Expire old suggestions and condense topic files that are too long")
+    pdel_mem.add_argument("--memory")
+    pdel_mem.add_argument("--model", default=None, help="Temporary model override")
+    pdel_mem.set_defaults(func=cmd_delegate)
 
     ps = sub.add_parser("search", help="FTS5 search over transcripts")
     ps.add_argument("query")
