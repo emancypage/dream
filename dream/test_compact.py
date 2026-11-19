@@ -41,6 +41,7 @@ def test_prompt_does_not_expand_placeholders_inside_the_data():
     ({"body": "---\nname: other\n---\nshort", "dropped_summary": "", "folded_ids": []}, "frontmatter name changed"),
     ({"body": HEAD + "short", "dropped_summary": "", "folded_ids": [9]}, "unknown folded id"),
     ({"body": HEAD + "short", "dropped_summary": "", "folded_ids": [7, 7]}, "duplicate folded id"),
+    ({"body": HEAD + "ok", "dropped_summary": "", "folded_ids": []}, "body shorter than a quarter of compact_target_chars"),
 ])
 def test_check_output_refuses(output, message):
     with pytest.raises(CompactionError, match=message):
@@ -50,7 +51,7 @@ def test_check_output_refuses(output, message):
 def test_propose_uses_the_delegate_stage_and_stops_before_the_provider_on_oversize(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(compact.backend, "generate", lambda stage, *a, **k: calls.append(stage) or SimpleNamespace(
-        output={"body": HEAD + "short", "dropped_summary": "old history", "folded_ids": []}, provider="fake", model="m"))
+        output={"body": HEAD + "x" * 10_000, "dropped_summary": "old history", "folded_ids": []}, provider="fake", model="m"))
     cfg = load_config(tmp_path / "absent")
     result = propose(_file("a.md", 41_000), [], config=cfg, policy_context="")
     assert calls == ["delegate"] and result.dropped_summary == "old history"

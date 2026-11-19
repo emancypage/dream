@@ -80,6 +80,8 @@ def check_output(entry: MemoryFile, output: dict, patch_ids: set[int],
         raise CompactionError("unknown folded id")
     if len(set(folded)) != len(folded):
         raise CompactionError("duplicate folded id")
+    if len(body) < settings.compact_target_chars // 4:
+        raise CompactionError("body shorter than a quarter of compact_target_chars")
     return body, output["dropped_summary"], folded
 
 
