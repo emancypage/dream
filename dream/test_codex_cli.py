@@ -85,3 +85,38 @@ def test_codex_reports_bounded_stderr_tail_without_error_event(monkeypatch, tmp_
 
     assert "ERROR: authentication token expired" in str(error.value)
     assert len(str(error.value)) < 2200
+
+
+def _model_error_stdout():
+    inner = {"type": "error", "status": 400,
+             "error": {"type": "invalid_request_error", "message": "private words", "code": "model_not_found"}}
+    return json.dumps({"type": "error", "message": json.dumps(inner)})
+
+
+def test_failure_code_reads_status_and_code_not_message():
+    code = codex_cli._failure_code(1, _model_error_stdout())
+    assert code == "exit_1:status_400:model_not_found"
+    assert "private" not in code
+
+
+def test_failure_code_without_error_event():
+    assert codex_cli._failure_code(127, "") == "exit_127"
+
+
+def test_call_codex_attaches_the_failure_code(monkeypatch, tmp_path):
+    monkeypatch.setattr(codex_cli, "ensure_workdir", lambda: tmp_path)
+    monkeypatch.setattr(codex_cli.subprocess, "run",
+                        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 1, stdout=_model_error_stdout(), stderr=""))
+    with pytest.raises(ProviderError) as error:
+        codex_cli.call_codex("prompt", {"type": "object"})
+    assert error.value.code == "exit_1:status_400:model_not_found"
+
+
+def test_call_codex_timeout_has_a_code(monkeypatch, tmp_path):
+    def fake_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, 1)
+    monkeypatch.setattr(codex_cli, "ensure_workdir", lambda: tmp_path)
+    monkeypatch.setattr(codex_cli.subprocess, "run", fake_run)
+    with pytest.raises(ProviderError) as error:
+        codex_cli.call_codex("prompt", {"type": "object"})
+    assert error.value.code == "timeout"

@@ -18,6 +18,10 @@ def ensure_workdir() -> Path:
 class ProviderError(RuntimeError):
     """A configured model provider could not complete a request."""
 
+    def __init__(self, message: str = "", *, code: str | None = None):
+        super().__init__(message)
+        self.code = code
+
 
 class SchemaValidationError(ProviderError):
     """A provider returned output that does not satisfy the requested schema."""

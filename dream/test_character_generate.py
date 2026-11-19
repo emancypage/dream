@@ -690,3 +690,18 @@ def test_explicit_communication_complaints_are_candidates_without_bare_negation(
     conn.execute("UPDATE messages SET text=? WHERE session_id='s' AND seq=3", (feedback,))
     conn.commit()
     assert g.estimate(conn, cfg, source='corrections', limit=1)['source_items'] == 1
+
+
+@pytest.mark.parametrize(('error', 'reason'), [
+    ({'code': 'exit_1:status_400:model_not_found'}, 'exit_1:status_400:model_not_found'),
+    ({}, 'model or runtime failure'),
+])
+def test_provider_failure_reports_its_code_without_text(env, monkeypatch, caplog, error, reason):
+    from model_types import ProviderError
+    g, cfg, conn = env
+    def fail(*a, **k):
+        raise ProviderError('secret text', **error)
+    monkeypatch.setattr(g.backend, 'generate', fail)
+    result = g.generate_pairs(conn, cfg, source='corrections', limit=1)
+    assert result['failures'][0]['reason'] == reason
+    assert 'secret' not in caplog.text

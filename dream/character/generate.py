@@ -304,7 +304,7 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
         except sqlite3.Error:
             raise
         except (ValueError,RuntimeError,TimeoutError,OSError) as exc:
-            reason=str(exc) if isinstance(exc,GenerationValidationError) else 'model or runtime failure'
+            reason=str(exc) if isinstance(exc,GenerationValidationError) else getattr(exc,'code',None) or 'model or runtime failure'
             error=type(exc).__name__
             logging.getLogger(__name__).warning('Character generation failed for %s: %s: %s',item['work_key'],error,reason)
             result['failures'].append({'work_id':item['work_key'],'error':error,'reason':reason})

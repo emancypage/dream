@@ -78,7 +78,27 @@ def _parse_json(raw: str) -> dict:
             return json.loads(body.strip())
         except json.JSONDecodeError:
             pass
-    raise ProviderError(f"could not parse codex output as JSON:\n{raw[:2000]}")
+    raise ProviderError(f"could not parse codex output as JSON:\n{raw[:2000]}", code="invalid_json")
+
+
+_ERROR_CODE = re.compile(r"[a-z0-9_.-]{1,40}")
+
+
+def _failure_code(returncode: int, stdout: str) -> str:
+    labels = [f"exit_{returncode}" if returncode else "no_output"]
+    try:
+        detail = json.loads(_failure_message(stdout) or "")
+    except ValueError:
+        detail = None
+    if isinstance(detail, dict):
+        status = detail.get("status")
+        if type(status) is int:
+            labels.append(f"status_{status}")
+        error = detail.get("error")
+        code = error.get("code") if isinstance(error, dict) else None
+        if isinstance(code, str) and _ERROR_CODE.fullmatch(code):
+            labels.append(code)
+    return ":".join(labels)[:80]
 
 
 def _failure_message(stdout: str) -> str | None:
@@ -206,7 +226,7 @@ def call_codex(
                     timeout=timeout,
                 )
             except subprocess.TimeoutExpired as e:
-                raise ProviderError(f"codex CLI timed out after {timeout}s") from e
+                raise ProviderError(f"codex CLI timed out after {timeout}s", code="timeout") from e
 
             raw = out_path.read_text(encoding="utf-8").strip() if proc.returncode == 0 and out_path.exists() else ""
             if proc.returncode == 0 and raw:
@@ -217,7 +237,7 @@ def call_codex(
                 else f"codex produced no --output-last-message\n{detail}"
             )
             if not retry_temporary_errors or attempt == 1 or proc.returncode < 0 or not _temporary_failure(proc.stdout):
-                raise ProviderError(failure)
+                raise ProviderError(failure, code=_failure_code(proc.returncode, proc.stdout))
             print(f"distill: temporary Codex error; retrying once in 5s.\n{detail}", file=sys.stderr)
             out_path.unlink(missing_ok=True)
             time.sleep(5)
