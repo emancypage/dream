@@ -554,3 +554,117 @@ def test_cli_with_unwritable_previews_finishes_compaction(tmp_path, expiry):
     assert preview.exists()
     assert (root / "topic.md").read_text() == _body(20_000)
     assert conn.execute("SELECT text FROM recall_documents WHERE source_path='topic.md'").fetchone()[0] == _body(20_000)
+
+
+@pytest.mark.parametrize("failure", ["open", "partial", "restore", "backup", "hash", "collection"])
+def test_filesystem_failure_preserves_prior_compaction_expiry_and_report(tmp_path, monkeypatch, capsys, failure):
+    root, conn, args = _setup(tmp_path)
+    first, second = root / "big.md", root / "topic.md"
+    first.write_text(_body(50_000))
+    original = _body(45_000).replace("\n", "\r\n").encode("utf-8")
+    second.write_bytes(original)
+    old = _suggest(conn, "topic.md", age_days=15)
+    pending = _suggest(conn, "topic.md")
+    _fake(monkeypatch, lambda prompt: {"body": _body(20_000), "dropped_summary": "", "folded_ids": []})
+    original_open = Path.open
+    original_hash = dream._file_sha256
+    original_backup = dream._backup_memory
+    original_files = dream.memory_files
+
+    class FailingFile:
+        def __init__(self, handle):
+            self.handle = handle
+            self.writes = 0
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return self.handle.__exit__(*exc)
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+        def write(self, value):
+            self.writes += 1
+            if self.writes > 1 and failure == "restore":
+                raise OSError("PRIVATE memory and OS detail")
+            if self.writes == 1:
+                self.handle.write(value[:10])
+                self.handle.flush()
+                raise OSError("PRIVATE memory and OS detail")
+            return self.handle.write(value)
+
+    def failing_open(path, mode="r", *open_args, **kwargs):
+        if path == second and mode == "r+b":
+            if failure == "open":
+                raise PermissionError("PRIVATE memory and OS detail")
+            if failure in {"partial", "restore"}:
+                return FailingFile(original_open(path, mode, *open_args, **kwargs))
+        return original_open(path, mode, *open_args, **kwargs)
+
+    def failing_hash(path):
+        if path == second and failure == "hash":
+            raise OSError("PRIVATE memory and OS detail")
+        return original_hash(path)
+
+    def failing_backup(path):
+        if failure in {"backup", "collection"}:
+            raise OSError("PRIVATE memory and OS detail")
+        return original_backup(path)
+
+    def failing_files(*file_args, **kwargs):
+        if failure == "collection":
+            raise PermissionError("PRIVATE memory and OS detail")
+        return original_files(*file_args, **kwargs)
+
+    monkeypatch.setattr(dream, "memory_files", failing_files)
+    monkeypatch.setattr(Path, "open", failing_open)
+    monkeypatch.setattr(dream, "_file_sha256", failing_hash)
+    monkeypatch.setattr(dream, "_backup_memory", failing_backup)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("DREAM_CONTROL_STATE_DIR", str(tmp_path / "control"))
+    for key in ("DREAM_MEMORY_ROOT", "CLAUDE_DREAM_DB"):
+        monkeypatch.delenv(key, raising=False)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(f"[storage]\nmemory_root={json.dumps(str(root))}\n"
+                           "[review]\nmode='auto-apply'\n[delegate]\nenabled=true\n"
+                           "[stages.delegate]\nmodel='fake-model'\n")
+    assert dream.main(["--config", str(config_path), "--db", str(args.db), "delegate", "memory"]) == 1
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert "PRIVATE" not in captured.out + captured.err
+    assert result["expired"] == [old]
+    assert _status(conn, old) == "rejected"
+    assert _status(conn, pending) == "pending"
+    assert not conn.in_transaction
+    if failure in {"backup", "collection"}:
+        assert result["compacted"] == []
+        assert first.read_text() == _body(50_000)
+    else:
+        assert [item["file"] for item in result["compacted"]] == ["big.md"]
+        assert first.read_text() == _body(20_000)
+        assert conn.execute("SELECT text FROM recall_documents WHERE source_path='big.md'").fetchone()[0] == _body(20_000)
+    if failure != "restore":
+        assert second.read_bytes() == original
+    else:
+        assert second.read_bytes() != original
+        assert "restore failed" in result["failures"][0]["error"]
+    assert len(result["failures"]) == 1
+    assert conn.execute("SELECT COUNT(*) FROM suggestions WHERE consolidation_run_id LIKE 'compact-%'").fetchone()[0] == (0 if failure in {"backup", "collection"} else 1)
+
+
+@pytest.mark.parametrize("alias_kind", ["symlink", "hardlink"])
+def test_compaction_preserves_file_aliases(tmp_path, monkeypatch, capsys, alias_kind):
+    import os
+
+    root, conn, args = _setup(tmp_path)
+    topic = root / "topic.md"
+    topic.write_text(_body(45_000))
+    alias = root / "topic-alias"
+    if alias_kind == "symlink":
+        alias.symlink_to(topic.name)
+    else:
+        os.link(topic, alias)
+    inode = topic.stat().st_ino
+    _fake(monkeypatch, lambda prompt: {"body": _body(20_000), "dropped_summary": "", "folded_ids": []})
+    assert dream.cmd_delegate(args) == 0
+    assert topic.stat().st_ino == alias.stat().st_ino == inode
+    assert alias.read_text() == _body(20_000)
+    assert [item["file"] for item in _result(capsys)["compacted"]] == ["topic.md"]

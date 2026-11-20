@@ -602,12 +602,22 @@ Dream records the error in `failures`, processes the remaining files, synchroniz
 the recall index and exits with code 1. The report still lists the file in `compacted`
 if Dream shortened it successfully.
 
+A filesystem error while checking, backing up or writing a topic stops the run.
+Dream rolls back that topic's suggestion changes, synchronizes earlier successful
+writes with recall, and reports them in `compacted`. The JSON report includes
+expired suggestions even if Dream could not read the memory directory. If a write
+fails partway, Dream tries to restore the original bytes. A restoration error in
+`failures` means the file may need to be recovered from the backup.
+
 **Provider executable.** `executable` under `[providers.<name>]` may be an
 absolute path. Dream then puts that file's directory first on the child
 process `PATH`, so an interpreter installed next to it (for example `node`
 beside an npm-installed `codex`) is found even when a systemd unit's `PATH`
 does not include it. `dream preflight` starts the executable with `--version`
-and fails when it cannot start.
+and fails when it cannot start. For a bare executable name, preflight and model
+calls both use the original `PATH` order. The provider check reports the version.
+Recall separately checks whether native Codex Memories could inject a second
+copy of the same context.
 
 **Provider error codes.** A failed Codex call carries a short host-written
 code built from the exit status and the provider's own status and error code,

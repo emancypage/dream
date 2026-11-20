@@ -40,7 +40,7 @@ def preflight_provider(config: dict) -> tuple[bool, str]:
         return False, f"executable not found: {executable}"
     try:
         proc = subprocess.run([resolved, "--version"], capture_output=True, text=True,
-                              timeout=10, env=child_env(resolved), check=False)
+                              timeout=10, env=child_env(executable), check=False)
     except (OSError, subprocess.TimeoutExpired):
         return False, f"{resolved}: cannot start"
     if proc.returncode != 0:

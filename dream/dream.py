@@ -592,6 +592,32 @@ def _compaction_pending(conn, memory_root, entry, policy):
     return snapshots
 
 
+class CompactionRestoreError(OSError):
+    pass
+
+
+def _write_compaction(target: Path, content: str) -> None:
+    replacement = content.encode("utf-8")
+    with target.open("r+b", buffering=0) as handle:
+        original = handle.read()
+        try:
+            handle.seek(0)
+            if handle.write(replacement) != len(replacement):
+                raise OSError("incomplete compaction write")
+            handle.truncate()
+            handle.flush()
+        except OSError:
+            try:
+                handle.seek(0)
+                if handle.write(original) != len(original):
+                    raise OSError("incomplete compaction restore")
+                handle.truncate()
+                handle.flush()
+            except OSError:
+                raise CompactionRestoreError("write failed; original restore failed") from None
+            raise
+
+
 def compact_memory(conn: sqlite3.Connection, memory_root: Path, *, config, model: str | None = None) -> dict:
     from character.safety import is_memory_control_source
 
@@ -600,74 +626,86 @@ def compact_memory(conn: sqlite3.Connection, memory_root: Path, *, config, model
     compacted: list[dict] = []
     failures: list[dict] = []
     backed_up = False
+    recall_dirty = False
     settings = config.delegate_settings()
-    files = memory_files(memory_root, constitution_path=constitution_path)
+    try:
+        files = memory_files(memory_root, constitution_path=constitution_path)
+    except OSError:
+        return {"compacted": [], "failures": [{"error": "memory collection failed"}]}
     for entry in files:
         if entry.path.name != "MEMORY.md" and len(entry.body) > max(settings.compact_over_chars, MAX_COMPACT_INPUT_CHARS):
             failures.append({"file": entry.path.name, "error": f"input longer than {MAX_COMPACT_INPUT_CHARS} characters"})
     for entry in select_compaction_files(files, settings):
         name = entry.path.name
-        policy = load_retention_policy(memory_root)
-        if (policy.excludes(source_path=name, text=entry.body) or policy.excludes_memory_path(memory_root, name)
-                or is_memory_control_source(entry.path, memory_root=memory_root, constitution_path=constitution_path)):
-            continue
-        if _file_sha256(entry.path) != entry.sha256:
-            failures.append({"file": name, "error": "apply refused"})
-            continue
-        snapshots = _compaction_pending(conn, memory_root, entry, policy)
-        patches = [{"id": row[0], "find": find or "", "replacement": row[3], "rationale": row[4] or ""}
-                   for row, find in snapshots if row[1] == "patch"]
         try:
-            if load_retention_policy(memory_root) != policy:
-                raise CompactionError("retention policy changed before compaction")
-            result = propose_compaction(entry, patches, config=config, policy_context=policy.context(), model=model)
-        except CompactionError as exc:
-            failures.append({"file": name, "error": str(exc)})
-            continue
-        except ProviderError as exc:
-            failures.append({"file": name, "error": exc.code or "provider_error"})
-            continue
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            current_policy = load_retention_policy(memory_root)
-            if (current_policy != policy
-                    or current_policy.excludes(source_path=name, text=entry.body)
-                    or current_policy.excludes_memory_path(memory_root, name)
-                    or excludes_suggestion(conn, current_policy, memory_root, target_path=name,
-                                           source_sessions=None, texts=(result.body, result.dropped_summary))):
-                failures.append({"file": name, "error": "excluded or changed retention policy"})
+            policy = load_retention_policy(memory_root)
+            if (policy.excludes(source_path=name, text=entry.body) or policy.excludes_memory_path(memory_root, name)
+                    or is_memory_control_source(entry.path, memory_root=memory_root, constitution_path=constitution_path)):
                 continue
-            if _compaction_pending(conn, memory_root, entry, current_policy) != snapshots:
-                failures.append({"file": name, "error": "pending suggestions changed"})
-                continue
-            if not backed_up:
-                _backup_memory(memory_root)
-                backed_up = True
-            sug_id = conn.execute(
-                "INSERT INTO suggestions(kind, target_path, body, rationale, status, base_sha256, target_existed, "
-                "consolidation_run_id) VALUES ('update', ?, ?, ?, 'pending', ?, 1, ?)",
-                (name, result.body, result.dropped_summary, entry.sha256, "compact-" + uuid.uuid4().hex),
-            ).lastrowid
-            if not _apply_suggestion(conn, memory_root, sug_dir, sug_id, "update", name, result.body, None, False,
-                                     constitution_path=constitution_path, commit=False, diagnostic_stream=sys.stderr):
+            if _file_sha256(entry.path) != entry.sha256:
                 failures.append({"file": name, "error": "apply refused"})
                 continue
-            rows = [row for row, _ in snapshots]
-            folded = [row[0] for row in rows if row[0] in result.folded_ids]
-            dropped = [row[0] for row in rows if row[0] not in result.folded_ids]
-            for row in rows:
-                status = "accepted" if row[0] in result.folded_ids else "rejected"
-                conn.execute("UPDATE suggestions SET status=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
-                             (status, row[0]))
-            conn.commit()
-            compacted.append({"file": name, "old_chars": len(entry.body), "new_chars": len(result.body),
-                              "folded": folded, "dropped": dropped})
-            for row in rows:
-                _cleanup_delegate_preview(sug_dir, row[0], row[6], failures, file_name=name)
-        finally:
-            if conn.in_transaction:
-                conn.rollback()
-    if compacted and not _sync_recall_documents(conn, memory_root, constitution_path=constitution_path):
+            snapshots = _compaction_pending(conn, memory_root, entry, policy)
+            patches = [{"id": row[0], "find": find or "", "replacement": row[3], "rationale": row[4] or ""}
+                       for row, find in snapshots if row[1] == "patch"]
+            try:
+                if load_retention_policy(memory_root) != policy:
+                    raise CompactionError("retention policy changed before compaction")
+                result = propose_compaction(entry, patches, config=config, policy_context=policy.context(), model=model)
+            except CompactionError as exc:
+                failures.append({"file": name, "error": str(exc)})
+                continue
+            except ProviderError as exc:
+                failures.append({"file": name, "error": exc.code or "provider_error"})
+                continue
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                current_policy = load_retention_policy(memory_root)
+                if (current_policy != policy
+                        or current_policy.excludes(source_path=name, text=entry.body)
+                        or current_policy.excludes_memory_path(memory_root, name)
+                        or excludes_suggestion(conn, current_policy, memory_root, target_path=name,
+                                               source_sessions=None, texts=(result.body, result.dropped_summary))):
+                    failures.append({"file": name, "error": "excluded or changed retention policy"})
+                    continue
+                if _compaction_pending(conn, memory_root, entry, current_policy) != snapshots:
+                    failures.append({"file": name, "error": "pending suggestions changed"})
+                    continue
+                if not backed_up:
+                    _backup_memory(memory_root)
+                    backed_up = True
+                sug_id = conn.execute(
+                    "INSERT INTO suggestions(kind, target_path, body, rationale, status, base_sha256, target_existed, "
+                    "consolidation_run_id) VALUES ('update', ?, ?, ?, 'pending', ?, 1, ?)",
+                    (name, result.body, result.dropped_summary, entry.sha256, "compact-" + uuid.uuid4().hex),
+                ).lastrowid
+                if not _apply_suggestion(conn, memory_root, sug_dir, sug_id, "update", name, result.body, None, False,
+                                         constitution_path=constitution_path, commit=False, diagnostic_stream=sys.stderr,
+                                         update_writer=_write_compaction):
+                    failures.append({"file": name, "error": "apply refused"})
+                    continue
+                rows = [row for row, _ in snapshots]
+                folded = [row[0] for row in rows if row[0] in result.folded_ids]
+                dropped = [row[0] for row in rows if row[0] not in result.folded_ids]
+                for row in rows:
+                    status = "accepted" if row[0] in result.folded_ids else "rejected"
+                    conn.execute("UPDATE suggestions SET status=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
+                                 (status, row[0]))
+                conn.commit()
+                compacted.append({"file": name, "old_chars": len(entry.body), "new_chars": len(result.body),
+                                  "folded": folded, "dropped": dropped})
+                for row in rows:
+                    _cleanup_delegate_preview(sug_dir, row[0], row[6], failures, file_name=name)
+            finally:
+                if conn.in_transaction:
+                    conn.rollback()
+        except OSError as exc:
+            restore_failed = isinstance(exc, CompactionRestoreError)
+            recall_dirty = recall_dirty or restore_failed
+            failures.append({"file": name, "error": "write failed; original restore failed" if restore_failed
+                             else "filesystem operation failed"})
+            break
+    if (compacted or recall_dirty) and not _sync_recall_documents(conn, memory_root, constitution_path=constitution_path):
         failures.append({"error": "recall synchronization failed"})
     return {"compacted": compacted, "failures": failures}
 
@@ -838,7 +876,7 @@ def _find_text(conn: sqlite3.Connection, sug_id) -> str | None:
 def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
                       sug_id, kind, target_path, new_content, sug_file,
                       sync_recall: bool = True, *, constitution_path, commit: bool = True,
-                      reviewed_index: dict[str, str] | None = None, diagnostic_stream=None) -> bool:
+                      reviewed_index: dict[str, str] | None = None, diagnostic_stream=None, update_writer=None) -> bool:
     """Accept one suggestion: write/merge/delete the target, mark accepted, drop the preview.
 
     Refuses (marks 'rejected' instead of touching the filesystem) if target_path would
@@ -922,7 +960,10 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
         if kind == "remove" and tgt.exists():
             tgt.unlink()
         elif kind in ("new", "update", "index"):
-            tgt.write_text(new_content, encoding="utf-8")
+            if update_writer is None:
+                tgt.write_text(new_content, encoding="utf-8")
+            else:
+                update_writer(tgt, new_content)
         elif kind == "patch":
             try:
                 apply_patch(tgt, find or "", new_content or "", expected_sha=base_sha, allow_empty=allow_empty)
