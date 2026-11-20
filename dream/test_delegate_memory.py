@@ -420,7 +420,9 @@ def test_expiry_skips_suggestion_reviewed_after_selection(tmp_path, monkeypatch)
             writer.close()
 
     monkeypatch.setattr(dream, "_drop_suggestion_preview", drop_preview)
-    assert dream.expire_suggestions(conn, root, 14, failures=[]) == [first]
+    expired = []
+    dream.expire_suggestions(conn, root, 14, failures=[], expired=expired)
+    assert expired == [first]
     assert _status(conn, first) == "rejected"
     assert _status(conn, second) == "accepted"
     assert removed == [None]
@@ -668,3 +670,221 @@ def test_compaction_preserves_file_aliases(tmp_path, monkeypatch, capsys, alias_
     assert topic.stat().st_ino == alias.stat().st_ino == inode
     assert alias.read_text() == _body(20_000)
     assert [item["file"] for item in _result(capsys)["compacted"]] == ["topic.md"]
+
+
+@pytest.mark.parametrize("release_before_sync", [True, False])
+def test_sqlite_lock_on_second_topic_preserves_report_and_attempts_recall(
+        tmp_path, monkeypatch, capsys, release_before_sync):
+    import sqlite3
+
+    root, conn, args = _setup(tmp_path)
+    (root / "big.md").write_text(_body(50_000))
+    original = _body(45_000).replace("\n", "\r\n").encode()
+    (root / "topic.md").write_bytes(original)
+    old = _suggest(conn, "topic.md", age_days=15)
+    pending = _suggest(conn, "topic.md")
+    previews = root / ".suggestions"
+    previews.mkdir()
+    preview = previews / "pending.md"
+    preview.write_text("synthetic preview")
+    conn.execute("UPDATE suggestions SET sug_file=? WHERE id=?", (preview.name, pending))
+    conn.commit()
+    blocker = sqlite3.connect(args.db)
+    opener = dream.open_db
+
+    def short_timeout(path):
+        opened = opener(path)
+        opened.execute("PRAGMA busy_timeout = 10")
+        return opened
+
+    def answer(prompt):
+        if "# File `topic.md`" in prompt:
+            blocker.execute("BEGIN IMMEDIATE")
+        return {"body": _body(20_000), "dropped_summary": "", "folded_ids": []}
+
+    sync = dream._sync_recall_documents
+    attempts = []
+
+    def synchronize(*sync_args, **kwargs):
+        attempts.append(True)
+        if release_before_sync:
+            blocker.rollback()
+        return sync(*sync_args, **kwargs)
+
+    monkeypatch.setattr(dream, "open_db", short_timeout)
+    monkeypatch.setattr(dream, "_sync_recall_documents", synchronize)
+    _fake(monkeypatch, answer)
+    try:
+        assert dream.cmd_delegate(args) == 1
+    finally:
+        blocker.close()
+    result = _result(capsys)
+    assert attempts == [True]
+    assert result["expired"] == [old]
+    assert [item["file"] for item in result["compacted"]] == ["big.md"]
+    assert result["failures"] == ([{"file": "topic.md", "error": "storage operation failed"}]
+                                   + ([] if release_before_sync else [{"error": "recall synchronization failed"}]))
+    assert _status(conn, old) == "rejected"
+    assert _status(conn, pending) == "pending"
+    assert preview.read_text() == "synthetic preview"
+    assert (root / "topic.md").read_bytes() == original
+    assert conn.execute("SELECT COUNT(*) FROM suggestions WHERE consolidation_run_id LIKE 'compact-%'").fetchone()[0] == 1
+    if release_before_sync:
+        assert conn.execute("SELECT text FROM recall_documents WHERE source_path='big.md'").fetchone()[0] == _body(20_000)
+
+
+@pytest.mark.parametrize("later_change", [None, "edit", "replace"])
+def test_sqlite_commit_lock_restores_only_unchanged_topic(tmp_path, monkeypatch, capsys, later_change):
+    import sqlite3
+
+    root, conn, args = _setup(tmp_path)
+    topic = root / "topic.md"
+    original = _body(45_000).replace("\n", "\r\n").encode()
+    topic.write_bytes(original)
+    pending = _suggest(conn, "topic.md")
+    conn.execute("PRAGMA journal_mode = DELETE")
+    reader = sqlite3.connect(args.db)
+    opener, writer = dream.open_db, dream._write_compaction
+
+    def short_timeout(path):
+        opened = opener(path)
+        opened.execute("PRAGMA journal_mode = DELETE")
+        opened.execute("PRAGMA busy_timeout = 10")
+        return opened
+
+    def write_with_reader(target, content):
+        original = writer(target, content)
+        if isinstance(content, str):
+            reader.execute("BEGIN")
+            reader.execute("SELECT COUNT(*) FROM suggestions").fetchone()
+            if later_change == "edit":
+                target.write_text("synthetic owner edit")
+            elif later_change == "replace":
+                replacement = root / "replacement"
+                replacement.write_text(content)
+                replacement.replace(target)
+        return original
+
+    monkeypatch.setattr(dream, "open_db", short_timeout)
+    monkeypatch.setattr(dream, "_write_compaction", write_with_reader)
+    sync = dream._sync_recall_documents
+
+    def synchronize(*sync_args, **kwargs):
+        reader.rollback()
+        return sync(*sync_args, **kwargs)
+
+    monkeypatch.setattr(dream, "_sync_recall_documents", synchronize)
+    _fake(monkeypatch, lambda prompt: {"body": _body(20_000), "dropped_summary": "", "folded_ids": [pending]})
+    try:
+        assert dream.cmd_delegate(args) == 1
+    finally:
+        reader.close()
+    error = "storage failed; original restore failed" if later_change else "storage operation failed"
+    assert _result(capsys) == {"expired": [], "compacted": [], "failures": [{"file": "topic.md", "error": error}]}
+    expected = b"synthetic owner edit" if later_change == "edit" else (_body(20_000).encode() if later_change else original)
+    assert topic.read_bytes() == expected
+    assert _status(conn, pending) == "pending"
+    assert conn.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("invalid", ["markdown", "json", "fields", "encoding", "directory"])
+def test_collection_errors_keep_expiry_and_emit_safe_json(tmp_path, monkeypatch, capsys, invalid):
+    root, conn, args = _setup(tmp_path)
+    (root / "topic.md").write_text(_body(45_000))
+    old = _suggest(conn, "topic.md", age_days=15)
+    policy = root / ".dream-retention.json"
+    if invalid == "markdown":
+        (root / "unrelated.md").write_bytes(b"PRIVATE\xff")
+    elif invalid == "json":
+        policy.write_text('{"PRIVATE')
+    elif invalid == "fields":
+        policy.write_text('{"instructions": ["PRIVATE"]}')
+    elif invalid == "encoding":
+        policy.write_bytes(b"PRIVATE\xff")
+    else:
+        iterdir = Path.iterdir
+
+        def unreadable(path):
+            if path == root:
+                raise PermissionError("PRIVATE directory listing")
+            return iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", unreadable)
+    prompts = _fake(monkeypatch, lambda prompt: {})
+    assert dream.cmd_delegate(args) == 1
+    captured = capsys.readouterr()
+    assert "PRIVATE" not in captured.out + captured.err
+    assert json.loads(captured.out) == {"expired": [old], "compacted": [], "failures": [
+        {"error": "memory collection failed"}]}
+    assert _status(conn, old) == "rejected"
+    assert (root / "topic.md").read_text() == _body(45_000)
+    assert prompts == []
+
+
+def test_invalid_policy_during_later_generation_keeps_committed_topics(tmp_path, monkeypatch, capsys):
+    root, conn, args = _setup(tmp_path)
+    (root / "big.md").write_text(_body(50_000))
+    (root / "topic.md").write_text(_body(45_000))
+    old = _suggest(conn, "topic.md", age_days=15)
+    pending = _suggest(conn, "topic.md")
+
+    def answer(prompt):
+        if "# File `topic.md`" in prompt:
+            (root / ".dream-retention.json").write_text('{"PRIVATE')
+        return {"body": _body(20_000), "dropped_summary": "", "folded_ids": []}
+
+    prompts = _fake(monkeypatch, answer)
+    assert dream.cmd_delegate(args) == 1
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert "PRIVATE" not in captured.out + captured.err
+    assert result["expired"] == [old]
+    assert [item["file"] for item in result["compacted"]] == ["big.md"]
+    assert result["failures"] == [{"file": "topic.md", "error": "invalid retention policy"},
+                                   {"error": "recall synchronization failed"}]
+    assert _status(conn, pending) == "pending"
+    assert (root / "topic.md").read_text() == _body(45_000)
+    assert (root / "big.md").read_text() == _body(20_000)
+    assert len(prompts) == 2
+
+
+@pytest.mark.parametrize("failure", ["open", "expiry"])
+def test_cli_storage_failure_emits_json_and_keeps_committed_expiry(tmp_path, monkeypatch, capsys, failure):
+    import sqlite3
+
+    root, conn, args = _setup(tmp_path)
+    ids = [_suggest(conn, "topic.md", age_days=15) for _ in range(2)]
+    previews = root / ".suggestions"
+    previews.mkdir()
+    for sug_id in ids:
+        (previews / f"{sug_id}.md").write_text("synthetic preview")
+        conn.execute("UPDATE suggestions SET sug_file=? WHERE id=?", (f"{sug_id}.md", sug_id))
+    conn.commit()
+    blocker = sqlite3.connect(args.db)
+    opener, drop = dream.open_db, dream._drop_suggestion_preview
+
+    def short_timeout(path):
+        opened = opener(path)
+        opened.execute("PRAGMA busy_timeout = 10")
+        return opened
+
+    def lock_after_first(*drop_args):
+        drop(*drop_args)
+        blocker.execute("BEGIN IMMEDIATE")
+
+    monkeypatch.setattr(dream, "open_db", short_timeout)
+    monkeypatch.setattr(dream, "_drop_suggestion_preview", lock_after_first)
+    monkeypatch.setattr(dream, "load_config", lambda *unused_args, **kwargs: args.config)
+    monkeypatch.setattr(dream, "is_paused", lambda: False)
+    database = args.db
+    if failure == "open":
+        database = tmp_path / "database-directory"
+        database.mkdir()
+    try:
+        assert dream.main(["--db", str(database), "delegate", "memory"]) == 1
+    finally:
+        blocker.close()
+    assert _result(capsys) == {"expired": ids[:1] if failure == "expiry" else [], "compacted": [],
+                              "failures": [{"error": "delegate storage access failed"}]}
+    assert [_status(conn, sug_id) for sug_id in ids] == (["rejected", "pending"] if failure == "expiry" else ["pending", "pending"])
+    assert (previews / f"{ids[1]}.md").exists()

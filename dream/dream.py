@@ -61,7 +61,7 @@ from recall_hook_state import claim_hook_event, finish_hook_event, successful_se
 from recall_render import delivered_ids  # noqa: E402
 from recall_hooks import install_hooks, uninstall_hooks  # noqa: E402
 from storage import open_db_readonly  # noqa: E402
-from retention_policy import POLICY_FILE, excludes_source_sessions, excludes_suggestion, load_retention_policy  # noqa: E402
+from retention_policy import RetentionPolicyError, POLICY_FILE, excludes_source_sessions, excludes_suggestion, load_retention_policy  # noqa: E402
 from pause_control import PAUSE_NOTICE, is_paused, pause, resume  # noqa: E402
 
 
@@ -552,12 +552,11 @@ def cmd_audit(args: argparse.Namespace) -> int:
 
 
 def expire_suggestions(conn: sqlite3.Connection, memory_root: Path, days: int, *,
-                       failures: list[dict]) -> list[int]:
+                       failures: list[dict], expired: list[int]) -> None:
     rows = conn.execute(
         "SELECT id, sug_file FROM suggestions WHERE status='pending' AND created_at < datetime('now', ?) ORDER BY id",
         (f"-{days} days",),
     ).fetchall()
-    expired = []
     for sug_id, sug_file in rows:
         changed = conn.execute(
             "UPDATE suggestions SET status='rejected', reviewed_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'",
@@ -567,7 +566,6 @@ def expire_suggestions(conn: sqlite3.Connection, memory_root: Path, days: int, *
         if changed:
             expired.append(sug_id)
             _cleanup_delegate_preview(memory_root / ".suggestions", sug_id, sug_file, failures)
-    return expired
 
 
 def _cleanup_delegate_preview(sug_dir, sug_id, sug_file, failures, *, file_name=None):
@@ -596,8 +594,8 @@ class CompactionRestoreError(OSError):
     pass
 
 
-def _write_compaction(target: Path, content: str) -> None:
-    replacement = content.encode("utf-8")
+def _write_compaction(target: Path, content: str | bytes) -> bytes:
+    replacement = content.encode("utf-8") if isinstance(content, str) else content
     with target.open("r+b", buffering=0) as handle:
         original = handle.read()
         try:
@@ -616,6 +614,7 @@ def _write_compaction(target: Path, content: str) -> None:
             except OSError:
                 raise CompactionRestoreError("write failed; original restore failed") from None
             raise
+    return original
 
 
 def compact_memory(conn: sqlite3.Connection, memory_root: Path, *, config, model: str | None = None) -> dict:
@@ -630,13 +629,22 @@ def compact_memory(conn: sqlite3.Connection, memory_root: Path, *, config, model
     settings = config.delegate_settings()
     try:
         files = memory_files(memory_root, constitution_path=constitution_path)
-    except OSError:
+    except (OSError, UnicodeDecodeError, RetentionPolicyError):
         return {"compacted": [], "failures": [{"error": "memory collection failed"}]}
     for entry in files:
         if entry.path.name != "MEMORY.md" and len(entry.body) > max(settings.compact_over_chars, MAX_COMPACT_INPUT_CHARS):
             failures.append({"file": entry.path.name, "error": f"input longer than {MAX_COMPACT_INPUT_CHARS} characters"})
     for entry in select_compaction_files(files, settings):
         name = entry.path.name
+        original = None
+        restore_failed = False
+
+        def write_topic(target, content):
+            nonlocal original
+            identity = target.stat()
+            saved = _write_compaction(target, content)
+            original = (saved, identity.st_dev, identity.st_ino)
+
         try:
             policy = load_retention_policy(memory_root)
             if (policy.excludes(source_path=name, text=entry.body) or policy.excludes_memory_path(memory_root, name)
@@ -681,7 +689,7 @@ def compact_memory(conn: sqlite3.Connection, memory_root: Path, *, config, model
                 ).lastrowid
                 if not _apply_suggestion(conn, memory_root, sug_dir, sug_id, "update", name, result.body, None, False,
                                          constitution_path=constitution_path, commit=False, diagnostic_stream=sys.stderr,
-                                         update_writer=_write_compaction):
+                                         update_writer=write_topic):
                     failures.append({"file": name, "error": "apply refused"})
                     continue
                 rows = [row for row, _ in snapshots]
@@ -692,13 +700,33 @@ def compact_memory(conn: sqlite3.Connection, memory_root: Path, *, config, model
                     conn.execute("UPDATE suggestions SET status=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
                                  (status, row[0]))
                 conn.commit()
+                original = None
                 compacted.append({"file": name, "old_chars": len(entry.body), "new_chars": len(result.body),
                                   "folded": folded, "dropped": dropped})
                 for row in rows:
                     _cleanup_delegate_preview(sug_dir, row[0], row[6], failures, file_name=name)
+            except sqlite3.OperationalError:
+                if original is not None:
+                    try:
+                        current = entry.path.stat()
+                        if ((current.st_dev, current.st_ino) != original[1:]
+                                or entry.path.read_bytes() != result.body.encode("utf-8")):
+                            raise OSError("compacted target changed before restore")
+                        _write_compaction(entry.path, original[0])
+                    except OSError:
+                        restore_failed = True
+                        recall_dirty = True
+                raise
             finally:
                 if conn.in_transaction:
                     conn.rollback()
+        except sqlite3.OperationalError:
+            failures.append({"file": name, "error": "storage failed; original restore failed" if restore_failed
+                             else "storage operation failed"})
+            break
+        except RetentionPolicyError:
+            failures.append({"file": name, "error": "invalid retention policy"})
+            break
         except OSError as exc:
             restore_failed = isinstance(exc, CompactionRestoreError)
             recall_dirty = recall_dirty or restore_failed
@@ -718,12 +746,21 @@ def cmd_delegate(args: argparse.Namespace) -> int:
     if args.config.data["review"]["mode"] != "auto-apply":
         print("delegate memory requires review.mode = auto-apply")
         return 1
-    conn = open_db(args.db)
-    memory_root = Path(args.memory)
-    failures: list[dict] = []
-    expired = expire_suggestions(conn, memory_root, settings.suggestion_expiry_days, failures=failures)
-    result = {"expired": expired, **compact_memory(conn, memory_root, config=args.config, model=args.model)}
-    result["failures"] = failures + result["failures"]
+    conn = None
+    result = {"expired": [], "compacted": [], "failures": []}
+    try:
+        conn = open_db(args.db)
+        memory_root = Path(args.memory)
+        expire_suggestions(conn, memory_root, settings.suggestion_expiry_days,
+                           failures=result["failures"], expired=result["expired"])
+        compacted = compact_memory(conn, memory_root, config=args.config, model=args.model)
+        result["compacted"] = compacted["compacted"]
+        result["failures"].extend(compacted["failures"])
+    except (sqlite3.OperationalError, OSError):
+        result["failures"].append({"error": "delegate storage access failed"})
+    finally:
+        if conn is not None:
+            conn.close()
     print(json.dumps(result, ensure_ascii=False))
     return 1 if result["failures"] else 0
 

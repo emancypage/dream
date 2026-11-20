@@ -9,6 +9,10 @@ from pathlib import Path
 POLICY_FILE = ".dream-retention.json"
 
 
+class RetentionPolicyError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class RetentionPolicy:
     instructions: str = ""
@@ -49,21 +53,24 @@ def load_retention_policy(memory_root: Path | None) -> RetentionPolicy:
     path = Path(memory_root) / POLICY_FILE
     if not path.exists():
         return RetentionPolicy()
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise RetentionPolicyError("invalid local retention policy encoding or JSON") from None
     if not isinstance(data, dict) or set(data) - {"instructions", "memory_paths", "project_slugs", "text_markers", "session_ids"}:
-        raise ValueError("invalid local retention policy fields")
+        raise RetentionPolicyError("invalid local retention policy fields")
     if not isinstance(data.get("instructions", ""), str):
-        raise ValueError("retention instructions must be text")
+        raise RetentionPolicyError("retention instructions must be text")
     values = {}
     for key in ("memory_paths", "project_slugs", "text_markers", "session_ids"):
         value = data.get(key, [])
         if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
-            raise ValueError(f"retention {key} must contain nonempty strings")
+            raise RetentionPolicyError(f"retention {key} must contain nonempty strings")
         values[key] = tuple(value)
     for name in values["memory_paths"]:
         relative = Path(name)
         if relative.is_absolute() or ".." in relative.parts or relative.name in {"MEMORY.md", POLICY_FILE}:
-            raise ValueError("retention memory path must be a relative topic file")
+            raise RetentionPolicyError("retention memory path must be a relative topic file")
     values["memory_paths"] = tuple(str(Path(name)) for name in values["memory_paths"])
     return RetentionPolicy(instructions=data.get("instructions", ""), **values)
 

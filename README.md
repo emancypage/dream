@@ -602,12 +602,19 @@ Dream records the error in `failures`, processes the remaining files, synchroniz
 the recall index and exits with code 1. The report still lists the file in `compacted`
 if Dream shortened it successfully.
 
-A filesystem error while checking, backing up or writing a topic stops the run.
-Dream rolls back that topic's suggestion changes, synchronizes earlier successful
-writes with recall, and reports them in `compacted`. The JSON report includes
-expired suggestions even if Dream could not read the memory directory. If a write
-fails partway, Dream tries to restore the original bytes. A restoration error in
-`failures` means the file may need to be recovered from the backup.
+If Dream cannot list the memory directory, decode a topic as UTF-8 or read a valid
+retention policy, it stops and reports a failure. The JSON report includes any
+suggestions that already expired and topics that Dream already compacted.
+
+If a filesystem error or a SQLite lock interrupts a topic, Dream stops processing
+topics and attempts to synchronize earlier successful writes with recall. If the
+database remains locked through the synchronization timeout, `failures` also
+records the index failure. The command exits with code 1.
+
+If writing a file fails partway, Dream tries to restore the original bytes. If
+SQLite cannot commit after the file was written, Dream first checks that the
+file still has the same identity and contents it just wrote. A restoration error
+in `failures` means the file may need to be recovered from the backup.
 
 **Provider executable.** `executable` under `[providers.<name>]` may be an
 absolute path. Dream then puts that file's directory first on the child
