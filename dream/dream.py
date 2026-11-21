@@ -2011,6 +2011,8 @@ def _language_codes(value: str) -> tuple[str, ...]:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="dream", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    version = (ROOT.parent / "VERSION").read_text(encoding="utf-8").strip()
+    p.add_argument("--version", action="version", version=f"%(prog)s {version}")
     p.add_argument("--config", help="TOML configuration path (env: DREAM_CONFIG)")
     p.add_argument("--db", help="SQLite DB path; overrides configuration")
     sub = p.add_subparsers(dest="cmd", required=True)
