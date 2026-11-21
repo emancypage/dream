@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/emancypage/dream/compare/v0.1.0...v0.1.1) (2026-11-21)
+
+
+### Bug Fixes
+
+* run Dream release PR tests automatically ([8e67bf1](https://github.com/emancypage/dream/commit/8e67bf11a59dbcefa7b805b6b067e2d1ef402b1e))
+* show release PR test results in GitHub checks ([000e064](https://github.com/emancypage/dream/commit/000e064660bf0300d1f214c01c47bbba3857a91e))
+
 ## 0.1.0 (2026-11-21)
 
 
