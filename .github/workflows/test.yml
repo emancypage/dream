@@ -18,10 +18,12 @@ on:
 permissions:
   contents: read
 
+concurrency: dream-tests-${{ github.event_name == 'workflow_dispatch' && github.sha || github.run_id }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
+    strategy: &python-tests
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
@@ -46,3 +48,48 @@ jobs:
 
       - name: Check installer syntax
         run: bash -n install.sh
+
+  mark-release-tests-pending:
+    if: github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/release-please--branches--')
+    runs-on: ubuntu-latest
+    strategy: *python-tests
+    permissions:
+      statuses: write
+    steps:
+      - name: Show the pending test on the release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTEXT: Dream / Python ${{ matrix.python-version }}
+        run: |
+          gh api --silent --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f context="$CONTEXT" -f state=pending -f description="Running the Dream test suite" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+  report-release-tests:
+    needs: [test, mark-release-tests-pending]
+    if: always() && github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/release-please--branches--')
+    runs-on: ubuntu-latest
+    strategy: *python-tests
+    permissions:
+      actions: read
+      statuses: write
+    steps:
+      - name: Show the test result on the release PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST_JOB: test (${{ matrix.python-version }})
+          CONTEXT: Dream / Python ${{ matrix.python-version }}
+        run: |
+          jobs_url="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100"
+          job=$(gh api --paginate "$jobs_url" | jq -cs \
+            '[.[].jobs[] | select(.name == env.TEST_JOB)] | max_by(.id)') || job=null
+          conclusion=$(jq -r '.conclusion // "unknown"' <<< "$job")
+          url=$(jq -r '.html_url // empty' <<< "$job")
+          case "$conclusion" in
+            success|failure) state="$conclusion" ;;
+            *) state=error ;;
+          esac
+          gh api --silent --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f context="$CONTEXT" -f state="$state" -f description="$TEST_JOB finished: $conclusion" \
+            -f target_url="${url:-$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID}"
