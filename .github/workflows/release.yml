@@ -2,7 +2,7 @@ name: Dream releases
 
 on:
   push:
-    branches: [main]
+    branches: [codex/release-ci-verification]
   pull_request:
     branches: [main]
     types: [closed]
@@ -66,7 +66,7 @@ jobs:
     needs: publish
     if: ${{ !cancelled() && (github.event_name == 'push' || needs.publish.result == 'success') }}
     runs-on: ubuntu-latest
-    concurrency: dream-release-proposal-main
+    concurrency: dream-release-proposal-ci-verification
     outputs:
       pr-updated: ${{ steps.release.outputs.prs_created }}
     permissions:
@@ -77,7 +77,7 @@ jobs:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
-          target-branch: main
+          target-branch: codex/release-ci-verification
           skip-github-release: true
 
   dispatch-release-tests:
@@ -92,4 +92,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/test.yml/dispatches" \
-            -f ref=release-please--branches--main
+            -f ref=release-please--branches--codex/release-ci-verification
