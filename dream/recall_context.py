@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sqlite3
-import subprocess
 import time
 import tomllib
 from dataclasses import dataclass, replace
@@ -617,17 +615,6 @@ def recall_preflight(config, db_path) -> list[tuple[str, bool, str]]:
     reranker = config.recall_settings().reranker
     checks.append(("recall.reranker", not reranker.enabled or reranker.type == "none", "disabled" if not reranker.enabled else f"adapter type {reranker.type}"))
     checks.append(("recall.mcp", *mcp_install_status()))
-    executable = shutil.which("codex")
-    version_ok = False
-    detail = "codex executable not found"
-    if executable:
-        try:
-            output = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=1, check=False).stdout.strip()
-            version_ok = bool(output)
-            detail = output or "codex version unavailable"
-        except (OSError, subprocess.SubprocessError) as exc:
-            detail = str(exc)
-    checks.append(("codex.version", version_ok, detail))
     memories_ok, memories_detail = codex_memories_check()
     checks.append(("codex.memories-double-injection", memories_ok, memories_detail))
     return checks

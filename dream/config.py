@@ -18,7 +18,7 @@ from recall_types import AdapterSettings, RecallSettings
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "dream" / "config.toml"
 
-_TOP_KEYS = {"storage", "stages", "providers", "sources", "review", "recall", "character", "consolidate"}
+_TOP_KEYS = {"storage", "stages", "providers", "sources", "review", "recall", "character", "consolidate", "delegate"}
 _STORAGE_KEYS = {"db_path", "memory_root"}
 _STAGE_KEYS = {"provider", "model", "reasoning_effort", "timeout_seconds"}
 _PROVIDER_KEYS = {"type", "auth", "executable", "extra_args", "refusal_fallback_model"}
@@ -72,6 +72,8 @@ _RECALL_DEFAULTS: dict[str, Any] = {
 _DEFAULT_ADAPTER = AdapterSettings(enabled=False, type="none", remote_data_egress=False)
 _CONSOLIDATE_KEYS = {"mode", "subset_files"}
 _CONSOLIDATE_MODES = {"full", "subset"}
+_DELEGATE_INT_KEYS = {"suggestion_expiry_days", "compact_over_chars", "compact_target_chars", "compact_max_files_per_run"}
+_DELEGATE_KEYS = {"enabled"} | _DELEGATE_INT_KEYS
 
 
 class ConfigError(ValueError):
@@ -89,6 +91,15 @@ class ConsolidateSettings:
 
     mode: str = "full"
     subset_files: int = 15
+
+
+@dataclass(frozen=True)
+class DelegateSettings:
+    enabled: bool = False
+    suggestion_expiry_days: int = 14
+    compact_over_chars: int = 40_000
+    compact_target_chars: int = 25_000
+    compact_max_files_per_run: int = 2
 
 
 @dataclass(frozen=True)
@@ -141,6 +152,10 @@ class DreamConfig:
             mode=raw.get("mode", defaults.mode),
             subset_files=raw.get("subset_files", defaults.subset_files),
         )
+
+    def delegate_settings(self) -> DelegateSettings:
+        raw = self.data.get("delegate", {})
+        return DelegateSettings(**{key: raw[key] for key in _DELEGATE_KEYS if key in raw})
 
     @staticmethod
     def _adapter_settings(name: str, recall: dict[str, Any]) -> AdapterSettings:
@@ -309,7 +324,30 @@ def _validate(data: dict[str, Any]) -> list[str]:
     _validate_character(data)
     _validate_recall(data.get("recall", {}), optional_errors)
     _validate_consolidate(data.get("consolidate", {}))
+    _validate_delegate(data)
     return optional_errors
+
+
+def _validate_delegate(data: dict[str, Any]) -> None:
+    from curate import MAX_CURATION_FIELD_CHARS
+
+    raw = data.get("delegate", {})
+    if not isinstance(raw, dict):
+        raise ConfigError("delegate must be a table")
+    _unknown_keys("delegate", raw, _DELEGATE_KEYS)
+    if "enabled" in raw and type(raw["enabled"]) is not bool:
+        raise ConfigError("delegate.enabled must be a boolean")
+    for key in _DELEGATE_INT_KEYS & raw.keys():
+        if type(raw[key]) is not int or raw[key] <= 0:
+            raise ConfigError(f"delegate.{key} must be a positive integer")
+    settings = DelegateSettings(**{key: raw[key] for key in _DELEGATE_KEYS if key in raw})
+    if settings.compact_target_chars >= settings.compact_over_chars:
+        raise ConfigError("delegate.compact_target_chars must be below compact_over_chars")
+    if settings.compact_over_chars >= MAX_CURATION_FIELD_CHARS:
+        raise ConfigError(f"delegate.compact_over_chars must be below {MAX_CURATION_FIELD_CHARS}")
+    model = data.get("stages", {}).get("delegate", {}).get("model")
+    if settings.enabled and not (isinstance(model, str) and model.strip()):
+        raise ConfigError("delegate.enabled requires stages.delegate.model")
 
 
 def _validate_consolidate(raw: Any) -> None:

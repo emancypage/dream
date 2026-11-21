@@ -65,6 +65,7 @@ automatic recall unless duplicate injection is intentional.
 - To build the private eval fixture, run `dream eval-build --limit N` only when the user asks: it makes one distill-provider call per sampled document and writes `~/.config/dream/eval/private.json`. Never copy that file into a repository.
 - To calibrate, run `dream recall-calibrate --fixtures ~/.config/dream/eval/private.json --mode MODE` as a preview; add `--apply` only when the user asks to store the threshold.
 - When the local embedder is enabled, `dream embed` stores missing vectors and `dream embed --refresh` re-embeds after a model change; recalibrate `--mode lexical_plus_embedder` afterwards.
+- `dream delegate memory` is the nightly fallback for memory nobody curates: it expires old suggestions and condenses topic files that are too long. Do not run it unless the user asks.
 - For the weekly staleness audit, run `dream audit`; it skips while `consolidate.mode = "full"`, so pass `--force` only when the user asks. `dream consolidate --mode subset|full` overrides the configured mode for one run.
 - For memories that recall never delivers, run `dream status --usage`. It only reads; usage is evidence for review, never a reason to delete on its own.
 - `dream preflight` also reports whether the embedder is enabled, whether the MCP server entry is in the Codex or OpenCode config (for Claude Code, `claude mcp get dream`) and the consolidation mode.

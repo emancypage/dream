@@ -3,7 +3,7 @@ import metrics
 
 
 def test_nightly_character_stages_are_separate_provider_neutral_commands(tmp_path):
-    assert metrics.STAGES == ('ingest', 'distill', 'consolidate', 'curation', 'character_generate', 'character_judge')
+    assert metrics.STAGES == ('ingest', 'distill', 'delegate_memory', 'consolidate', 'curation', 'character_generate', 'character_judge')
     service = (Path(__file__).parent / 'systemd/dream.service').read_text()
     backup = 'ExecStartPre=%h/.local/bin/dream character backup'
     assert service.count(backup) == 1
