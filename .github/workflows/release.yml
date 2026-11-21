@@ -20,6 +20,10 @@ jobs:
       github.event.pull_request.user.login == 'github-actions[bot]' &&
       contains(github.event.pull_request.labels.*.name, 'autorelease: pending')
     uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+      actions: read
+      statuses: write
     with:
       ref: ${{ github.event.pull_request.merge_commit_sha }}
 
