@@ -7,7 +7,6 @@
 
 * run Dream release PR tests automatically ([8e67bf1](https://github.com/emancypage/dream/commit/8e67bf11a59dbcefa7b805b6b067e2d1ef402b1e))
 * show release PR test results in GitHub checks ([000e064](https://github.com/emancypage/dream/commit/000e064660bf0300d1f214c01c47bbba3857a91e))
-* show release PR test results in GitHub checks ([cf3c1cc](https://github.com/emancypage/dream/commit/cf3c1cca7afe58cc85e8f30b7d32b10cced91961))
 
 ## 0.1.0 (2026-11-21)
 
