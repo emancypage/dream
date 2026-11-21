@@ -62,9 +62,10 @@ commit messages that reach `main` (the PR title when squash-merging).
 
 Release Please keeps one release PR open as changes accumulate. It proposes
 the next version in `VERSION` and adds an entry to `CHANGELOG.md`. The first
-release is `v0.1.0`. Review that entry and add any upgrade instructions just
-before merging the release PR. Its merge starts the test suite on the merged
-commit. Once tests pass, the workflow publishes that commit with the reviewed
+release is `v0.1.0`. Each time Release Please opens or updates the release PR,
+it starts the test suite on the release branch. Review the results and add any
+upgrade instructions to the changelog before merging. The workflow tests the
+merged commit again. Once tests pass, it publishes that commit with the reviewed
 changelog entry as its GitHub Release description. Ordinary merges only
 refresh the proposal.
 

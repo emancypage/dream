@@ -67,12 +67,29 @@ jobs:
     if: ${{ !cancelled() && (github.event_name == 'push' || needs.publish.result == 'success') }}
     runs-on: ubuntu-latest
     concurrency: dream-release-proposal-main
+    outputs:
+      pr-updated: ${{ steps.release.outputs.prs_created }}
     permissions:
       contents: write
       pull-requests: write
       issues: write
     steps:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
         with:
           target-branch: main
           skip-github-release: true
+
+  dispatch-release-tests:
+    needs: propose
+    if: ${{ !cancelled() && needs.propose.result == 'success' && needs.propose.outputs.pr-updated == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Start tests on the release PR branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/test.yml/dispatches" \
+            -f ref=release-please--branches--main

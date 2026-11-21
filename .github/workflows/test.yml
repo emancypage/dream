@@ -3,11 +3,20 @@ name: tests
 on:
   push:
   pull_request:
+    # Release Please dispatches tests for its metadata-only changes.
+    paths-ignore:
+      - .release-please-manifest.json
+      - CHANGELOG.md
+      - VERSION
+  workflow_dispatch:
   workflow_call:
     inputs:
       ref:
         required: true
         type: string
+
+permissions:
+  contents: read
 
 jobs:
   test:
