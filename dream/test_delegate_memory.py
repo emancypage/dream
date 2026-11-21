@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -650,6 +651,27 @@ def test_filesystem_failure_preserves_prior_compaction_expiry_and_report(tmp_pat
         assert "restore failed" in result["failures"][0]["error"]
     assert len(result["failures"]) == 1
     assert conn.execute("SELECT COUNT(*) FROM suggestions WHERE consolidation_run_id LIKE 'compact-%'").fetchone()[0] == (0 if failure in {"backup", "collection"} else 1)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root lists directories regardless of their mode")
+def test_directory_unlistable_after_generation_keeps_topic_and_makes_no_empty_backup(tmp_path, monkeypatch, capsys):
+    root, conn, args = _setup(tmp_path)
+    topic = root / "topic.md"
+    topic.write_text(_body(45_000), encoding="utf-8")
+
+    def answer(prompt):
+        root.chmod(0o300)
+        return {"body": _body(20_000), "dropped_summary": "", "folded_ids": []}
+
+    _fake(monkeypatch, answer)
+    try:
+        assert dream.cmd_delegate(args) == 1
+    finally:
+        root.chmod(0o755)
+    assert topic.read_text(encoding="utf-8") == _body(45_000)
+    assert not (tmp_path / "memory-backups").exists()
+    assert _result(capsys) == {"expired": [], "compacted": [],
+                               "failures": [{"file": "topic.md", "error": "filesystem operation failed"}]}
 
 
 @pytest.mark.parametrize("alias_kind", ["symlink", "hardlink"])

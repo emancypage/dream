@@ -855,8 +855,9 @@ def _backup_memory(memory_root: Path) -> Path:
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     root = memory_root.parent / "memory-backups"
     dest = root / ts
+    files = [f for f in memory_root.iterdir() if f.match("*.md")]
     dest.mkdir(parents=True, exist_ok=True)
-    for f in memory_root.glob("*.md"):
+    for f in files:
         shutil.copy2(f, dest / f.name)
     keep = sorted(p for p in root.iterdir() if p.is_dir())
     for old in keep[:-14]:
