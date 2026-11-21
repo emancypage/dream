@@ -3,6 +3,11 @@ name: tests
 on:
   push:
   pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
 
 jobs:
   test:
@@ -13,6 +18,8 @@ jobs:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5

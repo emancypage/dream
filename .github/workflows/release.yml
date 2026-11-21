@@ -1,0 +1,78 @@
+name: Dream releases
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  test-release:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'release-please--branches--main' &&
+      github.event.pull_request.user.login == 'github-actions[bot]' &&
+      contains(github.event.pull_request.labels.*.name, 'autorelease: pending')
+    uses: ./.github/workflows/test.yml
+    with:
+      ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+  publish:
+    needs: test-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+
+      - name: Publish the reviewed changelog entry
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          tag="v$(cat VERSION)"
+          notes="$RUNNER_TEMP/dream-release-notes.md"
+          python3 .github/scripts/release_notes.py > "$notes"
+
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            if [[ "$(git rev-parse "$tag^{commit}")" != "$(git rev-parse HEAD)" ]]; then
+              echo "Tag $tag already belongs to another commit." >&2
+              exit 1
+            fi
+          fi
+          if draft=$(gh release view "$tag" --json isDraft --jq .isDraft); then
+            [[ "$draft" == false ]] || { echo "A draft already exists for $tag." >&2; exit 1; }
+          else
+            gh release create "$tag" --target "$(git rev-parse HEAD)" --title "Dream $tag" --notes-file "$notes"
+          fi
+          labels_url="repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels"
+          pending=$(gh api "$labels_url" --jq 'any(.[]; .name == "autorelease: pending")')
+          if [[ "$pending" == true ]]; then
+            gh api --method DELETE "$labels_url/autorelease%3A%20pending" --silent
+          fi
+
+  propose:
+    needs: publish
+    if: ${{ !cancelled() && (github.event_name == 'push' || needs.publish.result == 'success') }}
+    runs-on: ubuntu-latest
+    concurrency: dream-release-proposal-main
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          target-branch: main
+          skip-github-release: true

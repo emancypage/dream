@@ -17,11 +17,19 @@ For a visual walkthrough of one nightly run, see [How Dream works](https://emanc
 
 ## Install
 
+Choose a tag from [Dream releases](https://github.com/emancypage/dream/releases).
+Once the first release is published, install it in a directory you will keep:
+
 ```bash
-git clone https://github.com/emancypage/dream.git
+tag=v0.1.0  # Set this to the published version you want.
+git clone --branch "$tag" https://github.com/emancypage/dream.git
 cd dream
 ./install.sh
+dream --version
 ```
+
+For a development install, including before the first release, clone without
+`--branch "$tag"` and run the same installer.
 
 The installer creates symlinks into your **current checkout directory** and, on first install, copies the default configuration:
 
@@ -29,14 +37,36 @@ The installer creates symlinks into your **current checkout directory** and, on 
 - `skill/` → `~/.codex/skills/dream` and `~/.claude/skills/dream`
 - `dream/default-config.toml` is copied to `~/.config/dream/config.toml`, only when no configuration file exists yet.
 
-Because the links point at the checkout, update in place:
+To update an existing install (including one following `main`), select a
+published tag in the same checkout:
 
 ```bash
-cd dream   # wherever you cloned it
-git pull
+cd dream
+tag=v0.1.0  # Set this to the release you want to install.
+git fetch origin --tags
+git switch --detach "$tag"
+./install.sh
+dream --version
 ```
 
-Updating via `git pull` is safe: the installer never writes into the repository, and an existing `~/.config/dream/config.toml` is left untouched on every install.
+The installer refreshes the links and bundled service files and keeps an
+existing `~/.config/dream/config.toml`. On Linux, run
+`systemctl --user daemon-reload` if you use the bundled units.
+
+## Publishing Dream releases
+
+Enable **Allow GitHub Actions to create and approve pull requests** under
+**Settings → Actions → General → Workflow permissions** so Release Please can
+open its release PR. Use `feat:` for new features and `fix:` for fixes in the
+commit messages that reach `main` (the PR title when squash-merging).
+
+Release Please keeps one release PR open as changes accumulate. It proposes
+the next version in `VERSION` and adds an entry to `CHANGELOG.md`. The first
+release is `v0.1.0`. Review that entry and add any upgrade instructions just
+before merging the release PR. Its merge starts the test suite on the merged
+commit. Once tests pass, the workflow publishes that commit with the reviewed
+changelog entry as its GitHub Release description. Ordinary merges only
+refresh the proposal.
 
 ## Configuration
 
