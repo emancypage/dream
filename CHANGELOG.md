@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.1](https://github.com/emancypage/dream/compare/v0.1.0...v0.1.1) (2026-11-21)
+
+
+### Bug Fixes
+
+* exercise the release PR update in the isolated CI verification ([f6a203f](https://github.com/emancypage/dream/commit/f6a203fbaf05d5d718b6794669703a3b43edf633))
+* run Dream release PR tests automatically ([8e67bf1](https://github.com/emancypage/dream/commit/8e67bf11a59dbcefa7b805b6b067e2d1ef402b1e))
+* show release PR test results in GitHub checks ([fc3dc41](https://github.com/emancypage/dream/commit/fc3dc41f7b21d6162d7c70ad573f7c552722d922))
+
 ## 0.1.0 (2026-11-21)
 
 
