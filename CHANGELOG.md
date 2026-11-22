@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/emancypage/dream/compare/v0.1.1...v0.2.0) (2026-11-22)
+
+
+### Features
+
+* unattended operation, phase 1: memory delegate and provider fixes ([bb5257f](https://github.com/emancypage/dream/commit/bb5257f57b405ee4a2165643fb1907f910970901))
+
 ## [0.1.1](https://github.com/emancypage/dream/compare/v0.1.0...v0.1.1) (2026-11-21)
 
 
