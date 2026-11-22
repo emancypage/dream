@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -15,8 +16,19 @@ def ensure_workdir() -> Path:
     return WORKDIR
 
 
+def child_env(executable: str | None) -> dict[str, str]:
+    env = os.environ.copy()
+    if executable and os.path.isabs(executable):
+        env["PATH"] = os.pathsep.join(filter(None, [os.path.dirname(executable), env.get("PATH", "")]))
+    return env
+
+
 class ProviderError(RuntimeError):
     """A configured model provider could not complete a request."""
+
+    def __init__(self, message: str = "", *, code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 class SchemaValidationError(ProviderError):

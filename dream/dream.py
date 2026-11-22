@@ -8,6 +8,7 @@ Subcommands:
   distill       Run the configured distillation stage and store JSON notes
   consolidate   Run the configured consolidation stage and propose updates
   audit         Weekly staleness audit over the whole store (remove/patch only)
+  delegate      Configured-model fallback when nobody reviews (memory: expire and condense)
   search        FTS5 search over all ingested transcripts
   recall        Read-only approved-memory query for agents (prints the recall block)
   mcp           Read-only recall tools over MCP stdio (serve), and client install/uninstall
@@ -33,6 +34,7 @@ import os
 import re
 import sqlite3
 import sys
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 from typing import Any
@@ -45,7 +47,9 @@ sys.path.insert(0, str(ROOT))
 from ingest import discover_jsonl, harvest_recall_usage, home_project_slug, ingest_file, ingest_configured_sources  # noqa: E402
 from distill import distill_session, sessions_needing_distill  # noqa: E402
 from consolidate import consolidate as run_consolidate  # noqa: E402
-from consolidate import PatchError, patch_text, run_audit, states_deletion  # noqa: E402
+from consolidate import PatchError, memory_files, patch_text, run_audit, states_deletion  # noqa: E402
+from compact import MAX_COMPACT_INPUT_CHARS, CompactionError, propose as propose_compaction, select_files as select_compaction_files  # noqa: E402
+from model_types import ProviderError  # noqa: E402
 from search import search as fts_search, session_summary  # noqa: E402
 from backend import active_backend, generate, preflight  # noqa: E402
 from config import load_config  # noqa: E402
@@ -57,7 +61,7 @@ from recall_hook_state import claim_hook_event, finish_hook_event, successful_se
 from recall_render import delivered_ids  # noqa: E402
 from recall_hooks import install_hooks, uninstall_hooks  # noqa: E402
 from storage import open_db_readonly  # noqa: E402
-from retention_policy import POLICY_FILE, excludes_source_sessions, excludes_suggestion, load_retention_policy  # noqa: E402
+from retention_policy import RetentionPolicyError, POLICY_FILE, excludes_source_sessions, excludes_suggestion, load_retention_policy  # noqa: E402
 from pause_control import PAUSE_NOTICE, is_paused, pause, resume  # noqa: E402
 
 
@@ -547,6 +551,220 @@ def cmd_audit(args: argparse.Namespace) -> int:
     return _print_suggestions(memory_root, suggestions)
 
 
+def expire_suggestions(conn: sqlite3.Connection, memory_root: Path, days: int, *,
+                       failures: list[dict], expired: list[int]) -> None:
+    rows = conn.execute(
+        "SELECT id, sug_file FROM suggestions WHERE status='pending' AND created_at < datetime('now', ?) ORDER BY id",
+        (f"-{days} days",),
+    ).fetchall()
+    for sug_id, sug_file in rows:
+        changed = conn.execute(
+            "UPDATE suggestions SET status='rejected', reviewed_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'",
+            (sug_id,),
+        ).rowcount
+        conn.commit()
+        if changed:
+            expired.append(sug_id)
+            _cleanup_delegate_preview(memory_root / ".suggestions", sug_id, sug_file, failures)
+
+
+def _cleanup_delegate_preview(sug_dir, sug_id, sug_file, failures, *, file_name=None):
+    try:
+        _drop_suggestion_preview(sug_dir, sug_file)
+    except OSError:
+        failure = {"suggestion_id": sug_id, "error": "preview cleanup failed"}
+        if file_name is not None:
+            failure["file"] = file_name
+        failures.append(failure)
+
+
+def _compaction_pending(conn, memory_root, entry, policy):
+    snapshots = []
+    for row in _pending_suggestions(conn):
+        if _curation_pending_target(memory_root, row) != entry.path.resolve():
+            continue
+        find = _find_text(conn, row[0]) if row[1] == "patch" else None
+        if not excludes_suggestion(conn, policy, memory_root, target_path=row[2],
+                                   source_sessions=row[5], texts=(row[3], row[4], find)):
+            snapshots.append((tuple(row), find))
+    return snapshots
+
+
+class CompactionRestoreError(OSError):
+    pass
+
+
+def _write_compaction(target: Path, content: str | bytes) -> bytes:
+    replacement = content.encode("utf-8") if isinstance(content, str) else content
+    with target.open("r+b", buffering=0) as handle:
+        original = handle.read()
+        try:
+            handle.seek(0)
+            if handle.write(replacement) != len(replacement):
+                raise OSError("incomplete compaction write")
+            handle.truncate()
+            handle.flush()
+        except OSError:
+            try:
+                handle.seek(0)
+                if handle.write(original) != len(original):
+                    raise OSError("incomplete compaction restore")
+                handle.truncate()
+                handle.flush()
+            except OSError:
+                raise CompactionRestoreError("write failed; original restore failed") from None
+            raise
+    return original
+
+
+def compact_memory(conn: sqlite3.Connection, memory_root: Path, *, config, model: str | None = None) -> dict:
+    from character.safety import is_memory_control_source
+
+    constitution_path = config.data["character"]["constitution_path"]
+    sug_dir = memory_root / ".suggestions"
+    compacted: list[dict] = []
+    failures: list[dict] = []
+    backed_up = False
+    recall_dirty = False
+    settings = config.delegate_settings()
+    try:
+        files = memory_files(memory_root, constitution_path=constitution_path)
+    except (OSError, UnicodeDecodeError, RetentionPolicyError):
+        return {"compacted": [], "failures": [{"error": "memory collection failed"}]}
+    for entry in files:
+        if entry.path.name != "MEMORY.md" and len(entry.body) > max(settings.compact_over_chars, MAX_COMPACT_INPUT_CHARS):
+            failures.append({"file": entry.path.name, "error": f"input longer than {MAX_COMPACT_INPUT_CHARS} characters"})
+    for entry in select_compaction_files(files, settings):
+        name = entry.path.name
+        original = None
+        restore_failed = False
+
+        def write_topic(target, content):
+            nonlocal original
+            identity = target.stat()
+            saved = _write_compaction(target, content)
+            original = (saved, identity.st_dev, identity.st_ino)
+
+        try:
+            policy = load_retention_policy(memory_root)
+            if (policy.excludes(source_path=name, text=entry.body) or policy.excludes_memory_path(memory_root, name)
+                    or is_memory_control_source(entry.path, memory_root=memory_root, constitution_path=constitution_path)):
+                continue
+            if _file_sha256(entry.path) != entry.sha256:
+                failures.append({"file": name, "error": "apply refused"})
+                continue
+            snapshots = _compaction_pending(conn, memory_root, entry, policy)
+            patches = [{"id": row[0], "find": find or "", "replacement": row[3], "rationale": row[4] or ""}
+                       for row, find in snapshots if row[1] == "patch"]
+            try:
+                if load_retention_policy(memory_root) != policy:
+                    raise CompactionError("retention policy changed before compaction")
+                result = propose_compaction(entry, patches, config=config, policy_context=policy.context(), model=model)
+            except CompactionError as exc:
+                failures.append({"file": name, "error": str(exc)})
+                continue
+            except ProviderError as exc:
+                failures.append({"file": name, "error": exc.code or "provider_error"})
+                continue
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                current_policy = load_retention_policy(memory_root)
+                if (current_policy != policy
+                        or current_policy.excludes(source_path=name, text=entry.body)
+                        or current_policy.excludes_memory_path(memory_root, name)
+                        or excludes_suggestion(conn, current_policy, memory_root, target_path=name,
+                                               source_sessions=None, texts=(result.body, result.dropped_summary))):
+                    failures.append({"file": name, "error": "excluded or changed retention policy"})
+                    continue
+                if _compaction_pending(conn, memory_root, entry, current_policy) != snapshots:
+                    failures.append({"file": name, "error": "pending suggestions changed"})
+                    continue
+                if not backed_up:
+                    _backup_memory(memory_root)
+                    backed_up = True
+                sug_id = conn.execute(
+                    "INSERT INTO suggestions(kind, target_path, body, rationale, status, base_sha256, target_existed, "
+                    "consolidation_run_id) VALUES ('update', ?, ?, ?, 'pending', ?, 1, ?)",
+                    (name, result.body, result.dropped_summary, entry.sha256, "compact-" + uuid.uuid4().hex),
+                ).lastrowid
+                if not _apply_suggestion(conn, memory_root, sug_dir, sug_id, "update", name, result.body, None, False,
+                                         constitution_path=constitution_path, commit=False, diagnostic_stream=sys.stderr,
+                                         update_writer=write_topic):
+                    failures.append({"file": name, "error": "apply refused"})
+                    continue
+                rows = [row for row, _ in snapshots]
+                folded = [row[0] for row in rows if row[0] in result.folded_ids]
+                dropped = [row[0] for row in rows if row[0] not in result.folded_ids]
+                for row in rows:
+                    status = "accepted" if row[0] in result.folded_ids else "rejected"
+                    conn.execute("UPDATE suggestions SET status=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
+                                 (status, row[0]))
+                conn.commit()
+                original = None
+                compacted.append({"file": name, "old_chars": len(entry.body), "new_chars": len(result.body),
+                                  "folded": folded, "dropped": dropped})
+                for row in rows:
+                    _cleanup_delegate_preview(sug_dir, row[0], row[6], failures, file_name=name)
+            except sqlite3.OperationalError:
+                if original is not None:
+                    try:
+                        current = entry.path.stat()
+                        if ((current.st_dev, current.st_ino) != original[1:]
+                                or entry.path.read_bytes() != result.body.encode("utf-8")):
+                            raise OSError("compacted target changed before restore")
+                        _write_compaction(entry.path, original[0])
+                    except OSError:
+                        restore_failed = True
+                        recall_dirty = True
+                raise
+            finally:
+                if conn.in_transaction:
+                    conn.rollback()
+        except sqlite3.OperationalError:
+            failures.append({"file": name, "error": "storage failed; original restore failed" if restore_failed
+                             else "storage operation failed"})
+            break
+        except RetentionPolicyError:
+            failures.append({"file": name, "error": "invalid retention policy"})
+            break
+        except OSError as exc:
+            restore_failed = isinstance(exc, CompactionRestoreError)
+            recall_dirty = recall_dirty or restore_failed
+            failures.append({"file": name, "error": "write failed; original restore failed" if restore_failed
+                             else "filesystem operation failed"})
+            break
+    if (compacted or recall_dirty) and not _sync_recall_documents(conn, memory_root, constitution_path=constitution_path):
+        failures.append({"error": "recall synchronization failed"})
+    return {"compacted": compacted, "failures": failures}
+
+
+def cmd_delegate(args: argparse.Namespace) -> int:
+    settings = args.config.delegate_settings()
+    if not settings.enabled:
+        print("delegate disabled; skipping")
+        return 0
+    if args.config.data["review"]["mode"] != "auto-apply":
+        print("delegate memory requires review.mode = auto-apply")
+        return 1
+    conn = None
+    result = {"expired": [], "compacted": [], "failures": []}
+    try:
+        conn = open_db(args.db)
+        memory_root = Path(args.memory)
+        expire_suggestions(conn, memory_root, settings.suggestion_expiry_days,
+                           failures=result["failures"], expired=result["expired"])
+        compacted = compact_memory(conn, memory_root, config=args.config, model=args.model)
+        result["compacted"] = compacted["compacted"]
+        result["failures"].extend(compacted["failures"])
+    except (sqlite3.OperationalError, OSError):
+        result["failures"].append({"error": "delegate storage access failed"})
+    finally:
+        if conn is not None:
+            conn.close()
+    print(json.dumps(result, ensure_ascii=False))
+    return 1 if result["failures"] else 0
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     conn = open_db_readonly(args.db)
     hits = fts_search(conn, args.query, limit=args.limit, role=args.role, project_slug=args.project)
@@ -637,8 +855,9 @@ def _backup_memory(memory_root: Path) -> Path:
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     root = memory_root.parent / "memory-backups"
     dest = root / ts
+    files = [f for f in memory_root.iterdir() if f.match("*.md")]
     dest.mkdir(parents=True, exist_ok=True)
-    for f in memory_root.glob("*.md"):
+    for f in files:
         shutil.copy2(f, dest / f.name)
     keep = sorted(p for p in root.iterdir() if p.is_dir())
     for old in keep[:-14]:
@@ -695,7 +914,7 @@ def _find_text(conn: sqlite3.Connection, sug_id) -> str | None:
 def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
                       sug_id, kind, target_path, new_content, sug_file,
                       sync_recall: bool = True, *, constitution_path, commit: bool = True,
-                      reviewed_index: dict[str, str] | None = None) -> bool:
+                      reviewed_index: dict[str, str] | None = None, diagnostic_stream=None, update_writer=None) -> bool:
     """Accept one suggestion: write/merge/delete the target, mark accepted, drop the preview.
 
     Refuses (marks 'rejected' instead of touching the filesystem) if target_path would
@@ -715,11 +934,11 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
     protected = kind in ("remove", "patch") and resolved_target == resolved_root / "MEMORY.md"
     if is_memory_control_source(tgt, memory_root=memory_root, constitution_path=constitution_path):
         _reject_suggestion(conn, sug_dir, sug_id, sug_file, commit=commit)
-        print(f"  rejected #{sug_id}: the constitution is human-controlled")
+        print(f"  rejected #{sug_id}: the constitution is human-controlled", file=diagnostic_stream)
         return False
     if resolved_target == (resolved_root / POLICY_FILE).resolve():
         _reject_suggestion(conn, sug_dir, sug_id, sug_file, commit=commit)
-        print(f"  rejected #{sug_id}: the local retention policy is user-controlled")
+        print(f"  rejected #{sug_id}: the local retention policy is user-controlled", file=diagnostic_stream)
         return False
     state_sql = ("SELECT base_sha256, target_existed, source_sessions, body, status, target_path, kind, rationale "
                  "FROM suggestions WHERE id=?")
@@ -731,7 +950,7 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
         if (reviewed_index is None or actual_review != reviewed_index
                 or state[4] != "pending"
                 or _safe_suggestion_target(memory_root, state[5]) != resolved_target):
-            print(f"  conflict #{sug_id}: reviewed index proposal changed")
+            print(f"  conflict #{sug_id}: reviewed index proposal changed", file=diagnostic_stream)
             return False
         index_existed = tgt.exists()
         index_bytes = tgt.read_bytes() if index_existed else b""
@@ -743,7 +962,7 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
         or excludes_source_sessions(conn, policy, state[2] if state else None)
     ):
         _reject_suggestion(conn, sug_dir, sug_id, sug_file, commit=commit)
-        print(f"  rejected #{sug_id}: excluded by local memory retention policy")
+        print(f"  rejected #{sug_id}: excluded by local memory retention policy", file=diagnostic_stream)
         return False
     base_sha = state[0] if state else None
     target_existed = state[1] if state else None
@@ -753,7 +972,7 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
         base_sha is None and target_existed == 0 and tgt.exists()
     )
     if conflict:
-        print(f"  conflict #{sug_id} ({target_path}): target changed since suggestion")
+        print(f"  conflict #{sug_id} ({target_path}): target changed since suggestion", file=diagnostic_stream)
         return False
     if kind == "patch" and contained and not protected:
         find, rationale = _patch_fields(conn, sug_id)
@@ -762,33 +981,36 @@ def _apply_suggestion(conn, memory_root: Path, sug_dir: Path,
             patched = patch_text(tgt.read_bytes().decode("utf-8") if tgt.exists() else "",
                                  find or "", new_content or "", allow_empty=allow_empty)
         except (PatchError, OSError, UnicodeDecodeError) as exc:
-            print(f"  deferred #{sug_id}: {exc}")
+            print(f"  deferred #{sug_id}: {exc}", file=diagnostic_stream)
             return False
         if policy.excludes(source_path=target_path, text=patched):
             _reject_suggestion(conn, sug_dir, sug_id, sug_file, commit=commit)
-            print(f"  rejected #{sug_id}: excluded by local memory retention policy")
+            print(f"  rejected #{sug_id}: excluded by local memory retention policy", file=diagnostic_stream)
             return False
     if kind == "index" and index_bytes is not None:
         if (conn.execute(state_sql, (sug_id,)).fetchone() != state
                 or tgt.resolve() != resolved_target or tgt.exists() != index_existed
                 or (tgt.read_bytes() if index_existed else b"") != index_bytes):
-            print(f"  conflict #{sug_id}: index or reviewed proposal changed before write")
+            print(f"  conflict #{sug_id}: index or reviewed proposal changed before write", file=diagnostic_stream)
             return False
     if contained and not protected:
         tgt.parent.mkdir(parents=True, exist_ok=True)
         if kind == "remove" and tgt.exists():
             tgt.unlink()
         elif kind in ("new", "update", "index"):
-            tgt.write_text(new_content, encoding="utf-8")
+            if update_writer is None:
+                tgt.write_text(new_content, encoding="utf-8")
+            else:
+                update_writer(tgt, new_content)
         elif kind == "patch":
             try:
                 apply_patch(tgt, find or "", new_content or "", expected_sha=base_sha, allow_empty=allow_empty)
             except PatchError as exc:
-                print(f"  deferred #{sug_id}: {exc}")
+                print(f"  deferred #{sug_id}: {exc}", file=diagnostic_stream)
                 return False
         status = "accepted"
     else:
-        print(f"  refusing #{sug_id} ({target_path}): unsafe target, marking rejected")
+        print(f"  refusing #{sug_id} ({target_path}): unsafe target, marking rejected", file=diagnostic_stream)
         status = "rejected"
     conn.execute("UPDATE suggestions SET status=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?", (status, sug_id))
     if commit:
@@ -1630,6 +1852,14 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     for name, ok, detail in recall_preflight(args.config, args.db):
         print(f"{'ok' if ok else 'FAIL'}  {name}: {detail}")
         failed = failed or not ok
+    delegate = args.config.delegate_settings()
+    if not delegate.enabled:
+        print("ok  delegate: off")
+    elif args.config.data["review"]["mode"] != "auto-apply":
+        print("FAIL  delegate: requires review.mode = auto-apply")
+        failed = True
+    else:
+        print(f"ok  delegate: memory compaction over {delegate.compact_over_chars} characters")
     consolidate = args.config.consolidate_settings()
     mode = consolidate.mode if consolidate.mode == "full" else (
         f"{consolidate.mode} ({consolidate.subset_files} topic files; the weekly dream audit covers the whole store)")
@@ -2056,6 +2286,13 @@ def main(argv: list[str] | None = None) -> int:
     pa.add_argument("--force", action="store_true",
                     help="Audit even when consolidate.mode is full (the nightly run already audits)")
     pa.set_defaults(func=cmd_audit)
+
+    pdel = sub.add_parser("delegate", help="Decisions the configured delegate model makes when nobody reviews")
+    pdel_sub = pdel.add_subparsers(dest="delegate_cmd", required=True)
+    pdel_mem = pdel_sub.add_parser("memory", help="Expire old suggestions and condense topic files that are too long")
+    pdel_mem.add_argument("--memory")
+    pdel_mem.add_argument("--model", default=None, help="Temporary model override")
+    pdel_mem.set_defaults(func=cmd_delegate)
 
     ps = sub.add_parser("search", help="FTS5 search over transcripts")
     ps.add_argument("query")

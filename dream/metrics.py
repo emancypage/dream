@@ -22,7 +22,7 @@ from typing import Callable, Mapping, Sequence
 
 DEFAULT_STATE_PATH = Path.home() / ".local" / "state" / "dream" / "run.json"
 DEFAULT_STALE_AFTER = 36 * 60 * 60
-STAGES = ("ingest", "distill", "consolidate", "curation", "character_generate", "character_judge")
+STAGES = ("ingest", "distill", "delegate_memory", "consolidate", "curation", "character_generate", "character_judge")
 STATUS_VALUES = ("never", "running", "success", "failed", "stale")
 SAFE_LABEL = re.compile(r"^[a-zA-Z0-9_.:-]+$")
 

@@ -654,7 +654,7 @@ def test_retention_policy_errors_fail_closed(home, tmp_path):
     for name, arguments in (("recall_search", {"query": "postgres"}),
                             ("recall_get", {"id": stable_document_id("approved_memory", "memory:api.md")}),
                             ("memory_index", {})):
-        text = _assert_tool_error(_tool(config, db, name, arguments), "ValueError", home)
+        text = _assert_tool_error(_tool(config, db, name, arguments), "RetentionPolicyError", home)
         assert "Postgres" not in text
 
 

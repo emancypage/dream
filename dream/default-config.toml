@@ -80,6 +80,18 @@ backup_keep = 14
 mode = "full"
 subset_files = 15
 
+[delegate]
+enabled = false
+suggestion_expiry_days = 14
+compact_over_chars = 40000
+compact_target_chars = 25000
+compact_max_files_per_run = 2
+
+[stages.delegate]
+provider = "codex"
+reasoning_effort = "high"
+timeout_seconds = 600
+
 [recall]
 enabled = true
 install_hooks = false

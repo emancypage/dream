@@ -12,6 +12,7 @@ ExecStartPre=%h/.local/bin/dream-metrics start
 ExecStartPre=%h/.local/bin/dream character backup
 ExecStart=%h/.local/bin/dream-stage --continue-on-error ingest -- %h/.local/bin/dream ingest
 ExecStart=%h/.local/bin/dream-stage --continue-on-error distill -- %h/.local/bin/dream distill --yes --limit 50
+ExecStart=%h/.local/bin/dream-stage --continue-on-error delegate_memory -- %h/.local/bin/dream delegate memory
 ExecStart=%h/.local/bin/dream-stage --continue-on-error consolidate -- %h/.local/bin/dream consolidate
 ExecStart=%h/.local/bin/dream-stage --continue-on-error curation -- %h/.local/bin/dream suggestions curate-configured
 ExecStart=%h/.local/bin/dream-stage --continue-on-error character_generate -- %h/.local/bin/dream character generate --source corrections --limit 10

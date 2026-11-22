@@ -553,6 +553,7 @@ Each session records source, external identity, content revision, and parser ver
 ```text
 dream ingest
 dream distill --yes --limit 50
+dream delegate memory
 dream consolidate
 dream suggestions curate-configured
 dream character generate --source all --limit 10
@@ -581,6 +582,86 @@ systemctl --user enable --now dream-audit.timer
 ```
 
 On macOS, schedule the same commands with `launchd` or cron.
+
+## Unattended operation
+
+Some steps wait for a human: pending memory suggestions, and topic files that
+grow until curation refuses them (`curate.MAX_CURATION_FIELD_CHARS`, 60,000
+characters). The optional delegate is a configured model that acts when nobody
+does. It is off by default:
+
+```toml
+[delegate]
+enabled = false                # true turns on `dream delegate memory`
+suggestion_expiry_days = 14    # pending suggestions older than this are rejected
+compact_over_chars = 40000     # a topic file longer than this is condensed
+compact_target_chars = 25000   # size the model is asked to aim for
+compact_max_files_per_run = 2
+
+[stages.delegate]
+provider = "codex"
+model = "your-model-id"        # required when the delegate is enabled
+reasoning_effort = "high"
+timeout_seconds = 600
+```
+
+`dream delegate memory` runs in the nightly unit between `distill` and
+`consolidate`. It needs `review.mode = "auto-apply"`; with `suggest-only` it
+refuses and `dream preflight` reports `FAIL  delegate`. Each run:
+
+1. rejects pending suggestions older than `suggestion_expiry_days`;
+2. sends the longest topic files above `compact_over_chars` (never `MEMORY.md`
+   or the constitution) to the delegate with the file's pending `patch`
+   suggestions, and asks for a shorter body that folds in the patches that are
+   still valid;
+3. checks the answer (no longer than `compact_over_chars` and at least a
+   quarter of `compact_target_chars`, identical complete frontmatter (preserving
+   an original UTF-8 BOM), a `dropped_summary` of at most 2,000 characters, only
+   patch ids it was sent, unchanged file on disk, retention policy) and writes
+   it through the suggestion apply path, after a backup under `memory-backups/`;
+4. marks the folded patches accepted and rejects the file's other eligible pending
+   suggestions, because they were written against the old body.
+
+A failed check or model call writes nothing for that file and makes the stage
+exit 1; the file is tried again the next night. The command prints one JSON
+line with `expired`, `compacted` and `failures`. Files above 200,000 characters
+are reported as failures without using a compaction slot. Changed pending
+suggestions or retention rules abort the file before writing. Recall synchronization
+failures also make the stage exit 1 while preserving the list of compacted files.
+Dream deletes previews after committing suggestion statuses. If deletion fails,
+Dream records the error in `failures`, processes the remaining files, synchronizes
+the recall index and exits with code 1. The report still lists the file in `compacted`
+if Dream shortened it successfully.
+
+If Dream cannot list the memory directory, decode a topic as UTF-8 or read a valid
+retention policy, it stops and reports a failure. The JSON report includes any
+suggestions that already expired and topics that Dream already compacted.
+
+If a filesystem error or a SQLite lock interrupts a topic, Dream stops processing
+topics and attempts to synchronize earlier successful writes with recall. If the
+database remains locked through the synchronization timeout, `failures` also
+records the index failure. The command exits with code 1.
+
+If writing a file fails partway, Dream tries to restore the original bytes. If
+SQLite cannot commit after the file was written, Dream first checks that the
+file still has the same identity and contents it just wrote. A restoration error
+in `failures` means the file may need to be recovered from the backup.
+
+**Provider executable.** `executable` under `[providers.<name>]` may be an
+absolute path. Dream then puts that file's directory first on the child
+process `PATH`, so an interpreter installed next to it (for example `node`
+beside an npm-installed `codex`) is found even when a systemd unit's `PATH`
+does not include it. `dream preflight` starts the executable with `--version`
+and fails when it cannot start. For a bare executable name, preflight and model
+calls both use the original `PATH` order. The provider check reports the version.
+Recall separately checks whether native Codex Memories could inject a second
+copy of the same context.
+
+**Provider error codes.** A failed Codex call carries a short host-written
+code built from the exit status and the provider's own status and error code,
+for example `exit_1:status_400:invalid_json_schema`, `timeout` or
+`invalid_json`. `dream character generate` and `dream delegate memory` report
+that code; they never log the provider's message or model output.
 
 ## Monitoring (Linux)
 

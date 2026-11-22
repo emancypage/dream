@@ -277,7 +277,9 @@ def memory_files(memory_root: Path, *, constitution_path) -> list[MemoryFile]:
     files = []
     policy = load_retention_policy(memory_root)
     from character.safety import is_constitution_source
-    for f in sorted(memory_root.glob("*.md")):
+    for f in sorted(memory_root.iterdir()):
+        if not f.match("*.md"):
+            continue
         if is_constitution_source(f, constitution_path=constitution_path):
             continue
         if f.name.startswith("."):

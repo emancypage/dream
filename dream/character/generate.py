@@ -170,12 +170,9 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
         prompt=canonical_json(payload)
         request_schema=schema
         if stage=='character_extract':
-            # Constrain verbatim evidence at the provider boundary. Keep the
-            # host's independent evidence checks below for every returned result.
+            # Strict provider schemas reject enum strings that contain a quote or
+            # newline, so copied evidence is checked or filled by the host instead.
             properties=dict(schema['properties'])
-            properties['context_excerpt']={'type':'string','enum':[message['content'] for message in item['messages'] if message['content'].strip()]}
-            properties['corrected_assistant_response']={'type':'string','enum':[item['rejected']]}
-            properties['user_correction']={'type':'string','enum':[item['correction']]}
             properties['trait_ids']={'type':'array','items':{'type':'string','enum':list(doc.traits)},
                 'description':'Use unique approved trait IDs. A positive correction with sufficient context requires at least one trait; otherwise the list may be empty.'}
             properties['rationale']={'type':'string','maxLength':2000,
@@ -262,8 +259,11 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
                     feedback=None
                     for attempt in range(2):
                         output,meta=call(item,'character_extract','character-extract-v1.md',{'messages':item['messages'],'assistant_response':item['rejected'],'user_correction':item['correction'],'trait_ids':list(doc.traits)},EXTRACT_SCHEMA,validation_feedback=feedback)
+                        output=dict(output,corrected_assistant_response=item['rejected'],user_correction=item['correction'])
                         reason=None
-                        if output['is_correction'] and output['context_sufficient']:
+                        if not output['context_excerpt'].strip() or not any(output['context_excerpt'] in m['content'] for m in item['messages']):
+                            reason='context excerpt is not copied'
+                        elif output['is_correction'] and output['context_sufficient']:
                             if not output['trait_ids']:
                                 reason='positive correction has no traits'
                             elif len(set(output['trait_ids']))!=len(output['trait_ids']):
@@ -276,12 +276,6 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
                             raise GenerationValidationError(reason)
                         logging.getLogger(__name__).warning('Character extraction validation failed for %s: %s; retrying once',item['work_key'],reason)
                         feedback=reason
-                    if not output['context_excerpt'].strip() or not any(output['context_excerpt'] in m['content'] for m in item['messages']):
-                        raise GenerationValidationError('context excerpt is not copied')
-                    if output['corrected_assistant_response']!=item['rejected']:
-                        raise GenerationValidationError('assistant response is not copied')
-                    if output['user_correction']!=item['correction']:
-                        raise GenerationValidationError('user correction is not copied')
                     if any(t not in doc.traits for t in output['trait_ids']):
                         raise GenerationValidationError('unknown extraction trait')
                     if len(output['rationale'])>2000:
@@ -310,7 +304,7 @@ def generate_pairs(conn, config, *, source, limit, refresh=False, expand_seeds=F
         except sqlite3.Error:
             raise
         except (ValueError,RuntimeError,TimeoutError,OSError) as exc:
-            reason=str(exc) if isinstance(exc,GenerationValidationError) else 'model or runtime failure'
+            reason=str(exc) if isinstance(exc,GenerationValidationError) else getattr(exc,'code',None) or 'model or runtime failure'
             error=type(exc).__name__
             logging.getLogger(__name__).warning('Character generation failed for %s: %s: %s',item['work_key'],error,reason)
             result['failures'].append({'work_id':item['work_key'],'error':error,'reason':reason})

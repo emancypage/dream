@@ -1,0 +1,115 @@
+import hashlib
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import compact
+from compact import CompactionError, build_prompt, check_output, propose, select_files
+from config import DelegateSettings, load_config
+from consolidate import MemoryFile
+
+HEAD = "---\nname: topic\n---\n"
+SETTINGS = DelegateSettings()
+
+
+def _file(name, chars):
+    body = HEAD + "x" * (chars - len(HEAD))
+    return MemoryFile(Path("/memory") / name, body, hashlib.sha256(body.encode()).hexdigest())
+
+
+def test_select_files_takes_the_longest_topics_and_never_the_index():
+    files = [_file("a.md", 41_000), _file("b.md", 55_000), _file("c.md", 45_000),
+             _file("MEMORY.md", 59_000), _file("d.md", 40_000)]
+    assert [f.path.name for f in select_files(files, SETTINGS)] == ["b.md", "c.md"]
+
+
+def test_prompt_carries_target_size_and_patches():
+    prompt = build_prompt(_file("a.md", 41_000), [{"id": 7, "find": "x", "replacement": "y", "rationale": "r"}], SETTINGS, "")
+    assert "25000" in prompt and '"id": 7' in prompt
+
+
+def test_prompt_does_not_expand_placeholders_inside_the_data():
+    entry = MemoryFile(Path("/memory/a.md"), HEAD + "see {{target_chars}} and {{pending_patches}}", "sha")
+    prompt = build_prompt(entry, [], SETTINGS, "")
+    assert "see {{target_chars}} and {{pending_patches}}" in prompt
+
+
+@pytest.mark.parametrize("output, message", [
+    ({"body": "", "dropped_summary": "", "folded_ids": []}, "empty body"),
+    ({"body": HEAD + "x" * 40_001, "dropped_summary": "", "folded_ids": []}, "body longer than compact_over_chars"),
+    ({"body": "---\nname: other\n---\nshort", "dropped_summary": "", "folded_ids": []}, "frontmatter changed"),
+    ({"body": HEAD + "short", "dropped_summary": "", "folded_ids": [9]}, "unknown folded id"),
+    ({"body": HEAD + "short", "dropped_summary": "", "folded_ids": [7, 7]}, "duplicate folded id"),
+    ({"body": HEAD + "ok", "dropped_summary": "", "folded_ids": []}, "body shorter than a quarter of compact_target_chars"),
+])
+def test_check_output_refuses(output, message):
+    with pytest.raises(CompactionError, match=message):
+        check_output(_file("a.md", 41_000), output, {7}, SETTINGS)
+
+
+def test_propose_uses_the_delegate_stage_and_stops_before_the_provider_on_oversize(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(compact.backend, "generate", lambda stage, *a, **k: calls.append(stage) or SimpleNamespace(
+        output={"body": HEAD + "x" * 10_000, "dropped_summary": "old history", "folded_ids": []}, provider="fake", model="m"))
+    cfg = load_config(tmp_path / "absent")
+    result = propose(_file("a.md", 41_000), [], config=cfg, policy_context="")
+    assert calls == ["delegate"] and result.dropped_summary == "old history"
+    with pytest.raises(CompactionError, match="input longer than 200000 characters"):
+        propose(_file("big.md", 200_001), [], config=cfg, policy_context="")
+    assert calls == ["delegate"]
+
+
+def test_oversized_files_do_not_consume_selection_slots():
+    files = [_file("huge.md", 200_001), _file("b.md", 55_000), _file("c.md", 45_000)]
+    assert [f.path.name for f in select_files(files, SETTINGS)] == ["b.md", "c.md"]
+
+
+@pytest.mark.parametrize("replacement", [
+    "---\nname: topic\ndescription: changed\nmetadata:\n  type: project\n---\n",
+    "---\nname: topic\ndescription: original\nmetadata:\n  type: changed\n---\n",
+    "---\nname: topic\ndescription: original\nmetadata:\n  type: project\n",
+    "---\nname: topic\ndescription: original\nmetadata:\n  type: project\n---broken\n",
+])
+def test_complete_frontmatter_is_preserved(replacement):
+    head = "---\nname: topic\ndescription: original\nmetadata:\n  type: project\n---\n"
+    entry = MemoryFile(Path("/memory/topic.md"), _file("a.md", 41_000).body.replace(HEAD, head), "sha")
+    with pytest.raises(CompactionError, match="frontmatter"):
+        check_output(entry, {"body": replacement + "x" * 10_000, "dropped_summary": "", "folded_ids": []}, set(), SETTINGS)
+
+
+def test_plain_markdown_is_supported():
+    entry = MemoryFile(Path("/memory/topic.md"), "x" * 41_000, "sha")
+    assert check_output(entry, {"body": "x" * 10_000, "dropped_summary": "", "folded_ids": []}, set(), SETTINGS)[0] == "x" * 10_000
+
+
+@pytest.mark.parametrize("with_bom", [False, True])
+def test_bom_frontmatter_keeps_original_marker_and_complete_header(with_bom):
+    head = "---\nname: topic\nmetadata:\n  type: project\n---\n"
+    entry = MemoryFile(Path("/memory/topic.md"), "\ufeff" + head + "x" * 45_000, "sha")
+    body = ("\ufeff" if with_bom else "") + head + "x" * 10_000
+    assert check_output(entry, {"body": body, "dropped_summary": "", "folded_ids": []}, set(), SETTINGS)[0] == "\ufeff" + head + "x" * 10_000
+
+
+@pytest.mark.parametrize("header", ["", "---\nname: other\n---\n", "---\nname: topic\nmetadata:\n  type: changed\n---\n", "---\nname: topic\nmetadata:\n  type: project\n---broken\n"])
+def test_bom_frontmatter_cannot_be_removed_or_changed(header):
+    entry = MemoryFile(Path("/memory/topic.md"), "\ufeff---\nname: topic\nmetadata:\n  type: project\n---\n" + "x" * 45_000, "sha")
+    with pytest.raises(CompactionError, match="frontmatter"):
+        check_output(entry, {"body": header + "x" * 10_000, "dropped_summary": "", "folded_ids": []}, set(), SETTINGS)
+
+
+@pytest.mark.parametrize("length", [2000, 2001])
+def test_dropped_summary_limit_matches_schema(length):
+    output = {"body": HEAD + "x" * 10_000, "dropped_summary": "ą" * length, "folded_ids": []}
+    assert compact.COMPACT_SCHEMA["properties"]["dropped_summary"]["maxLength"] == 2000
+    if length == 2000:
+        assert check_output(_file("a.md", 41_000), output, set(), SETTINGS)[1] == output["dropped_summary"]
+    else:
+        with pytest.raises(CompactionError, match="dropped_summary longer"):
+            check_output(_file("a.md", 41_000), output, set(), SETTINGS)
+
+
+def test_bom_plain_markdown_still_refuses_empty_output():
+    entry = MemoryFile(Path("/memory/topic.md"), "\ufeff" + "x" * 45_000, "sha")
+    with pytest.raises(CompactionError, match="empty body"):
+        check_output(entry, {"body": " " * 10_000, "dropped_summary": "", "folded_ids": []}, set(), SETTINGS)
